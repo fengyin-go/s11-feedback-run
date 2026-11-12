@@ -424,7 +424,9 @@ def run_one(task_dir: Path, cfg: dict) -> dict:
         return {"task_id": name, "state": "blocked", "detail": "已检测到网关 key 泄露，等待人工处理"}
     if lib.stage_ok(task_dir, "run"):
         return {"task_id": name, "state": "skip", "detail": "已经跑过"}
-    if time.time() >= cfg.get('_deadline', float('inf')) or (cfg.get('_drain') and Path(cfg['_drain']).exists()):
+    current = lib.load_json(task_dir / 'run/current.json', default={})
+    recovering = current.get('request_id') and current.get('state') in ('running', 'exited')
+    if not recovering and (time.time() >= cfg.get('_deadline', float('inf')) or (cfg.get('_drain') and Path(cfg['_drain']).exists())):
         return {'task_id': name, 'state': 'deferred', 'detail': '批次已排空或预算到顶，不起新轮'}
     try:
         secret = bound_key(task_dir, cfg, start=True)

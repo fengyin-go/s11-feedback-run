@@ -309,6 +309,13 @@ class Watcher:
         return self.retry_at > 0 and now - self.retry_at <= grace
 
 
+def progress_alive(watcher, now, cfg):
+    """An admitted execution may outlive time budgets while it is progressing."""
+    return bool(cfg.get('continue_while_progress', True) and (
+        now - max(watcher.progress, watcher.output) < cfg['stall_seconds']
+        or watcher.active_tools or watcher.protected(now, cfg)))
+
+
 @contextlib.contextmanager
 def stream_context(task, cfg, attempt, segment, gateway):
     token = STREAM.set({'task': task, 'cfg': cfg, 'attempt': attempt, 'segment': segment, 'gateway': gateway})
@@ -336,7 +343,8 @@ def monitored_stream(command, stdin_text, stdout_path, stderr_path, timeout, con
     request = {'id': request_id, 'command': command, 'stdin': stdin_text,
                'task': str(task), 'guard_deadline': guard, 'started_epoch': time.time(), 'base_budget': starting_budget,
                'attempt_waiting_base': attempt_wait_base,
-               'stdout': str(stdout_path), 'stderr': str(stderr_path), 'result': str(result_path), 'timeout': timeout}
+               'stdout': str(stdout_path), 'stderr': str(stderr_path), 'result': str(result_path), 'timeout': timeout,
+               'progress_policy': dict(cfg) if cfg.get('continue_while_progress', True) else None}
     lib.save_json(request_path, request)
     process = subprocess.Popen([sys.executable, str(Path(__file__).with_name('fbr_worker.py')), str(request_path)],
                                start_new_session=True, stdin=subprocess.DEVNULL,
@@ -430,6 +438,8 @@ def monitor_process(process, request, base, context, *, started=None, adopted=Fa
         if done.get('id') == request_id and 'rc' in done:
             process.wait(timeout=10)
             base.update(state='exited', rc=done['rc'], ended_at=lib.now_iso())
+            if done.get('timed_out') and done.get('reason'):
+                base.update(timed_out=True, reason=done['reason'])
             lib.save_json(task / 'run/current.json', base)
             spent_wait = waiting_total + (now - waiting_started if waiting_started else 0)
             save_budget(now, spent_wait)
@@ -461,6 +471,8 @@ def monitor_process(process, request, base, context, *, started=None, adopted=Fa
         heartbeat = {'at': lib.now_iso(), 'elapsed': now - started, 'idle': now - watcher.progress,
                      'output_idle': now - watcher.output, 'events': watcher.events, 'tools': watcher.tools,
                      'session_id': watcher.session_id, 'model': watcher.model,
+                     'continue_while_progress': cfg.get('continue_while_progress', True),
+                     'progress_alive': progress_alive(watcher, now, cfg),
                      'gateway_wait': bool(waiting_started), 'waiting_seconds': waiting_total +
                          (now - waiting_started if waiting_started else 0), 'pid': process.pid,
                      'attempt_waiting_base': request.get('attempt_waiting_base', base_budget.get('waiting_seconds', 0)),
@@ -475,7 +487,7 @@ def monitor_process(process, request, base, context, *, started=None, adopted=Fa
                     or base_budget.get('waiting_seconds', 0) + spent_wait - request.get('attempt_waiting_base', base_budget.get('waiting_seconds', 0)) >= cfg['gateway_wait_total']
                     or (cfg.get('gateway_wait_task_total') is not None and base_budget.get('waiting_seconds', 0) + spent_wait >= cfg['gateway_wait_task_total'])):
                 reason = 'gateway_wait_exhausted'
-        elif now >= deadline:
+        elif now >= deadline and not progress_alive(watcher, now, cfg):
             if not extended and now - watcher.progress <= 180:
                 deadline += cfg['grace_seconds']
                 extended = True
@@ -485,11 +497,11 @@ def monitor_process(process, request, base, context, *, started=None, adopted=Fa
         elif now - max(watcher.progress, watcher.output) >= cfg['stall_seconds'] and not protected and not watcher.active_tools:
             reason = 'stalled'
         active = base_budget['active_seconds'] + now - started - spent_wait
-        if active >= cfg['task_budget']:
+        if not reason and active >= cfg['task_budget'] and not progress_alive(watcher, now, cfg):
             reason = 'task_budget'
-        if now >= context['cfg'].get('_deadline', float('inf')):
+        if not reason and now >= context['cfg'].get('_deadline', float('inf')) and not progress_alive(watcher, now, cfg):
             reason = 'batch_budget'
-        if now >= request.get('guard_deadline', float('inf')):
+        if not reason and now >= request.get('guard_deadline', float('inf')) and not progress_alive(watcher, now, cfg):
             reason = 'worker_guard'
         if reason:
             before_stop_bytes = stdout_path.stat().st_size if stdout_path.exists() else 0

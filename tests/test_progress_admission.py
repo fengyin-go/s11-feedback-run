@@ -39,3 +39,17 @@ class ProgressAdmission(Sandbox):
         (task.parent/'runner/drain').touch()
         with mock.patch('fbr_runtime.alive',side_effect=self.live):
             self.assertEqual(fbr_sheet.run_activity(task),'')
+
+    def test_expired_starting_is_no_longer_waiting_for_dispatch(self):
+        task=self.queued()
+        lib.save_json(task.parent/'runner/plan.json',{'tasks':[task.name],'deadline':1})
+        lib.save_json(task/'run/current.json',{'state':'starting','owner_pid':123,'owner_identity':'controller'})
+        with mock.patch('fbr_runtime.alive',side_effect=self.live):
+            self.assertIn('停止派发', fbr_sheet.run_activity(task))
+
+    def test_live_worker_remains_running_after_dispatch_deadline(self):
+        task=self.queued()
+        lib.save_json(task.parent/'runner/plan.json',{'tasks':[task.name],'deadline':1})
+        lib.save_json(task/'run/current.json',{'state':'running','pid':123,'identity':'worker'})
+        with mock.patch('fbr_runtime.alive',side_effect=self.live):
+            self.assertIn('模型运行中', fbr_sheet.run_activity(task))

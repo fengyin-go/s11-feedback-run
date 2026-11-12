@@ -213,6 +213,11 @@ def run_activity(task_dir: Path) -> str:
         heartbeat = lib.load_json(task_dir / 'run/heartbeat.json', default={})
         return '网关内部重试中，模型尚未跑完' if heartbeat.get('pid') == current.get('pid') and heartbeat.get('gateway_wait') else '模型运行中，尚未跑完'
     owner = {'pid': current.get('owner_pid'), 'identity': current.get('owner_identity')}
+    for kind in ('runner', 'flow'):
+        plan = lib.load_json(task_dir.parent / kind / 'plan.json', default={})
+        selected = plan.get('tasks')
+        if selected and task_dir.name in selected and plan.get('deadline', float('inf')) <= time.time():
+            return '已到批次新派发截止，停止派发'
     if current.get('state') == 'starting' and fbr_runtime.alive(owner):
         return '等待共享网关额度，尚未派发模型'
     # Only a live batch controller and current admission can establish queued work.
