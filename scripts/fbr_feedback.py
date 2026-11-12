@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""R6 打分与 Feedback：给独立验收模型备料、实跑反例、核对模型回执与证据闸门。
+"""R6 打分与 Feedback：给当前任务 AI 备料、实跑反例、核对模型回执与证据闸门。
 
     fbr_feedback.py card  --batch b1110-01 [--tasks …]                      # 生成 review/card.md
     fbr_feedback.py probe --batch b1110-01 --task s11-000123 --cmd '…'      # 在产物提交上实跑一条命令（起容器）
     fbr_feedback.py gate  --batch b1110-01 [--tasks …]                      # 检查 audit.json 和 feedback.json
 
-fbr_reviewer.py 调用指定 gpt-6.1-sol / high 生成两份文件：
+当前任务 AI 生成候选并逐句复核，fbr_reviewer.py finalize 校验后保存：
 - evidence/audit.json   逐条需求的结论 + 锚点、实跑过的反例、虚假成功判断
 - review/feedback.json  score、feedback 正文、issues（问题句）、process（过程句）、note（进备注列）
 闸门通过才把 feedback 阶段记成 ok，结果表只收通过的。
@@ -184,22 +184,37 @@ def card_one(task_dir: Path) -> dict:
 @lib.task_locked
 def probe_one(task_dir: Path, cfg: dict, cmd: str, timeout: int, with_setup: bool = True) -> dict:
     """在产物提交的干净克隆上跑一条命令，结果追加到 evidence/probes.jsonl。会起一个任务镜像的新容器。"""
+    return probe_many(task_dir, cfg, [{'cmd':cmd,'timeout':timeout}], with_setup=with_setup)[0]
+
+
+def probe_many(task_dir, cfg, requests, with_setup=True):
     record, facts = load_evidence(task_dir)
-    if not cmd.strip():
-        raise lib.FbrError("--cmd 不能为空")
+    if not requests or any(not r.get('cmd','').strip() for r in requests):
+        raise lib.FbrError('probe 请求缺少明确命令')
     lib.restore_git_config(task_dir)
-    clone = lib.clean_clone(task_dir / "workspace", facts["commit"], f"s11-probe-{record['task_id']}")
-    steps = [{"name": "probe", "cmd": cmd, "timeout": timeout}]
+    # Commands share setup only when they explicitly declare that they do not mutate the environment.
+    if len(requests) > 1 and not all(r.get('read_only') is True for r in requests):
+        return [probe_many(task_dir,cfg,[r],with_setup)[0] for r in requests]
+    clone = lib.clean_clone(task_dir/'workspace', facts['commit'], f"s11-probe-{record['task_id']}")
+    steps = [{'name':'probe' if len(requests)==1 else f'probe-{i}', 'cmd':r['cmd'], 'timeout':r.get('timeout',180)} for i,r in enumerate(requests)]
     if with_setup:
-        steps.insert(0, {"name": "setup", "cmd": cfg["facts"]["setup_cmd"], "timeout": cfg["facts"]["setup_timeout"]})
-    rows = lib.run_steps_in_image(record["image"], clone, steps, tail=80)
-    done = rows[-1]
-    row = {"id": f"P{len(load_probes(task_dir)) + 1}", "cmd": cmd, "rc": done["rc"], "seconds": done["seconds"],
-           "tail": lib.redact(done["tail"][-3000:], [lib.read_key(cfg)]),
-           "setup_rc": rows[0]["rc"] if with_setup else None, "commit": facts["commit"], "at": lib.now_iso(),
-           "container_name": done.get("container_name", ""), "clone": str(clone)}
-    lib.append_jsonl(task_dir / "evidence" / "probes.jsonl", row)
-    return row
+        steps.insert(0, {'name':'setup','cmd':cfg['facts']['setup_cmd'],'timeout':cfg['facts']['setup_timeout']})
+    # stop_on_fail retains setup failure semantics; independent probes must not suppress one another.
+    rows = lib.run_steps_in_image(record['image'],clone,steps,tail=80)
+    setup_rc = rows[0]['rc'] if with_setup else None
+    outputs=[]
+    for request,done in zip(requests,rows[1:] if with_setup else rows):
+        row = {'id':f'P{len(load_probes(task_dir))+1}','cmd':request['cmd'],'rc':done['rc'],'seconds':done['seconds'],
+               'tail':lib.redact(done['tail'][-3000:],[lib.read_key(cfg)]),'setup_rc':setup_rc,'commit':facts['commit'],
+               'at':lib.now_iso(),'container_name':done.get('container_name',''),'clone':str(clone)}
+        if done.get('output_file'):
+            import shutil
+            target=task_dir/'evidence/command-logs/probes'/f"{row['id']}.log"
+            target.parent.mkdir(parents=True,exist_ok=True)
+            shutil.copy2(done['output_file'],target)
+            row.update(output_file=str(target.relative_to(task_dir)),output_sha256=done.get('output_sha256'))
+        lib.append_jsonl(task_dir/'evidence/probes.jsonl',row);outputs.append(row)
+    return outputs
 
 
 # ---------- gate ----------

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""逐题滚动生产、录屏、取证、独立评价和落表；默认演练，不自动发布或提交。"""
+"""逐题滚动生产、录屏、取证、独立评价和落表；默认演练；执行包含验收后发布，平台提交单独授权。"""
 from __future__ import annotations
 import argparse
 import concurrent.futures as futures
@@ -80,55 +80,98 @@ def review_task(task, root, cfg, options):
     import fbr_feedback
     import fbr_reviewer
     import fbr_recover
-    existing = False
-    if lib.stage_ok(task, 'feedback'):
-        # 回执与证据必须仍有效；已提交的由 produce 直接冻结。
-        if fbr_feedback.gate_task(task, cfg)['errors'] == []:
-            existing = True
-    if not existing:
-        base, secret = fbr_reviewer.credentials(Path(options.reviewer_env).expanduser())
-    for turn in range(0 if existing else 3):
+    if lib.stage_ok(task, 'feedback') and not fbr_feedback.gate_task(task,cfg)['errors']:
+        result = {'state':'already_valid'}
+    else:
         fbr_feedback.card_one(task)
-        result = fbr_recover.recover(task, base, secret)
-        if result['state'] == 'already_valid':
-            result = {**result, 'state': 'ok'}
-        if result['state'] == 'needs_probes':
-            requests = lib.load_json(task / 'review/probe-requests.json')['requests']
-            if turn == 2 or not isinstance(requests, list) or len(requests) > 3:
-                raise lib.FbrError('补证循环达到上限，保留 probe 请求，不编造结论')
-            for request in requests:
-                if not isinstance(request, dict) or not isinstance(request.get('cmd'), str) or not request['cmd'].strip():
-                    raise lib.FbrError('probe 请求必须给出明确 cmd，不能自动猜测命令')
-                fbr_feedback.probe_one(task, cfg, request['cmd'], min(180, max(1, int(request.get('timeout', 180)))))
-            continue
-        checked(result)
-        break
-    # 查重和落表共享串行写入通道，避免两个评价同时过闸留下相互重复。
+        gate=lib.load_json(task/'review/gate.json',default={})
+        result=fbr_recover.recover(task,repair_gate=gate.get('passed') is False,max_cycles=1,env_file=options.reviewer_env)
+    if result['state'] in ('needs_probes','repairing','needs_task_agent'):
+        return {'task_id':task.name,**result}
+    checked({**result,'state':'ok' if result['state']=='already_valid' else result['state']})
     with options.delivery_lock:
-        rows, _ = fbr_feedback.gate_batch(root, options.batch, cfg, task.name)
-        match = next(row for row in rows if row['task_id'] == task.name)
-        if match['state'] != 'ok':
-            raise lib.FbrError('Feedback 闸门未通过：' + '；'.join(match['errors']))
-        import fbr_sheet
-        # 先落本地进度；推送失败也保留已通过的独立验收。
-        fbr_sheet.write_sheet(root, options.batch, cfg)
-        if getattr(options, 'publish', False):
-            import fbr_snapshot
+        rows,_=fbr_feedback.gate_batch(root,options.batch,cfg,task.name)
+        match=next(row for row in rows if row['task_id']==task.name)
+    if match['state']!='ok':
+        errors=match.get('errors',[])
+        path=task/'review/gate-repair.json'
+        history=lib.load_json(path,default={'attempts':[]})
+        signature=lib.content_hash({'errors':errors,'feedback':lib.load_json(task/'review/feedback.json',default={})})
+        repeats=1
+        for row in reversed(history['attempts']):
+            if row.get('signature')!=signature:break
+            repeats+=1
+        history['attempts'].append({'at':lib.now_iso(),'errors':errors,'signature':signature})
+        history['state']='repairing';lib.save_json(path,history)
+        if repeats>=3: raise lib.FbrError('相同候选和错误重复，需要调度补充证据：'+'；'.join(errors))
+        return {'task_id':task.name,'state':'repairing','detail':'；'.join(errors)}
+    return finish_review(task,root,cfg,options)
+
+
+def probe_task(task, root, cfg, options):
+    import fbr_feedback
+    requests=lib.load_json(task/'review/probe-requests.json')['requests']
+    if not isinstance(requests,list) or not 1<=len(requests)<=3:
+        raise lib.FbrError('probe 请求范围不合法，保留原请求')
+    signature=lib.content_hash(requests)
+    path=task/'review/probe-dispatch.json'
+    prior=lib.load_json(path,default={})
+    repeats=prior.get('repeats',0)+1 if prior.get('signature')==signature else 1
+    if repeats>=3: raise lib.FbrError('相同补证请求重复且没有解决，需调度核对环境')
+    lib.save_json(path,{'signature':signature,'repeats':repeats})
+    for request in requests:
+        if not isinstance(request,dict) or not isinstance(request.get('cmd'),str) or not request['cmd'].strip():
+            raise lib.FbrError('probe 必须给出明确 cmd')
+        request['timeout']=min(180,max(1,int(request.get('timeout',180))))
+    fbr_feedback.probe_many(task,cfg,requests)
+    return {'task_id':task.name,'state':'ok'}
+
+
+def finish_review(task, root, cfg, options):
+    import fbr_sheet
+    import fbr_common
+    # Finish acceptance first, then proactively publish and re-read the snapshot before field audit.
+    with options.delivery_lock:
+        fbr_sheet.write_sheet(root,options.batch,cfg)
+    history={'attempts':[]}
+    target=task/'review/delivery-repair.json'
+    publishing=getattr(options,'publish',None)
+    if publishing is None: publishing=True
+    if publishing:
+        import fbr_snapshot
+        for attempt in range(1,4):
             try:
-                checked(fbr_snapshot.push_one(fbr_snapshot.Hub(cfg['github_owner']), task, cfg))
-            finally:
-                fbr_sheet.write_sheet(root, options.batch, cfg)
-            row, reason = fbr_sheet.build_row(root, task, cfg)
-            if row is None or row['数据状态'] != '可提交':
-                raise lib.FbrError('交付必填字段闸门未通过：' + (reason or row['数据状态']))
-        if options.auto_submit:
-            snapshot = lib.load_json(task / 'review/snapshot.json')
-            if not snapshot.get('pushed'):
-                raise lib.FbrError('未获发布授权或产物尚未推送，不能提交平台')
-            import fbr_submit
-            fbr_submit.run_batch(root, options.batch, tasks=task.name, execute=True, confirm='SUBMIT')
-            fbr_sheet.write_sheet(root, options.batch, cfg)
-    return {'task_id': task.name, 'state': 'ok', 'detail': '本地评价与结果表完成'}
+                checked(fbr_snapshot.push_one(fbr_snapshot.Hub(cfg['github_owner']),task,cfg))
+                break
+            except (lib.FbrError,OSError) as exc:
+                history['attempts'].append({'at':lib.now_iso(),'stage':'publish','attempt':attempt,'error':str(exc)})
+                lib.save_json(target,history)
+                # Retry transport/temporary failures only; never force-push a divergent main.
+                if attempt==3 or not any(w in str(exc).lower() for w in ('timeout','timed out','connection','502','503','504','推送失败','回读远端')):
+                    with options.delivery_lock:fbr_sheet.write_sheet(root,options.batch,cfg)
+                    raise
+                if time.time()+attempt*2>=cfg.get('_deadline',float('inf')):raise
+                time.sleep(attempt*2)
+    for attempt in range(2):
+        with options.delivery_lock:
+            fbr_sheet.write_sheet(root,options.batch,cfg)
+            row,reason=fbr_sheet.build_row(root,task,cfg)
+        problems = fbr_sheet.row_problems(row, lib.load_json(task/'trace/ids.json'), lib.load_json(task/'review/snapshot.json')) if row else [reason]
+        if not publishing:
+            problems = [p for p in problems if p not in ('缺产物快照', '产物快照还没推送')]
+        if row is not None and not problems:break
+        repaired=fbr_common.repair_from_peer(task,root) if attempt==0 else False
+        history['attempts'].append({'at':lib.now_iso(),'stage':'fields','error':reason or (row or {}).get('数据状态'),'repaired':repaired})
+        lib.save_json(target,history)
+        if not repaired:
+            raise lib.FbrError('交付核查仍有缺失，来源不足不能猜值：'+(reason or (row or {}).get('数据状态','缺少有效本地行')))
+    if getattr(options,'auto_submit',False):
+        if not lib.load_json(task/'review/snapshot.json').get('pushed'):raise lib.FbrError('产物未发布，不能提交平台')
+        import fbr_submit
+        fbr_submit.run_batch(root,options.batch,tasks=task.name,execute=True,confirm='SUBMIT')
+        with options.delivery_lock:fbr_sheet.write_sheet(root,options.batch,cfg)
+    history['state']='passed';lib.save_json(target,history)
+    return {'task_id':task.name,'state':'ok','detail':'验收、快照推送及本地字段核查完成' if publishing else '本地验收完成（显式不发布）'}
 
 
 def run_flow(root, args):
@@ -138,6 +181,7 @@ def run_flow(root, args):
         cfg = lib.settings(root)
         cfg['_managed'] = True
         args.delivery_lock = threading.Lock()
+        if getattr(args,'publish',None) is None: args.publish=True
         saved = lib.load_json(directory / 'plan.json', default={})
         # 恢复同批次沿用绝对截止；不能靠看门狗清零预算。
         deadline = min(saved.get('deadline', float('inf')), runtime.batch_deadline(root, args.batch, cfg))
@@ -151,9 +195,8 @@ def run_flow(root, args):
         if not fbr_run.print_checks(fbr_run.preflight(cfg)):
             raise lib.FbrError('预检未通过，不启动流水线')
         tasks = lib.task_dirs(root, args.batch, args.tasks)
-        if any(not frozen(t) for t in tasks):
-            import fbr_reviewer
-            fbr_reviewer.credentials(Path(args.reviewer_env).expanduser())
+        # Recover every surviving worker before waiting to dispatch prepared tasks.
+        tasks.sort(key=lambda task: not runtime.alive(lib.load_json(task / 'run/current.json', default={})))
         if not args.no_watchdog:
             spawn(root, args, watchdog=True)
         rows = []
@@ -163,25 +206,46 @@ def run_flow(root, args):
             except (lib.FbrError, OSError, ValueError) as exc:
                 return {'task_id': values[0].name, 'state': 'blocked', 'detail': str(exc)}
         pools = [futures.ThreadPoolExecutor(max_workers=max(1, int(n))) for n in
-                 (cfg['concurrency'], cfg['record_parallel'], cfg.get('facts_parallel', 2), cfg.get('review_parallel', 1))]
-        pending = {pools[0].submit(safe, produce, task, cfg, args): (0, task) for task in tasks}
+                 (cfg['concurrency'], cfg['record_parallel'], cfg.get('facts_parallel', 2), min(5,cfg.get('review_parallel',5)), cfg.get('facts_parallel',2))]
+        import fbr_metrics
+        def enqueue(step,task):
+            fn,values=((produce,(task,cfg,args)),(record_task,(task,cfg)),(facts_task,(task,root,cfg)),
+                       (review_task,(task,root,cfg,args)),(probe_task,(task,root,cfg,args)))[step]
+            queued=time.time()
+            return pools[step].submit(safe,lambda t: fbr_metrics.stage(t,str(step),queued,fn,*values),task)
+        def resume_step(task):
+            if frozen(task) or any(not lib.stage_ok(task, stage) for stage in ('run', 'collect', 'commit')):
+                return 0
+            if not lib.stage_ok(task, 'record'):
+                return 1
+            if not lib.stage_ok(task, 'facts'):
+                return 2
+            return 3
+        pending={}
+        for task in tasks:
+            step=resume_step(task)
+            pending[enqueue(step,task)]=(step,task)
         try:
             while pending:
                 completed, _ = futures.wait(pending, timeout=5, return_when=futures.FIRST_COMPLETED)
                 for future in completed:
                     step, task = pending.pop(future)
                     result = future.result()
-                    if isinstance(result, dict) and result.get('state') not in ('ok', 'skip'):
+                    if isinstance(result,dict) and result.get('state') in ('repairing','needs_probes'):
+                        if time.time()>=deadline or (directory/'pause').exists():
+                            rows.append({'task_id':task.name,'state':'deferred','detail':'保留评价/补证检查点'})
+                        else:
+                            next_step=4 if result['state']=='needs_probes' else 3
+                            pending[enqueue(next_step,task)]=(next_step,task)
+                    elif isinstance(result,dict) and result.get('state') not in ('ok','skip'):
                         rows.append(result)
-                    elif step == 3:
+                    elif step==3:
                         rows.append(result)
-                    elif time.time() >= deadline or (directory / 'pause').exists():
-                        rows.append({'task_id': task.name, 'state': 'deferred', 'detail': '排空或批次预算到顶'})
+                    elif time.time()>=deadline or (directory/'pause').exists():
+                        rows.append({'task_id':task.name,'state':'deferred','detail':'排空或批次预算到顶'})
                     else:
-                        next_step = step + 1
-                        fn, values = ((record_task, (task, cfg)), (facts_task, (task, root, cfg)),
-                                      (review_task, (task, root, cfg, args)))[step]
-                        pending[pools[next_step].submit(safe, fn, *values)] = (next_step, task)
+                        next_step=3 if step==4 else step+1
+                        pending[enqueue(next_step,task)]=(next_step,task)
                 report = {'at': lib.now_iso(), 'active': [{'task_id': t.name, 'stage': s} for s, t in pending.values()],
                           'results': rows, 'deadline': deadline,
                           'phases': {t.name: phase(t) for t in tasks}}
@@ -193,7 +257,7 @@ def run_flow(root, args):
         with args.delivery_lock:
             fbr_sheet.write_sheet(root, args.batch, cfg)
         problem = any(r['state'] not in ('ok', 'frozen') for r in rows)
-        reason = 'budget' if time.time() >= deadline else 'paused' if args.stopped() else 'blocked' if problem else 'completed'
+        reason = 'budget' if time.time() >= deadline else 'paused' if args.stopped() else 'needs_task_agent' if any(r['state']=='needs_task_agent' for r in rows) else 'blocked' if problem else 'completed'
         lib.save_json(directory / 'stop.json', {'reason': reason, 'at': lib.now_iso(), 'results': rows})
         return {'state': reason, 'results': rows}
 
@@ -212,6 +276,7 @@ def spawn(root, args, watchdog=False):
             value = getattr(args, key, None)
             if value:
                 argv += ['--' + key.replace('_', '-'), value]
+        if getattr(args,'publish',None) is False: argv += ['--no-publish']
         for key, confirm in (('publish', 'PUBLISH'), ('auto_submit', 'SUBMIT')):
             if getattr(args, key, False):
                 argv += ['--' + key.replace('_', '-'), '--confirm-' + ('publish' if key == 'publish' else 'submit'), confirm]
@@ -232,7 +297,7 @@ def watchdog(root, args):
                 return {'state': 'stopped'}
             proc = lib.load_json(directory / 'process.json', default={})
             stop = lib.load_json(directory / 'stop.json', default={})
-            if stop.get('reason') in ('completed', 'blocked', 'budget', 'paused'):
+            if stop.get('reason') in ('completed', 'blocked', 'budget', 'paused', 'needs_task_agent'):
                 return {'state': stop['reason']}
             if not runtime.alive(proc):
                 revive = lib.load_json(directory / 'revives.json', default={'count': 0})
@@ -261,7 +326,8 @@ def main():
         p.add_argument('--execute', action='store_true')
         p.add_argument('--confirm', default='')
         p.add_argument('--detach', action='store_true')
-        p.add_argument('--publish', action='store_true')
+        p.add_argument('--publish', action='store_true', default=None)
+        p.add_argument('--no-publish', action='store_false', dest='publish')
         p.add_argument('--confirm-publish', default='')
         p.add_argument('--auto-submit', action='store_true')
         p.add_argument('--confirm-submit', default='')
@@ -283,8 +349,8 @@ def main():
         elif args.command == 'watchdog':
             result = watchdog(root, args)
         else:
-            if args.confirm != 'FLOW' or (args.publish and args.confirm_publish != 'PUBLISH') or (args.auto_submit and args.confirm_submit != 'SUBMIT'):
-                raise lib.FbrError('执行需 --confirm FLOW；发布/提交另需各自明确确认')
+            if args.confirm != 'FLOW' or (args.auto_submit and args.confirm_submit != 'SUBMIT'):
+                raise lib.FbrError('执行含验收后快照发布，需 --confirm FLOW；平台提交另需 --confirm-submit SUBMIT')
             if args.command == 'resume':
                 for name in ('pause', 'drain'):
                     (directory / name).unlink(missing_ok=True)

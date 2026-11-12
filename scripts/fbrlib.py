@@ -47,6 +47,9 @@ DEFAULTS = {
     "harness_version": "2.1.319",
     "os": "MacOS/Linux",
     "concurrency": 5,
+    "review_parallel": 5, "facts_parallel": 2,
+    "publish_after_review": False,
+    "dependencies": {"enabled": True, "paths": [], "smoke_cmd": ""},
     "record_parallel": 2,
     "daily_cutoff": "20:00",
     "key_file": "~/.codex/solo11/gateway.env",
@@ -99,6 +102,14 @@ def find_root(explicit: str | None = None) -> Path:
         if (item / "_config" / "settings.json").is_file():
             return item.resolve()
     raise FbrError("找不到工作目录：用 --root 指定，或设置 SOLO11_ROOT（目录下要有 _config/settings.json）")
+
+
+def containing_root(path: Path) -> Path:
+    """Locate a repository/temporary clone's enclosing S11 root without changing cwd."""
+    here = Path(path).resolve()
+    for item in (here, *here.parents):
+        if (item/'_config/settings.json').is_file(): return item
+    raise FbrError('仓库或缓存克隆不在 S11 工作目录内')
 
 
 def load_json(path: Path, default=None):
@@ -162,6 +173,7 @@ def settings(root: Path) -> dict:
     for key in ("image", "image_id", "harness", "harness_version", "github_owner"):
         if not cfg.get(key):
             raise FbrError(f"_config/settings.json 缺少 {key}")
+    cfg["review_parallel"] = min(5, max(1, int(cfg["review_parallel"])))
     count = cfg["run"]["max_continuations"]
     if type(count) is not int or not 0 <= count <= 2:
         raise FbrError("run.max_continuations 必须是 0 到 2 的整数")
@@ -345,7 +357,7 @@ def task_locked(fn):
         bound = signature.bind(*args, **kwargs).arguments
         task = bound.get("task_dir", bound.get("task"))
         with file_lock(Path(task) / ".operation.lock"):
-            if fn.__name__ in ('run_one', 'recover_one', 'collect_one', 'commit_one', 'record_one', 'facts_one', 'review', 'probe_one'):
+            if fn.__name__ in ('run_one', 'recover_one', 'collect_one', 'commit_one', 'record_one', 'facts_one', 'review', 'finalize', 'probe_one'):
                 receipt = load_json(Path(task) / 'review/upload.json', default={})
                 if receipt.get('submission_id'):
                     raise FbrError('任务已有平台单，生产证据已冻结；不能自动重跑、重录或重写评价')
@@ -530,11 +542,21 @@ def scratch_dir(prefix: str) -> Path:
 
 
 def run_steps_in_image(image: str, workdir: Path, steps: list[dict], *, tail: int = 60,
-                       stop_on_fail: bool = True) -> list[dict]:
+                       stop_on_fail: bool = True, _seed: bool = True) -> list[dict]:
     """在任务镜像的一个新容器里依次跑几条命令（同一个容器，前一步装的东西后一步能用），不带 key。
 
     steps: [{name, cmd, timeout}]；返回 [{name, cmd, rc, seconds, tail}]，没跑到的步骤 rc 为 None。
     """
+    if _seed and steps and steps[0].get('name') == 'setup':
+        try:
+            cfg = settings(containing_root(workdir))
+        except FbrError:
+            cfg = None
+        if cfg and cfg.get('dependencies', {}).get('enabled'):
+            import fbr_dependencies
+            prepared = fbr_dependencies.seed(workdir, cfg, setup_cmd=steps[0]['cmd'])
+            if prepared:
+                steps = [dict(steps[0], cmd=cfg.get('dependencies', {}).get('setup_after_restore_cmd') or 'true'), *steps[1:]]
     lines = ["cd /workspace || exit 97"]
     for index, step in enumerate(steps):
         guard = "if [ \"$_stop\" != 1 ]; then" if stop_on_fail else "if true; then"

@@ -319,13 +319,17 @@ def record_one(task_dir: Path, cfg: dict, redo: bool = False) -> dict:
             if container:
                 lib.run(["docker", "kill", container], timeout=60)
             clone = lib.clean_clone(task_dir / "workspace", commit, f"s11-rec-{name}")
+            seeded = False
+            if cfg.get('dependencies', {}).get('enabled') and setup_cmd:
+                import fbr_dependencies
+                seeded = fbr_dependencies.seed(clone, cfg, setup_cmd=setup_cmd)
             port = fbr_web.free_port() if web else None
             container = start_container(record["image"], clone, port) if web else start_container(record["image"], clone)
             retained.append({"name": container, "clone": str(clone), "attempt": attempt})
             lib.save_json(out_dir / "containers.json", {"containers": retained, "retained": True})
             if not setup_cmd:
                 break
-            done = lib.run(["docker", "exec", "-w", "/workspace", container, "bash", "-lc", setup_cmd],
+            done = lib.run(["docker", "exec", "-w", "/workspace", container, "bash", "-lc", (cfg.get("dependencies", {}).get("setup_after_restore_cmd") or 'true') if seeded else setup_cmd],
                            timeout=int(rec["setup_timeout"]))
             tail = "\n".join((done.stdout + "\n" + done.stderr).strip().splitlines()[-30:])
             setup_runs.append({"attempt": attempt, "rc": done.returncode, "tail": lib.clip(tail, 2000)})

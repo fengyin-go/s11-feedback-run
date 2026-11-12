@@ -1,46 +1,47 @@
-# 独立验收模型
+# 轨迹分析与当前任务 AI 验收
 
-用户指定：验收轨迹分析、需求完成判断、评分和评价描述统一使用 `gpt-6.1-sol`，推理强度 `high`，包括返修。主会话可继续使用 CC Switch 配置的 DeepSeek；主会话只调度、收集与实跑，不生成评价结论或修改指定模型的评价。
+只有轨迹分析使用 `reviewer.env`。过程证据核查、需求验收、评分、Feedback 撰写、过程与产物断言逐句复核、门闸修复由推进任务的当前 AI 完成，所有其他操作使用推进任务的当前 AI，不读取这份配置，不指定固定模型或推理强度，不冒称独立模型或审核人完成。
 
-## 配置
+## 轨迹配置
 
-本机文件：`/Users/fengyin/.codex/solo11/reviewer.env`。其他机器默认 `~/.codex/solo11/reviewer.env`；用入口全局参数 `--env-file /绝对路径` 可覆盖，放在 `probe` 或 `review` 前。
+本机文件 `/Users/fengyin/.codex/solo11/reviewer.env`，权限 600、非符号链接；其他机器默认 `~/.codex/solo11/reviewer.env`。入口全局参数 `--env-file /绝对路径` 可覆盖。
 
 ```dotenv
 base_url=
 apikey=
+model=gpt-6.1-sol
+reasoning_effort=high
 ```
 
-`base_url` 填网关的 OpenAI Responses API 根地址，例如服务方要求的 `https://网关/v1`，不填 `/responses` 路径；脚本保留给出的路径，不自动加删 `/v1`。`apikey` 填验收专用 key，不加引号。文件权限必须为 600。不把 key 填进 SKILL.md、settings.json、命令行、题目仓库或消息。
+前两项必填，模型及强度未填写时沿用上面的默认值。base_url 是 HTTPS Responses API 根地址，不带 `/responses`、查询参数或口令；路径保持原样。key 不加引号，不出现在命令行、仓库、日志或消息中。轨迹 key 与跑题的 gateway.env 不复用。
 
-跑题用的 `gateway.env` 和验收用的 `reviewer.env` 分别配置，不自动复用。镜像中 `auto_model/urm` 的运行配置仍由原跑题入口负责。
+仅 `review` 轨迹分析及其 `probe` 连通性检查读取此配置。使用临时 CODEX_HOME、只读沙箱、隔离子进程环境，不修改 CC Switch 或全局配置。调用失败保留原始轨迹和错误，不回退其他模型，不声称完成。请求回执不证明第三方网关实际的上游路由。
 
-网关需要支持 Responses API、`gpt-6.1-sol` 这个精确模型标识和 `reasoning.effort=high`，以及验收读取文件所需的工具调用。如果网关使用另一个模型标识，先向用户确认映射，不能自行改为其他模型。请求参数与回执不能证明第三方网关实际调用的上游模型。
+## 操作
 
-## 连通性与运行
-
-下列命令省略 `python3 <skill>/scripts/` 前缀，在批次根目录运行：
+下列命令省略 `python3 <skill>/scripts/`：
 
 ```bash
-fbr_reviewer.py probe                           # 演练，不发请求
-fbr_reviewer.py probe --execute                 # 用独立网关发一次小请求，消耗少量额度
 fbr_feedback.py card --batch b1110-01
 fbr_reviewer.py review --batch b1110-01 --task s11-000123 --execute
-fbr_feedback.py gate --batch b1110-01
+# 返回 needs_task_agent：当前任务 AI 开始产物验收、评分、写作和复核
+fbr_reviewer.py finalize --batch b1110-01 --task s11-000123 --candidate /绝对路径/candidate.json --verification /绝对路径/verification.json --execute
 ```
 
-入口要求本机安装 Codex CLI，采用临时 `CODEX_HOME`，显式指定 provider、模型、high 和 Responses 协议；忽略用户配置及规则，关闭项目指令和联网搜索，使用只读沙箱及临时会话。验收 key 只放子进程环境，排除在模型执行的 shell 环境外。不修改全局 Codex 配置、CC Switch 或本次主会话模型。
+`review` 读取全量主/子会话及获准续写索引，定向核对原始工具输入/返回、相关完整后续、末次改动后的验证及最终回答。报告必须覆盖每份原始轨迹，含连续原文出处；索引、facts 和模型自述只作导航。分析不负责产物评分或写 Feedback。保存 `review/trace-analysis.json` 后，生成 `review/task-agent-work.json`，返回 `needs_task_agent`。滚动调度保留此待办，当前任务 AI 必须主动处理，不能把这个返回视为完成。
 
-调用失败、超时、模型不支持或格式不合法时停止，不回退 DeepSeek 或其他模型。配置未填写时不发送请求。`probe` 的 OK 只证明一次文本响应成功；第一道真题仍需确认完整材料读取、工具调用、评价结构及证据闸门都通过。
+当前任务 AI 先检查题面、diff、最终代码及相关调用链，再复用已有录屏和实跑证据。静态证据充分时无需重复启动；缺证据时按既有 probe 入口在任务镜像中补跑，不能直接在宿主机运行被审项目。补证后刷新 card；若轨迹报告仍有效，可用 `prepare --batch … --task … --execute` 仅刷新检查点，不调用外部模型。
 
-如果返回 `needs_probes`，根据 `review/probe-requests.json` 使用 `fbr_feedback.py probe` 在现有任务镜像的产物提交上真实执行，再生成 card 并重新验收。不要在宿主机直接执行被审项目代码。
+candidate 是 `{"audit": ..., "feedback": ..., "needs_probes": []}`，结构见检查点中的 candidate_schema。verification 须包含：
 
-模型先检查 diff、最终代码与实际调用链；静态证据足以确证需求缺口或 bug 时，不为同一结论启动服务。仅对运行依赖、证据不足或需验证通过的行为申请最小定向 probe；复用现有有效证据，交付录屏仍需保留。
+- `task_agent: "current_task_agent"`，如实表明复核者。
+- `binding`：检查点中的 binding 原样引用；它绑定证据、规则及轨迹分析摘要。
+- `candidate_sha`：`fbrlib.content_hash(candidate)`，不是文件原始字节摘要。
+- `checks`：feedback-quality.md 的七项语义判断，每项具体事实依据。
+- `claim_reviews`：按 `fbr_quality.public_units(feedback.feedback)` 顺序逐句列出 sentence、assertions、verdict、reason、later_check、sources(path/excerpt)。逐句复核必须真的回查原始来源、后续修正和最终影响，摘录必须逐字存在。
 
-入口生成 review/trace-index.jsonl，覆盖首轮、子会话及全部获准续写的每条消息，保留原始路径、行号、工具 ID 和结果关联。模型先浏览完整索引，再定向读取原始消息和相关日志；大消息解码后按字段分段读，不能用截断输出判断事实。索引和 facts 只导航，不作事实出处。负面缺失断言需检查完整相关后续范围，不能以关键词未命中证明未发生。评价综合全部过程和最终产物；填表标识仍取第一轮。它输出 audit、feedback 和 needs_probes。生成提示每次加载当前评分、写作、证据契约及样本校准规则，不依赖旧素材卡里的结构。
+当前 AI 写完候选后另做复核轮，发现矛盾或证据不足先修候选、补证，不把它标成 supported。正文每句必须覆盖。过程断言结合轨迹报告与原始来源，产物断言检查代码、实际日志及基线，不用生成报告代替原始出处。评分标准和证据要求保持不变。
 
-入口先执行确定性检查：结果和过程原句、需求关联、实际日志摘录、测试数量出处、评分上限及查重。通过后，再启动独立的 `gpt-6.1-sol / high` 调用，逐句拆出全部事实断言，回查原始材料、后续修正和最终产物，保存连续原文摘录；覆盖缺失、摘录不存在或结论不确定均拒绝采用。随后核对七项语义与其他正文的组织方式。复核失败时，把具体原因交回指定模型修复；标准入口每轮 3 版后，调用 `fbr_recover.py --batch … --task … --execute` 继续，保留每次生成和独立复核的请求、输出及轮次错误，不采纳失败候选。恢复只调整调度与来源/格式提示，不修改评分或证据政策，也不改写已通过记录的回执。调用异常需排除配置或网关故障后恢复；缺证据则请求最小 probe，不以降低标准解决。原提示词工程运行的重试限制不受此规则影响。详见 [feedback-quality.md](feedback-quality.md)。
 
-全部通过后才保存评价、`review/model-review.json` 和 `review/quality.json`。两份回执绑定模型/强度、输入、输出和规则摘要，后者另含逐句原文复查、后续状态、七项复核依据及修改记录。gate、导出和结果表继续检查这些绑定；证据、规则或评价发生变化后，必须重新调用指定模型。旧任务不会被自动改稿或回写平台，但缺少当前有效复核时不能再次交付。
 
-闸门错误及人工退回原因通过 `review/gate.json` 和 `review/spotcheck.json` 提供给下一次指定模型验收；不让主会话润色后重新盖回执。人审抽检不由模型代登记。平台其他问题字段仍仅填中断续写说明，其余情况为空字符串，返修也相同。
+`finalize` 不加载配置、不调用模型；默认在通过后主动推送快照并回读，明确本地模式加 `--no-publish`。它核对绑定、证据契约、评分上限、查重、七项语义记录和逐句原文。失败保存候选、复核和错误到 task-agent-history.json，返回 repairing，由当前 AI 继续修复；不会采用失败候选。通过后保存 task-agent-v1 回执、归档旧版、执行门闸并立即刷新本地表。文件来源变化或规则变化会使回执失效，必须重新核实；不自动改稿或提交平台；发布失败保留验收结果，修复后补发布即可。人工 spotcheck 由真实审核人完成。

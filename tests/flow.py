@@ -156,9 +156,21 @@ class FlowCase(FactsCase):
 
     def review_receipt(self, task_dir: Path) -> None:
         """离线模拟指定模型完成生成；生产代码只能在实际模型调用成功后写回执。"""
+        import fbr_trace_review
+        from types import SimpleNamespace
+        fbr_reviewer.trace_index(task_dir)
+        paths = sorted((task_dir/'trace/projects').rglob('*.jsonl'))
+        engine = SimpleNamespace(file_sha=fbr_reviewer.file_sha, quality=fbr_quality)
+        trace = {'state': 'accepted', 'identity': fbr_trace_review.identity(task_dir, engine),
+                 'receipt': {'model': fbr_reviewer.MODEL, 'reasoning_effort': fbr_reviewer.EFFORT, 'provider': fbr_reviewer.PROVIDER},
+                 'coverage': [{'path': p.relative_to(task_dir).as_posix(), 'last_line': len(p.read_text().splitlines())} for p in paths],
+                 'statements': [{'statement': '离线轨迹分析协议夹具', 'verdict': 'supported', 'later_check': '离线夹具后续状态',
+                     'sources': [{'path': paths[0].relative_to(task_dir).as_posix(), 'excerpt': paths[0].read_text().splitlines()[0]}]}]}
+        lib.save_json(task_dir/'review/trace-analysis.json', trace)
         receipt = {
-            "state": "completed", "model": fbr_reviewer.MODEL, "reasoning_effort": fbr_reviewer.EFFORT,
-            "provider": fbr_reviewer.PROVIDER, "base_url": "https://review.example.test/v1",
+            "state": "completed", "model": "current_task_agent", "reasoning_effort": "session",
+            "workflow": "task-agent-v1", "trace-analysis_sha": fbr_reviewer.file_sha(task_dir/"review/trace-analysis.json"),
+            "provider": "current_task_agent",
             "inputs": fbr_reviewer.inputs(task_dir),
             "audit_sha": fbr_reviewer.file_sha(task_dir / "evidence/audit.json"),
             "feedback_sha": fbr_reviewer.file_sha(task_dir / "review/feedback.json"),

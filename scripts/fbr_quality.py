@@ -9,12 +9,12 @@ import re
 import fbr_gate as gate
 import fbrlib as lib
 
-VERSION = 3
+VERSION = 4
 CHECKS = ("result_and_process", "task_specific_voice", "test_relevance", "score_alignment",
           "evidence_fidelity", "scope_discipline", "non_template")
 RULE_FILES = ("references/scoring.md", "references/feedback-writing.md", "references/feedback-calibration.md",
               "references/feedback-quality.md", "scripts/fbr_gate.py", "scripts/fbr_quality.py",
-              "scripts/fbr_reviewer.py", "scripts/fbr_feedback.py")
+              "scripts/fbr_reviewer.py", "scripts/fbr_feedback.py", "scripts/fbr_trace_review.py", "scripts/fbr_sources.py")
 TEST_CLAUSE = re.compile(r"[^。；！？\n]*(?:测试|用例|\btest\w*|\bpytest\b)[^。；！？\n]*", re.I)
 COUNT_CLAIM = re.compile(r"(?:\d+\s*(?:条|个|项)\s*(?:测试|用例)|(?:测试|用例)[^。；]{0,8}\d+|\d+\s*(?:条|个|项)?\s*(?:全[部都]?通过|通过))")
 NEGATIVE_TEST = re.compile(r"(?:未|没有|没|未曾|并未)[^。；]{0,24}(?:测试|用例|验证)|(?:测试|用例)[^。；]{0,16}(?:未执行|没跑|未跑|未重跑|缺失)")
@@ -181,7 +181,7 @@ def public_units(text: str) -> list[str]:
 
 
 def claim_report_errors(report: dict, doc: dict, task: Path) -> list[str]:
-    """强制逐句复查及原文摘录；摘录能否支持含义仍由独立模型负责。"""
+    """强制逐句复查及原文摘录；摘录能否支持含义仍由当前任务 AI 逐句复核。"""
     rows = report.get('claim_reviews')
     units = public_units(doc.get('feedback', ''))
     if not isinstance(rows, list) or len(rows) != len(units):
@@ -233,13 +233,13 @@ def claim_report_errors(report: dict, doc: dict, task: Path) -> list[str]:
 def certificate_errors(task: Path, receipt: dict) -> list[str]:
     path = task / "review/quality.json"
     if path.is_symlink() or not path.is_file():
-        return ["缺少指定模型的 Feedback 语义复核回执"]
+        return ["缺少当前任务 AI 的 Feedback 语义复核回执"]
     cert = lib.load_json(path, default={})
     if not isinstance(cert, dict) or cert.get("version") != VERSION or cert.get("state") != "accepted":
         return ["Feedback 语义复核尚未通过"]
     if receipt.get("policy_sha") != policy_sha() or cert.get("policy_sha") != policy_sha():
         return ["Feedback 规则已更新，须按当前规则重新生成并复核"]
-    for key in ("model", "reasoning_effort", "provider", "inputs", "audit_sha", "feedback_sha"):
+    for key in ("workflow", "trace-analysis_sha", "source_inputs", "model", "reasoning_effort", "provider", "inputs", "audit_sha", "feedback_sha"):
         if cert.get(key) != receipt.get(key):
             return ["Feedback 语义复核与当前模型回执、证据或正文不一致"]
     return report_errors(cert) + claim_report_errors(cert, lib.load_json(task / 'review/feedback.json'), task)

@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import random
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -183,6 +184,23 @@ class Gateway:
                 if self.token in data.get('slots', {}):
                     data['slots'][self.token].update(pid=pid, identity=process_identity(pid))
 
+    def track_existing(self, info, *, claim=False):
+        """Count a verified surviving worker after its original monitor exited."""
+        if not alive(info):
+            return False
+        with self.transaction() as data:
+            slots = {key: value for key, value in data.get('slots', {}).items() if alive(value)}
+            token = next((key for key, value in slots.items() if
+                value['pid'] == info['pid'] and value['identity'] == info['identity']), '')
+            if not token:
+                token = uuid.uuid4().hex
+                slots[token] = {'pid': info['pid'], 'identity': info['identity'],
+                    'at': time.time(), 'recovered': True}
+            data['slots'] = slots
+            if claim:
+                self.token = token
+        return True
+
     def probe_due(self):
         with self.transaction() as data:
             now = time.time()
@@ -227,6 +245,7 @@ class Watcher:
         self.session_id = self.model = ''
         self.events = self.tools = 0
         self.active_tools = set()
+        self.last_type = ''
 
     def poll(self, path, now):
         if not Path(path).exists():
@@ -248,6 +267,7 @@ class Watcher:
                 continue
             self.events += 1
             kind = row.get('type')
+            self.last_type = kind
             if kind == 'system' and row.get('subtype') == 'init':
                 self.session_id = row.get('session_id', '')
                 self.model = row.get('model', '')
@@ -257,6 +277,14 @@ class Watcher:
                 self.retry_interval = now - self.retry_at if self.retry_at else 0
                 self.previous_retry, self.retry_at = self.retry_at, now
                 self.kind = signal
+            # The harness emits these only from API thinking_delta/signature_delta,
+            # not from an elapsed-time spinner. Positive increments mean the API
+            # is producing content again, even before a full assistant message.
+            delta, total = row.get('estimated_tokens_delta'), row.get('estimated_tokens')
+            if (kind == 'system' and row.get('subtype') == 'thinking_tokens'
+                    and type(delta) is int and type(total) is int and total >= delta > 0):
+                self.progress = now
+                self.retry_at = 0
             if kind in ('assistant', 'user', 'result'):
                 self.progress = now
                 self.retry_at = 0
@@ -298,43 +326,125 @@ def monitored_stream(command, stdin_text, stdout_path, stderr_path, timeout, con
         max(0, cfg['gateway_wait_total'] - starting_budget.get('waiting_seconds', 0)))
     request = {'id': request_id, 'command': command, 'stdin': stdin_text,
                'task': str(task), 'guard_deadline': guard, 'started_epoch': time.time(), 'base_budget': starting_budget,
-               'stdout': str(stdout_path), 'stderr': str(stderr_path), 'result': str(result_path)}
+               'stdout': str(stdout_path), 'stderr': str(stderr_path), 'result': str(result_path), 'timeout': timeout}
     lib.save_json(request_path, request)
     process = subprocess.Popen([sys.executable, str(Path(__file__).with_name('fbr_worker.py')), str(request_path)],
                                start_new_session=True, stdin=subprocess.DEVNULL,
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     started = time.time()
-    watcher = Watcher(started)
     base = lib.load_json(task / 'run/current.json', default={})
     base.update(pid=process.pid, identity=process_identity(process.pid), request_id=request_id,
                 result=str(result_path), stdout=str(stdout_path), stderr=str(stderr_path),
                 segment=context['segment'], state='running')
     lib.save_json(task / 'run/current.json', base)
     gateway.transfer(process.pid)
+    return monitor_process(process, request, base, context, started=started)
+
+
+class ExistingProcess:
+    """Observe a surviving worker by PID identity; never launch another command."""
+    def __init__(self, current):
+        self.current = current
+        self.pid = current['pid']
+
+    def poll(self):
+        return None if alive(self.current) else 0
+
+    def wait(self, timeout):
+        until = time.monotonic() + timeout
+        while time.monotonic() < until:
+            receipt = lib.load_json(Path(self.current['result']), default={})
+            if receipt.get('id') == self.current['request_id'] and 'rc' in receipt:
+                return receipt['rc']
+            if not alive(self.current):
+                return 0
+            time.sleep(.1)
+        raise subprocess.TimeoutExpired('existing worker', timeout)
+
+    def kill(self):
+        if alive(self.current):
+            os.kill(self.pid, signal.SIGKILL)
+
+
+def monitor_existing(task, cfg, current):
+    request = lib.load_json(task / 'run' / ('exec-' + current['request_id'] + '.json'), default={})
+    if request.get('id') != current['request_id'] or request.get('task') != str(task):
+        raise lib.FbrError('存活 worker 的原始派发记录不匹配，不能恢复监控')
+    for key in ('stdout', 'stderr', 'result'):
+        if request.get(key) != current.get(key) or not Path(request[key]).resolve().is_relative_to((task / 'run').resolve()):
+            raise lib.FbrError('存活 worker 的派发输出路径不匹配，不能恢复监控')
+    if not isinstance(request.get('started_epoch'), (int, float)) or request['started_epoch'] > time.time():
+        raise lib.FbrError('存活 worker 的派发时间不完整，不能恢复监控')
+    gateway = Gateway(cfg)
+    if not gateway.track_existing(current, claim=True):
+        return
+    current.update(owner_pid=os.getpid(), owner_identity=process_identity(), monitor_recovered_at=lib.now_iso())
+    lib.save_json(task / 'run/current.json', current)
+    try:
+        return monitor_process(ExistingProcess(current), request, current,
+            {'task': task, 'cfg': cfg, 'gateway': gateway}, adopted=True)
+    finally:
+        gateway.release()
+
+
+def monitor_process(process, request, base, context, *, started=None, adopted=False):
+    task, cfg, gateway = context['task'], context['cfg']['run'], context['gateway']
+    request_id, result_path, stdout_path = request['id'], Path(request['result']), Path(request['stdout'])
+    started = request['started_epoch'] if started is None else started
+    base_budget = request['base_budget']
+    previous = lib.load_json(task / 'run/budget.json', default=base_budget)
+    timeout = request.get('timeout', min(cfg['timeout'], max(1, cfg['task_budget'] - base_budget['active_seconds'])))
+    watcher = Watcher(time.time())
+    if adopted:
+        # Reconstruct tool/session state, but historical retries are not new gateway events.
+        now = time.time()
+        watcher.poll(stdout_path, now)
+        watcher.retry_at = watcher.previous_retry = watcher.retry_interval = 0
+        watcher.kind = ''
+        watcher.output = min(now, stdout_path.stat().st_mtime) if stdout_path.exists() else now
     extended = False
     waiting_started = 0
-    waiting_total = 0
+    waiting_total = max(0, previous.get('waiting_seconds', 0) - base_budget.get('waiting_seconds', 0)) if adopted else 0
     last_pressure = 0
-    deadline = started + timeout
-    base_budget = lib.load_json(task / 'run/budget.json', default={'active_seconds': 0, 'waiting_seconds': 0})
+    deadline = started + timeout + waiting_total
+
+    def save_budget(now, spent_wait):
+        previous = lib.load_json(task / 'run/budget.json', default=base_budget)
+        lib.save_json(task / 'run/budget.json', {
+            'active_seconds': max(previous['active_seconds'], base_budget['active_seconds'] + now - started - spent_wait),
+            'waiting_seconds': max(previous.get('waiting_seconds', 0), base_budget.get('waiting_seconds', 0) + spent_wait)})
     while True:
         now = time.time()
         watcher.poll(stdout_path, now)
         done = lib.load_json(result_path, default={})
-        if done.get('id') == request_id:
+        if done.get('id') == request_id and 'rc' in done:
             process.wait(timeout=10)
             base.update(state='exited', rc=done['rc'], ended_at=lib.now_iso())
             lib.save_json(task / 'run/current.json', base)
             spent_wait = waiting_total + (now - waiting_started if waiting_started else 0)
-            lib.save_json(task / 'run/budget.json', {'active_seconds': base_budget['active_seconds'] + now - started - spent_wait,
-                'waiting_seconds': base_budget.get('waiting_seconds', 0) + spent_wait})
-            return done['rc'], False
+            save_budget(now, spent_wait)
+            return done['rc'], bool(done.get('timed_out'))
+        # A completed print result can precede a CLI shutdown hang. Export its
+        # matching main trace, then stop the owned container; retain the real
+        # worker exit code and a separate verified cleanup proof.
+        if not base.get('completion_cleanup') and watcher.last_type == 'result' and not watcher.active_tools:
+            import fbr_completion
+            if fbr_completion.terminal(stdout_path, context['cfg'].get('model', 'auto_model/urm')):
+                proof = fbr_completion.cleanup(task, context['cfg'], base, request)
+                if proof:
+                    base['completion_cleanup'] = proof
+                    lib.save_json(task / 'run/current.json', base)
+                    continue
         protected = watcher.protected(now, cfg)
         if protected and not waiting_started:
             waiting_started = now
             gateway.release()
         elif waiting_started and not protected:
-            if gateway.acquire(now + .1, once=True):
+            # A resumed response is already running inside this same worker.
+            # Count it even if new-dispatch capacity has since been reduced;
+            # quota admission cannot pause an in-flight API stream.
+            resumed = watcher.progress == now and gateway.track_existing(base, claim=True)
+            if resumed or gateway.acquire(now + .1, once=True):
                 gateway.transfer(process.pid)
                 duration = now - waiting_started
                 waiting_total += duration
@@ -350,8 +460,7 @@ def monitored_stream(command, stdin_text, stdout_path, stderr_path, timeout, con
                          (now - waiting_started if waiting_started else 0), 'pid': process.pid}
         lib.save_json(task / 'run/heartbeat.json', heartbeat)
         spent_wait = waiting_total + (now - waiting_started if waiting_started else 0)
-        lib.save_json(task / 'run/budget.json', {'active_seconds': base_budget['active_seconds'] + now - started - spent_wait,
-                'waiting_seconds': base_budget.get('waiting_seconds', 0) + spent_wait})
+        save_budget(now, spent_wait)
         reason = ''
         if waiting_started:
             if now - waiting_started >= cfg['gateway_wait_limit'] or base_budget.get('waiting_seconds', 0) + spent_wait >= cfg['gateway_wait_total']:
@@ -370,6 +479,8 @@ def monitored_stream(command, stdin_text, stdout_path, stderr_path, timeout, con
             reason = 'task_budget'
         if now >= context['cfg'].get('_deadline', float('inf')):
             reason = 'batch_budget'
+        if now >= request.get('guard_deadline', float('inf')):
+            reason = 'worker_guard'
         if reason:
             # 先停止容器内进程，再等 worker 写出退出码。原始证据仍在容器中。
             lib.run(['docker', 'kill', task.name], timeout=60)

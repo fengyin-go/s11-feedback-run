@@ -28,6 +28,7 @@ import time
 import contextlib
 import subprocess
 import json
+from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -133,13 +134,13 @@ def bound_key(task_dir: Path, cfg: dict, *, start: bool = False) -> str:
     return secret
 
 
-def ready_problems(task_dir: Path, record: dict, cfg: dict) -> list[str]:
+def ready_problems(task_dir: Path, record: dict, cfg: dict, *, prepared: bool = False) -> list[str]:
     workspace = task_dir / "workspace"
     problems = []
     if key_hold(task_dir):
         return ["已检测到网关 key 泄露，保留证据与容器，等待人工处理"]
     current = lib.load_json(task_dir / "run/current.json", default={})
-    if current.get("state") in ("running", "starting"):
+    if current.get("state") in ("running", "starting") and not prepared:
         return ["存在未收口运行，先执行 recover；不在活跃工作区执行宿主机 Git"]
     if (record.get("publish") or {}).get("state") != "published":
         problems.append("任务仓库还没发布（初始环境快照没有地址）")
@@ -169,9 +170,12 @@ def ready_problems(task_dir: Path, record: dict, cfg: dict) -> list[str]:
         tree = lib.git(workspace, "rev-parse", "HEAD^{tree}").stdout.strip()
         if tree != record["baseline"].get("tree"):
             problems.append("workspace 文件树与冻结基线不一致")
-    if lib.git(workspace, "status", "--porcelain", "--ignored").stdout.strip():
+    if __import__("fbr_dependencies").unexpected_ignored(task_dir, lib.git(workspace, "status", "--porcelain", "--ignored").stdout.strip()):
         problems.append("workspace 不干净（有未提交或被忽略的文件）")
-    if container_exists(record["task_id"]):
+    import fbr_dependencies
+    if lib.git(workspace, 'cat-file', '-e', record['initial_commit']).returncode == 0:
+        problems += fbr_dependencies.snapshot_problems(workspace, record['initial_commit'])
+    if not prepared and container_exists(record["task_id"]):
         problems.append(f"已有同名容器 {record['task_id']}：先确认它的轨迹导出过，再手动 docker rm")
     return problems
 
@@ -241,6 +245,42 @@ def code_changes(task_dir: Path, record: dict) -> list[str]:
     return [p for p in paths if p and not noise.search(p) and Path(p).suffix.lower() not in docs]
 
 
+def prepared_problems(task_dir: Path, record: dict, cfg: dict, current: dict) -> list[str]:
+    """Prove a dead controller stopped before creating any dispatch request."""
+    if current.get('state') != 'starting' or any(current.get(k) for k in
+            ('pid', 'request_id', 'result', 'session_id', 'continuations')):
+        return ['已有派发身份，不能按未派发容器恢复']
+    owner = {'pid': current.get('owner_pid'), 'identity': current.get('owner_identity')}
+    if runtime.alive(owner):
+        return ['原调度仍活着，不接管正在等待派发的容器']
+    if not current.get('container_id') or not container_exists(task_dir.name):
+        return ['未派发容器缺失或身份不完整']
+    attempts = lib.load_json(task_dir / 'run/attempts.json', default=[])
+    if current.get('attempt') != len(attempts) + 1 or len(attempts) >= cfg['run']['max_attempts']:
+        return ['未派发记录与已有尝试次数不符，保留现场']
+    try:
+        started = datetime.fromisoformat(current['started_at']).timestamp()
+        for path in (task_dir / 'run').glob('exec-*.json'):
+            request = lib.load_json(path)
+            if not request.get('started_epoch') or request['started_epoch'] >= started:
+                return ['存在本次派发请求或无法确认请求时间，保留现场']
+    except (KeyError, TypeError, ValueError):
+        return ['派发时间材料不完整，保留现场']
+    if any(p.stat().st_size for name in ('stream.jsonl', 'stderr.log')
+           if (p := task_dir / 'run' / name).exists()):
+        return ['存在未归档运行输出，不能认定尚未派发']
+    processes = lib.run(['docker', 'top', task_dir.name, '-eo', 'pid,comm'], timeout=30)
+    names = processes.stdout.splitlines()[1:]
+    if processes.returncode or sorted(n.split()[-1] for n in names if n.strip()) != ['docker-init', 'sleep']:
+        return ['容器不只包含初始等待进程，不能认定尚未派发']
+    sessions = lib.run(['docker', 'exec', task_dir.name, 'python3', '-c',
+        'from pathlib import Path; import sys; sys.exit(int(any(p.is_file() for p in Path("'
+        + lib.TRACE_SRC + '").rglob("*"))))'], timeout=30)
+    if sessions.returncode:
+        return ['容器已有会话文件或无法检查会话，不能重新发送题面']
+    return ready_problems(task_dir, record, cfg, prepared=True)
+
+
 @lib.task_locked
 def recover_one(task_dir: Path, cfg: dict) -> dict:
     """只认本任务持久回执及容器归属；活进程不杀、不重复投题。"""
@@ -267,7 +307,41 @@ def recover_one(task_dir: Path, cfg: dict) -> dict:
             return {**row, 'state': 'blocked', 'detail': '原会话容器缺失，不能继续'}
         return {**row, 'state': 'continue_ready', 'detail': '原会话已核验，可发送获准的继续'}
     if runtime.alive(current):
-        return {**row, 'state': 'running', 'detail': '持久 worker 仍活着，继续等待，不重跑'}
+        if cfg.get('_managed'):
+            bound_key(task_dir, cfg)
+            runtime.Gateway(cfg).track_existing(current)
+            owner = {'pid': current.get('owner_pid'), 'identity': current.get('owner_identity')}
+            if not runtime.alive(owner):
+                runtime.monitor_existing(task_dir, cfg, current)
+                current = lib.load_json(current_path)
+            else:
+                return {**row, 'state': 'running', 'detail': '持久 worker 仍活着，原调度继续监控，不重跑'}
+        else:
+            return {**row, 'state': 'running', 'detail': '持久 worker 仍活着，继续等待，不重跑'}
+    if (current.get('state') == 'starting' and not current.get('container_id')
+            and not container_exists(task_dir.name)):
+        # The operation lock is held: a failed dependency setup cannot still dispatch.
+        # Require positive absence of any execution identity or output before redoing setup.
+        if any(current.get(k) for k in ('pid', 'request_id', 'result', 'session_id', 'continuations')):
+            return {**row, 'state': 'blocked', 'detail': '起跑身份不完整，保留现场'}
+        if list((task_dir/'run').glob('exec-*.json')) or any(
+                p.stat().st_size for name in ('stream.jsonl', 'stderr.log')
+                if (p := task_dir/'run'/name).is_file()):
+            return {**row, 'state': 'blocked', 'detail': '已有请求或输出，不能重做派发前准备'}
+        problems = ready_problems(task_dir, record, cfg, prepared=True)
+        if problems:
+            return {**row, 'state': 'blocked', 'detail': '；'.join(problems)}
+        history_path = task_dir/'run/pre-container-recovery.json'
+        history = lib.load_json(history_path, default={'events': []})
+        history['events'].append({'at': lib.now_iso(), 'previous': current,
+                                 'reason': '容器尚未创建、请求和输出均不存在，仅重做依赖准备'})
+        lib.save_json(history_path, history)
+        lib.save_json(current_path, {**current, 'state': 'setup_ready'})
+        return {**row, 'state': 'idle', 'detail': '已核实未创建容器、未发送题面；原次数及预算保留'}
+    if current.get('state') == 'starting' and not current.get('request_id'):
+        problems = prepared_problems(task_dir, record, cfg, current)
+        return {**row, 'state': 'blocked' if problems else 'prepared',
+                'detail': '；'.join(problems) if problems else '未派发容器和干净基线已核验，可接续同一次起跑'}
     done = lib.load_json(Path(current.get('result', '/nonexistent')), default={})
     if done.get('id') != current.get('request_id') or 'rc' not in done:
         return {**row, 'state': 'blocked', 'detail': 'worker 已退出但无匹配回执，保留容器和全部证据'}
@@ -286,7 +360,9 @@ def recover_one(task_dir: Path, cfg: dict) -> dict:
         budget['active_seconds'] = max(budget['active_seconds'], initial_budget.get('active_seconds', 0) +
             max(0, done['ended_epoch'] - request['started_epoch'] - waited))
         lib.save_json(budget_path, budget)
-    decision = fbr_trace.classify_attempt(done['rc'], current.get('timed_out', False) or done.get('timed_out', False), segment, tail)
+    import fbr_completion
+    decision = fbr_trace.classify_attempt(done['rc'], current.get('timed_out', False) or done.get('timed_out', False), segment, tail,
+                                          completed_cleanup=fbr_completion.valid(task_dir, current, done))
     if segment.get('model') and segment['model'] != cfg.get('model', 'auto_model/urm'):
         decision = {'verdict': 'stop', 'reason': '实际模型不符', 'detail': '模型与起跑预期不符'}
     if runtime.auth_error(segment, tail):
@@ -326,6 +402,8 @@ def recover_one(task_dir: Path, cfg: dict) -> dict:
                       ended_at=lib.now_iso(), session_id=segment['session_id'], continuations=continuations)
         current.update(state='finished')
         lib.save_json(current_path, current)
+        if cfg.get('_managed'):
+            runtime.Gateway(cfg).event('success')
         return {**row, 'state': 'ok', 'detail': '匹配退出回执，运行已恢复收口'}
     if decision['verdict'] == 'retry':
         archive_attempt(task_dir, record, current['attempt'], secret)
@@ -353,9 +431,9 @@ def run_one(task_dir: Path, cfg: dict) -> dict:
     resume = None
     if current.get('state') in ('running', 'exited', 'starting', 'continue_ready'):
         recovered = recover_one(task_dir, cfg)
-        if recovered['state'] not in ('deferred', 'continue_ready', 'idle'):
+        if recovered['state'] not in ('deferred', 'continue_ready', 'idle', 'prepared'):
             return recovered
-        if recovered['state'] == 'continue_ready':
+        if recovered['state'] in ('continue_ready', 'prepared'):
             resume = lib.load_json(task_dir / 'run/current.json')
     problems = [] if resume else ready_problems(task_dir, record, cfg)
     if problems:
@@ -375,6 +453,9 @@ def run_one(task_dir: Path, cfg: dict) -> dict:
         if budget["active_seconds"] >= cfg["run"]["task_budget"]:
             lib.set_stage(task_dir, "run", "deferred", reason="单题累计运行预算耗尽，恢复不会清零预算")
             return {"task_id": name, "state": "deferred", "detail": "单题累计运行预算耗尽"}
+        if budget.get('waiting_seconds', 0) >= cfg['run']['gateway_wait_total']:
+            lib.set_stage(task_dir, 'run', 'deferred', reason='单题累计网关等待预算耗尽，未派发新的尝试')
+            return {'task_id': name, 'state': 'deferred', 'detail': '单题累计网关等待预算耗尽，保留次数与容器，不发送题面'}
         number = len(attempts) + 1
         lib.open_permissions(task_dir / "workspace")
         started = lib.now_iso()
@@ -385,6 +466,9 @@ def run_one(task_dir: Path, cfg: dict) -> dict:
                             for p in Path(__file__).parent.glob('*.py')}),
             "image": record["image"], "image_id": cfg["image_id"], "continuations": (resume or {}).get('continuations', [])})
         if not resume:
+            import fbr_dependencies
+            if cfg.get('dependencies', {}).get('enabled'):
+                fbr_dependencies.seed(task_dir/'workspace', cfg, task=task_dir)
             created = lib.run(run_command(task_dir, record, cfg), timeout=120)
             if created.returncode != 0:
                 raise lib.FbrError("跑题容器启动失败，保留容器与证据供排查")
@@ -437,7 +521,11 @@ def run_one(task_dir: Path, cfg: dict) -> dict:
                 return halt_for_key(task_dir, "run")
             segment = fbr_trace.read_stream(stdout)
             tail = "\n".join(stderr.read_text(encoding="utf-8", errors="replace").splitlines()[-20:])
-            decision = fbr_trace.classify_attempt(rc, timed_out, segment, tail)
+            import fbr_completion
+            completion = lib.load_json(run_dir / 'current.json', default={})
+            completed_exit = lib.load_json(Path(completion.get('result', '/nonexistent')), default={})
+            decision = fbr_trace.classify_attempt(rc, timed_out, segment, tail,
+                                                  completed_cleanup=fbr_completion.valid(task_dir, completion, completed_exit))
             if runtime.auth_error(segment, tail):
                 decision = {"verdict": "stop", "reason": "网关鉴权失败", "detail": "鉴权失败，停止开新轮，检查凭据"}
             if segment.get('model') and segment['model'] != cfg.get('model', 'auto_model/urm'):

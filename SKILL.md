@@ -2,7 +2,7 @@
 name: s11-feedback-run
 description: solo11（26.11 领域专项，单轮 pointwise）的运行侧：把铺好的批次逐题在 Claude Code 任务镜像的新容器里单轮跑完，
   导出轨迹并取 SessionID 与 PromptID，提交并推送产物快照，录运行录屏，取证，打交付完整性分数、写 Feedback，过闸门后汇成结果表。
-  分数和 Feedback 由独立 gpt-6.1-sol / high 基于证据生成并复核，脚本负责备料、核对锚点、卡硬上限、查重；通过 SOLO2 接口上传轨迹与视频、建单并回读，同时保留本地 Excel。
+  仅轨迹分析使用 reviewer.env 的模型配置；其余验收、评分和 Feedback 由推进任务的当前 AI 基于证据完成，脚本负责备料、证据绑定、卡硬上限与查重；通过 SOLO2 接口上传轨迹与视频、建单并回读，同时保留本地 Excel。
   自带运行、收集、快照、录屏、取证、闸门、结果表脚本和自测，不依赖其他 skill。
   关键词：solo11、领域专项、单轮运行、轨迹、产物快照、运行录屏、交付完整性、Feedback、结果表。
 ---
@@ -17,7 +17,7 @@ description: solo11（26.11 领域专项，单轮 pointwise）的运行侧：把
 
 ## 流程
 
-默认使用 [滚动调度与恢复](references/runtime-flow.md)：跑完一题就进入录屏、取证和独立评价，不等待整批跑题结束。下列命令均须加 `python3 <skill>/scripts/` 前缀。先演练；获得相应授权后才真跑、发布或提交。
+默认使用 [滚动调度与恢复](references/runtime-flow.md) 和 [缓存与并发](references/performance.md)：跑完一题就进入录屏、取证和独立评价，不等待整批跑题结束。下列命令均须加 `python3 <skill>/scripts/` 前缀。先演练；获得相应授权后才真跑、发布或提交。
 
 ```bash
 fbr_flow.py run --batch b1110-01
@@ -27,7 +27,7 @@ fbr_flow.py drain --batch b1110-01 --execute
 fbr_flow.py resume --batch b1110-01 --execute --confirm FLOW --detach
 ```
 
-真跑默认做到本地评价与结果表。GitHub 推送另加 `--publish --confirm-publish PUBLISH`，平台提交另加 `--auto-submit --confirm-submit SUBMIT`，都要求用户明确授权。下列逐阶段命令仍可用于排错和补跑：
+真跑默认在验收通过后主动推送 GitHub 产物快照并回读 SHA，再核查结果表；明确只做本地时加 `--no-publish`。平台提交另加 `--auto-submit --confirm-submit SUBMIT`，仍须单独获得用户明确授权。下列逐阶段命令仍可用于排错和补跑：
 
 ```
 fbr_run.py preflight                 R0  镜像、版本、context 上限、key、本机依赖
@@ -39,7 +39,7 @@ fbr_record.py --batch …              R4  任务镜像新容器里跑演示命�
 fbr_facts.py --batch …               R5  取证 → evidence/facts.json
 fbr_feedback.py card --batch …       R6  素材卡 → review/card.md
 fbr_reviewer.py review --batch … --task … --execute
-                                       指定 gpt-6.1-sol / high 分析轨迹并生成评价（见 references/reviewer.md）
+                                       仅分析轨迹，完成后返回 needs_task_agent（见 references/reviewer.md）
 fbr_feedback.py gate --batch …           闸门，通过才算数
 fbr_batch.py export --batch …            白名单证据 → results/<批次>/，不复制代码
 fbr_batch.py preview --batch …           抽检预览页（人看）
@@ -51,7 +51,9 @@ fbr_sheet.py --batch …                   回执有效时回填远端媒体、�
 
 每一步都是闸门式的：上一步没过，下一步的脚本直接拒绝；上游重做了，下游自动作废要重来。任何时候不确定走到哪了，跑 `fbr_batch.py status --batch …`，它会列出每道题卡在哪、下一条该跑什么。不要手改 `state.json`。
 
-三件对外的事必须由用户明确说了才做，脚本默认都是演练：真跑（`run --execute`）、真推（`push --execute --confirm PUBLISH`）和平台提交（`upload --execute --confirm SUBMIT`）。平台演练会登录并读取账号、字段和历史记录；不上传附件、不建单。
+数据调表、Feedback 或交付闸门未通过时，默认继续修复到能够通过，不以标记“不通过/blocked”结束可处理的问题。先按 [失败修复与复验](references/remediation.md) 定位来源，再修复字段、补齐实跑材料或由当前任务 AI 修改评价，重新跑相关闸门并立即刷新本地表。只有缺少必要授权、证据确实无法补齐、服务持续不可用或既有预算耗尽时才保留明确阻塞及下一步；其他题继续处理。通过来自事实与材料完整，不能降低标准、改被测代码、伪造证据或修改失败标记来实现。
+
+脚本默认演练。用户授权执行完整流水线后，默认包含验收通过后的 GitHub 产物快照推送；明确只做本地时使用 `--no-publish`。单独 `push` 仍使用 `--execute --confirm PUBLISH`；平台提交仍需单独授权并使用 `--execute --confirm SUBMIT`。平台演练会登录并读取账号、字段和历史记录；不上传附件、不建单。
 
 ## 1. 运行与收集
 
@@ -63,7 +65,7 @@ fbr_sheet.py --batch …                   回执有效时回填远端媒体、�
 
 - 一题一个新容器，容器名就是任务编号。题面原文从 stdin 送进去，只送一次。模型自行中断时，可以在同一容器、同一会话中只输入“继续”，同题累计最多 2 次；不补充需求、不提示解法。
 - 新出题侧先用 `prepare_handoff.py` 生成 V2 `task.json`、`prompt.txt`、录屏方案和批次清单，并从任务仓库 `main` 铺好 `workspace`。S11 类型固定为功能开发/Bugfix/代码重构/功能优化/依赖升级与迁移，整体配比由出题侧按 30/30/5/30/5 校验。
-- 工作区必须停在初始提交、没有任何多余文件才起跑；S11 交接的当前分支必须是 `main`。任务仓库没发布（`task.json` 里 `publish.state` 不是 `published`）不起跑。
+- 工作区必须停在初始提交、除运行侧缓存回执绑定的忽略依赖外没有任何多余文件才起跑；S11 交接的当前分支必须是 `main`。任务仓库没发布（`task.json` 里 `publish.state` 不是 `published`）不起跑。
 - 模型自行中断优先用上述“继续”处理，达到上限仍中断就保留全部内容并停止，不靠重跑刷结果。进程异常退出、网关报错等工程异常才按原规则重跑，连首次最多 3 次；没有可恢复会话的无故中断也按异常处理。正常结束且最终树有代码改动才算有效；改错仍是有效数据。零代码改动必须归档、恢复基线、重建容器重跑，连首次最多 3 次；仅文档、日志、缓存或改后还原不充数。跑得慢本身不是重跑理由。
 - 不算数的那次运行整份归档在 `run/attempt-N/`，工作区恢复到初始提交后再跑。
 - 轨迹导出并确认完整之后才停止、删除容器，不强删。有效轨迹为首轮题面加最多 2 次有中断记录的“继续”；其他追加输入、跨会话续写或 SessionID 对不上均判失败。评价综合首轮和所有续写的过程、回答及最终产物；填表题面、SessionID 与 TurnID/PromptID 仍取第一轮。
@@ -78,7 +80,7 @@ fbr_run.py collect --batch b1110-01
 
 ## 2. 产物快照
 
-获得推送授权后，执行顺序固定为：本地 commit → 录屏和取证 → 独立验收与 Feedback 闸门 → 立即落本地表 → 推送远程快照并回读 SHA/public → 再生成表格并核查全部必填字段。不得在独立验收前自动推送；推送失败保留验收结果，标记交付未通过并重试发布，不重新跑题。用户说“先不提交平台”不影响已授权的 GitHub 快照推送。
+`finalize --execute` 和完整流水线默认在验收通过后主动推送 GitHub 产物快照；明确本地模式时使用 `--no-publish`。执行顺序固定为：本地 commit → 录屏和取证 → 独立验收与 Feedback 闸门 → 立即落本地表 → 推送远程快照并回读 SHA/public → 再生成表格并核查全部必填字段。不得在独立验收前自动推送；推送失败保留验收结果，标记交付未通过并重试发布，不重新跑题。平台提交和 GitHub 发布分别遵守本次用户授权。
 
 - 模型自己的提交原样保留，不 squash、不 rebase、不强推。宿主机只在它后面补一个提交，收走它没提交的改动。
 - 初始提交必须是产物提交的祖先。模型改写了历史时，用它最终的文件在初始提交上另建一个提交，并记录在内部 `review/snapshot.json`，不写入备注。
@@ -114,13 +116,13 @@ fbr_record.py --batch b1110-01                       # --redo 重录
 
 ## 5. 打分与 Feedback
 
-先读 [references/reviewer.md](references/reviewer.md)、`references/scoring.md` 和 `references/feedback-writing.md`。轨迹分析、需求完成判断、交付完整性评分和评价描述必须由独立入口调用 `gpt-6.1-sol`，推理强度 `high`；返修评价也相同。当前主会话即使使用 DeepSeek，也只负责调度、收集和执行实跑，不自行代写、润色或修改评价。指定模型不可用就停止验收，不回退其他模型。`card.md` 只是素材卡。人工 spotcheck 仍由实际审核人完成。
+先读 [references/reviewer.md](references/reviewer.md)、`references/scoring.md` 和 `references/feedback-writing.md`。**只有轨迹分析使用 `reviewer.env`（默认 `gpt-6.1-sol`）**。过程证据核查、需求完成判断、产物验收、交付完整性评分、Feedback 撰写、产物断言逐句复核、门闸修复均由推进任务的当前 AI 完成，不通过该配置调用其他模型，也不固定另一个产物验收模型。人工 spotcheck 仍由实际审核人完成。
 
-1. `fbr_feedback.py card` 生成 `review/card.md`，把题面、需求点、测试对比、演示结果、改动、轨迹索引、模型的回答放在一起。
-2. 调用 `fbr_reviewer.py review`，由指定模型先检查 diff 与最终代码，静态证据能确证问题时无需额外启动服务；再用全量主/子轨迹索引定位原文，逐条判断：做到 / 有问题 / 看不出来。索引只导航，不代替证据。需要实跑时，它返回 `review/probe-requests.json`；调度侧用既有 `probe` 在产物提交上执行，再重新生成素材卡并调用同一验收模型。想打 5 分，至少实跑两个题面没明说的边界情况，各引用不同的 probe。只有 setup 成功且命令确已执行的记录才计数；超时、启动失败和未执行不计数。
-3. 入口先检查结果句、过程句和测试描述的证据契约，再用另一次 `gpt-6.1-sol / high` 调用逐句拆出事实断言，回查原文、后续修正及最终状态，保存原文摘录；正文每句均须覆盖，证据不足或矛盾不能通过。每个过程不满意断言在这独立第二轮重新核对工具输入/返回及完整相关后续，确认是否修正和最终影响；随后复核七项语义，包括测试范围、评分影响和自然表达；不会让生成侧自行宣布通过。失败原因送回指定模型修复。标准入口每轮最多 3 版；达到轮内上限后使用 `fbr_recover.py --batch … --task … --execute` 自动继续修复，不把可修复的评价格式、来源登记或复核错误当作终止条件。恢复入口保留每次模型候选和复核报告，沿用原评分及独立原文复核闸门；不改原始轨迹或被测产物，不沿用失败候选。缺实跑材料时返回 probe 请求，不编造功能缺陷或测试通过数。契约见 [references/feedback-quality.md](references/feedback-quality.md)。
-4. 通过后才保存 `evidence/audit.json`、`review/feedback.json`、`review/model-review.json` 和 `review/quality.json`。回执绑定本次轨迹、证据、正文和生成规则摘要；它记录请求的模型及推理强度，网关实际如何路由仍由网关负责。
-5. `fbr_feedback.py gate`。没过就补充事实或实跑，把闸门错误交给同一指定模型重新评价后再过；不手改评价绕过回执。模型/复核回执缺失、参数不符、材料、规则或评价变化都会阻止交付。
+1. `fbr_feedback.py card` 汇集题面、需求点、测试对比、演示结果、改动与轨迹索引。
+2. `fbr_reviewer.py review` 只分析全量主/子轨迹及获准续写，保存带原文出处、完整后续状态和调用回执的 `review/trace-analysis.json`，随后返回 `needs_task_agent` 检查点。轨迹配置未填写 `model` / `reasoning_effort` 时沿用 `gpt-6.1-sol` / `high`；不可用时只暂停这一阶段，不伪造分析。
+3. 当前任务 AI 读取分析报告、最终代码与真实实跑材料，判需求完成情况、评分并写 `audit` 和 `feedback`。代码已能确证的问题不重复跑服务；缺证据则用既有 probe 补齐后刷新 card 和检查点。5 分仍须至少两个不同的、题面未明说的有效边界 probe。
+4. 当前任务 AI 另做产物与文字复核轮，按 `public_units` 逐句拆出断言，核对原始连续摘录、后续修正、最终影响，以及七项语义要求，保存绑定候选和检查点的 verification。不得将自报“通过”代替逐句证据，不得冒称另一个模型或独立审核人完成。细节见 [reviewer.md](references/reviewer.md) 和 [feedback-quality.md](references/feedback-quality.md)。
+5. `fbr_reviewer.py finalize` 只做确定性校验，不读取 `reviewer.env` 或调用外部模型；通过后保存 `audit.json`、`feedback.json`、`model-review.json` 与 `quality.json`，执行门闸、刷新本地表并主动推送快照，再核查交付字段；明确本地模式时使用 `--no-publish`。失败返回具体错误，由当前任务 AI 继续修复、补证和复验；材料、规则或正文变化须重新核实，不给旧记录补盖新回执。
 
 ```bash
 fbr_feedback.py card  --batch b1110-01
@@ -201,7 +203,7 @@ fbr_sheet.py --batch b1110-01                       # 确认回执后回填媒�
 
 API key 填在上述独立 env 文件的 `apikey=` 后面。`settings.json` 只配置 `"key_file": "~/.codex/solo11/gateway.env"` 等路径，不填 key 原文；相同 key 文件也供返修后的本地校验使用。
 
-验收使用另一份配置 `/Users/fengyin/.codex/solo11/reviewer.env`，填写 `base_url=` 与 `apikey=`；入口支持 `--env-file` 改路径。它只影响独立验收子进程，不改 CC Switch 或全局 Codex 配置。详见 [references/reviewer.md](references/reviewer.md)。
+仅轨迹分析使用 `/Users/fengyin/.codex/solo11/reviewer.env`，填写 `base_url=`、`apikey=`，可配置 `model=` 与 `reasoning_effort=`；入口支持 `--env-file` 改路径。其他操作使用推进任务的当前 AI，不读取这份配置，不改 CC Switch 或全局 Codex 配置。详见 [references/reviewer.md](references/reviewer.md)。
 
 可调的配置都在 `_config/settings.json`，缺省值见 `scripts/fbrlib.py` 的 `DEFAULTS`（并发、超时、重跑次数、录屏规格、测试命令、闸门阈值）。`_config/` 里不放密钥。
 

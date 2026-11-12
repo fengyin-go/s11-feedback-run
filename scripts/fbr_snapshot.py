@@ -120,6 +120,8 @@ def commit_one(task_dir: Path, cfg: dict) -> dict:
               if isinstance(item, dict) and item.get("path") and item.get("reason")}
     problems = scan_secrets(workspace, initial, tree, lib.read_key(cfg), waived,
                             history_tip=None if rewritten else head)
+    import fbr_dependencies
+    problems += fbr_dependencies.snapshot_problems(workspace, tree, history_tip=None if rewritten else head, initial=initial)
     for line in lib.git_out(workspace, "diff", "--name-only", "--diff-filter=AM", initial, tree).splitlines():
         path = workspace / line
         if path.is_file() and not path.is_symlink() and path.stat().st_size > MAX_FILE_BYTES:
@@ -221,8 +223,7 @@ def push_one(hub, task_dir: Path, cfg: dict) -> dict:
     name, workspace = record["task_id"], task_dir / "workspace"
     lib.require_stage(task_dir, "commit")
     snapshot = lib.load_json(task_dir / "review" / "snapshot.json")
-    if snapshot.get("pushed"):
-        return {"task_id": name, "state": "skip", "detail": "已经推过"}
+    was_pushed = snapshot.get("pushed", False)
     full = record.get("task_repo_full") or f"{cfg['github_owner']}/{record['task_repo']}"
     if full.split("/")[0] != cfg["github_owner"]:
         raise lib.FbrError(f"{name}：任务仓库 {full} 不在 {cfg['github_owner']} 名下")
@@ -249,7 +250,7 @@ def push_one(hub, task_dir: Path, cfg: dict) -> dict:
     snapshot.update(pushed=True, pushed_at=lib.now_iso(),
                     artifact_snapshot=f"https://github.com/{full}/commit/{commit}")
     lib.save_json(task_dir / "review" / "snapshot.json", snapshot)
-    return {"task_id": name, "state": "ok", "detail": snapshot["artifact_snapshot"]}
+    return {"task_id": name, "state": "skip" if was_pushed else "ok", "detail": snapshot["artifact_snapshot"]}
 
 
 def main() -> int:

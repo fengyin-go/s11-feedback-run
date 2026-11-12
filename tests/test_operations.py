@@ -238,6 +238,31 @@ class Flow(Sandbox):
         self.assertEqual(result['state'], 'completed')
         self.assertLess(events[first.name + '-record'], events[second.name + '-produce'])
 
+    def test_resumed_ready_task_does_not_wait_for_busy_generation_pool(self):
+        first, second = self.make_task(1), self.make_task(2)
+        cfg=lib.settings(self.root);cfg['concurrency']=1
+        events={}
+        for stage in ('run','collect','commit','record','facts'):
+            lib.set_stage(second,stage,'ok')
+        def produce(task,cfg,opts):
+            time.sleep(.15);events['produced']=time.monotonic()
+            return {'state':'ok','task_id':task.name}
+        def review(task,*args):
+            if task==second:events['ready_review']=time.monotonic()
+            return {'state':'needs_task_agent','task_id':task.name}
+        opts=argparse.Namespace(batch=first.parent.name,tasks=None,publish=False,auto_submit=False,
+                               no_watchdog=True,reviewer_env='unused',execute=True,command='resume')
+        with mock.patch.object(lib,'settings',return_value=cfg), \
+             mock.patch.object(fbr_run,'preflight',return_value=[]), \
+             mock.patch.object(fbr_flow,'produce',side_effect=produce), \
+             mock.patch.object(fbr_flow,'record_task',side_effect=lambda t,*a:t), \
+             mock.patch.object(fbr_flow,'facts_task',side_effect=lambda t,*a:t), \
+             mock.patch.object(fbr_flow,'review_task',side_effect=review), \
+             mock.patch('fbr_sheet.write_sheet'):
+            result=fbr_flow.run_flow(self.root,opts)
+        self.assertLess(events['ready_review'],events['produced'])
+        self.assertEqual(result['state'],'needs_task_agent')
+
     def test_frozen_production_does_not_invoke_runner(self):
         task = self.make_task()
         lib.save_json(task / 'review/upload.json', {'submission_id': 10})
@@ -297,6 +322,15 @@ class Recovery(DockerCase):
         self.assertEqual(fbr_run.recover_one(task, self.cfg)['state'], 'ok')
         self.assertTrue(lib.stage_ok(task, 'run'))
         self.assertEqual(lib.load_json(task / 'run/current.json')['state'], 'finished')
+
+    def test_recovered_success_updates_shared_pressure_once(self):
+        task, _ = self.saved()
+        cfg = copy.deepcopy(self.cfg)
+        cfg['_managed'] = True
+        with mock.patch.object(rt, 'Gateway') as gateway:
+            self.assertEqual(fbr_run.recover_one(task, cfg)['state'], 'ok')
+            self.assertEqual(fbr_run.recover_one(task, cfg)['state'], 'ok')
+        gateway.return_value.event.assert_called_once_with('success')
 
     def test_recovery_zero_change_archives_instead_of_scoring(self):
         task, _ = self.saved(changed=False)

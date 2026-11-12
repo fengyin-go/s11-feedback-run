@@ -295,7 +295,7 @@ def read_stream(path: Path) -> dict:
     return out
 
 
-def classify_attempt(rc: int, timed_out: bool, stream: dict, stderr_tail: str = "") -> dict:
+def classify_attempt(rc: int, timed_out: bool, stream: dict, stderr_tail: str = "", *, completed_cleanup: bool = False) -> dict:
     """判断这次运行算不算数。只有进程异常、网关报错、无故中断才重跑；
 
     模型正常结束但没改代码、改错了、答非所问，都是有效数据，不重跑。
@@ -311,7 +311,7 @@ def classify_attempt(rc: int, timed_out: bool, stream: dict, stderr_tail: str = 
     if result["is_error"]:
         why = "网关报错" if GATEWAY_RE.search(result["text"] + " " + (stderr_tail or "")) else "无故中断"
         return {"verdict": "retry", "reason": why, "detail": lib.clip(result["text"] or result["subtype"], 300)}
-    if rc != 0:
+    if rc != 0 and not completed_cleanup:
         return {"verdict": "retry", "reason": "进程异常退出", "detail": lib.clip(stderr_tail, 300)}
     if not result["text"].strip():
         return {"verdict": "retry", "reason": "无故中断", "detail": "正常退出但没有最终回答"}

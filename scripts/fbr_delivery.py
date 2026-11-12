@@ -24,7 +24,8 @@ SUMMARY_FIELDS = ("task_id", "batch", "repo_id", "prompt", "domain", "subdirecti
                   "task_repo", "task_repo_full", "requirements")
 FILES = ("trace/ids.json", "record/recording.mp4", "record/recording.json", "evidence/facts.json",
          "evidence/audit.json", "evidence/probes.jsonl", "review/feedback.json", "review/gate.json",
-         "review/model-review.json", "review/quality.json")
+         "review/model-review.json", "review/quality.json", "review/field-revisions.json",
+         "review/trace-analysis.json", "review/trace-check.json")
 
 
 def digest(path: Path) -> str:
@@ -106,6 +107,15 @@ def _session_file(task_dir: Path) -> str:
 
 def _source_files(task_dir: Path, feedback_sha: str) -> list[Path]:
     files = [task_dir / name for name in FILES if safe_file(task_dir, task_dir / name)]
+    revision_sources = task_dir / 'evidence/field-revisions'
+    if revision_sources.is_symlink():
+        raise lib.FbrError('字段修订证据目录不能是符号链接')
+    if revision_sources.is_dir():
+        for path in sorted(revision_sources.rglob('*')):
+            if path.is_symlink():
+                raise lib.FbrError('字段修订证据不能是符号链接')
+            if path.suffix in ('.json', '.log') and safe_file(task_dir, path):
+                files.append(path)
     logs = task_dir / 'evidence/command-logs'
     if logs.is_symlink():
         raise lib.FbrError('证据日志目录不能是符号链接')
@@ -162,7 +172,7 @@ def export_batch(root: Path, batch_id: str, cfg: dict | None = None) -> dict:
     cfg = cfg or lib.settings(root)
     target.parent.mkdir(parents=True, exist_ok=True)
     staging = Path(tempfile.mkdtemp(prefix=f".{batch_id}.export-", dir=target.parent))
-    tasks, excluded = [], []
+    tasks, excluded, pending_copies = [], [], []
     try:
         for source in lib.task_dirs(root, batch_id):
             try:
@@ -173,7 +183,8 @@ def export_batch(root: Path, batch_id: str, cfg: dict | None = None) -> dict:
                 if not valid:
                     excluded.append({"task_id": source.name, "reason": reason})
                     continue
-                record = lib.load_task(source)
+                import fbr_fields
+                record = fbr_fields.effective_record(source)
                 if not lib.TASK_ID_RE.fullmatch(source.name):
                     raise lib.FbrError("交付任务编号格式不合法")
                 # 不修改 gate 或状态；再用当前事实执行同一套单题证据规则。
@@ -203,9 +214,9 @@ def export_batch(root: Path, batch_id: str, cfg: dict | None = None) -> dict:
                     relative = path.relative_to(source)
                     copied = dest / relative
                     copied.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copyfile(path, copied)
+                    pending_copies.append((path,copied))
                     entries.append({"path": (target / source.name / relative).relative_to(root).as_posix(),
-                                    "bytes": copied.stat().st_size, "sha256": digest(copied)})
+                                    "bytes": path.stat().st_size, "sha256": inputs[str(relative)]})
                 summary = {k: record[k] for k in SUMMARY_FIELDS if k in record}
                 summary["publish"] = {k: v for k, v in (record.get("publish") or {}).items()
                                       if k in ("state", "repo_url", "initial_snapshot")}
@@ -227,6 +238,15 @@ def export_batch(root: Path, batch_id: str, cfg: dict | None = None) -> dict:
         old = lib.load_json(target / "delivery-manifest.json", default={})
         if all(old.get(k) == manifest[k] for k in manifest) and _verify_files(root, target, old):
             return old
+        import subprocess
+        for source,copied in pending_copies:
+            if not copied.parent.exists(): continue  # task was excluded after preparing entries
+            # APFS CoW retains independent files and history without re-reading unchanged videos.
+            old_file=target/copied.relative_to(staging)
+            original=old_file if old_file.is_file() and not old_file.is_symlink() and digest(old_file)==digest(source) else source
+            done=subprocess.run(['cp','-c',str(original),str(copied)],capture_output=True) if __import__('sys').platform=='darwin' else None
+            if done is None or done.returncode:shutil.copyfile(source,copied)
+            if digest(copied)!=digest(source):raise lib.FbrError('导出期间来源发生变化，拒绝发布混合版本')
         manifest["generated_at"] = lib.now_iso()
         lib.save_json(staging / "delivery-manifest.json", manifest)
         if target.exists():

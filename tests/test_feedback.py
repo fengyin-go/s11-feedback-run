@@ -160,7 +160,7 @@ class Probe(FlowCase):
     def test_empty_command(self):
         task_dir = self.evidenced()
         self.step_calls.clear()
-        with self.assertRaisesRegex(lib.FbrError, "--cmd 不能为空"):
+        with self.assertRaisesRegex(lib.FbrError, "明确命令|不能为空"):
             fbr_feedback.probe_one(task_dir, self.cfg, "   ", 180)
         self.assertEqual(self.step_calls, [])
         self.assertEqual(fbr_feedback.load_probes(task_dir), [])

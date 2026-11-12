@@ -274,8 +274,8 @@ def check_score(score, facts: dict, audit: dict, ev: dict, gate: dict) -> tuple[
         errors.append("判了严重的虚假成功，只能是 1 分")
     if score <= 3 and not (tests["regression"] or "未实现" in levels or "明显" in levels or fake in ("轻微", "较大", "严重")):
         errors.append(f"分数 {score} 偏低：证据里没有测试不过、未实现、明显问题或虚假成功中的任何一项")
-    if score <= 2 and not (not tests["after_runnable"] or "未实现" in levels or fake in ("较大", "严重")):
-        errors.append(f"分数 {score} 偏低：没有跑不起来、未实现或较大的虚假成功")
+    if score <= 2 and not (not tests["after_runnable"] or "未实现" in levels or fake in ("较大", "严重") or (score == 2 and (levels.count("明显") >= 2 or any(r.get("core_path") is True and r.get("level") == "明显" and r.get("verdict") == "有问题" for r in reqs)))):
+        errors.append(f"分数 {score} 偏低：缺少运行失败、未实现、虚假成功或明确核心/多项明显问题的证据")
     demo = facts["demo"]["steps"]
     dead = not tests["after_runnable"] and demo and all(s.get("rc") not in (0, None) for s in demo)
     if dead and score > 2:

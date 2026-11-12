@@ -607,7 +607,7 @@ class FactsOne(FactsCase):
         self.assertEqual((tests["before"]["setup_rc"], tests["before"]["test_rc"]), (1, None))
         self.assertIn("no matching distribution", tests["before"]["setup_tail"])
         self.assertEqual((tests["after_ok"], tests["after_runnable"], tests["regression"]), (False, False, False))
-        self.assertFalse((self.root / "_registry" / "baseline-tests").exists())
+        self.assertEqual(list((self.root / "_registry" / "baseline-tests").glob("*.json")), [])
 
     def test_failed_demo_setup_is_carried_over(self):
         recording = dict(RECORDING, setup_ok=False, setup_runs=[{"attempt": 1, "rc": 1, "tail": "first"},

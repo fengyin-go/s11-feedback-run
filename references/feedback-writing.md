@@ -1,6 +1,6 @@
 # Feedback 写作与证据
 
-正文回答两个问题：最终交付能做什么、还有什么实际落差；模型的实现和验证过程为何得到这个结果。指定 gpt-6.1-sol / high 负责分析、评分、写作及随后另一次语义复核；主会话只调度和实跑。流程见 reviewer.md，机器契约见 feedback-quality.md，同事样本校准见 feedback-calibration.md。
+正文回答两个问题：最终交付能做什么、还有什么实际落差；模型的实现和验证过程为何得到这个结果。仅轨迹分析使用 reviewer.env 配置；推进任务的当前 AI 负责产物验收、评分、写作和随后单独一轮逐句语义复核。流程见 reviewer.md，机器契约见 feedback-quality.md，同事样本校准见 feedback-calibration.md。
 
 ## 从事实组织文字
 

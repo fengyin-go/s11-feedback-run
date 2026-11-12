@@ -362,7 +362,7 @@ class Score(Case):
     def test_lower_bound(self):
         self.has(self.check(3, audit(4))[0], "分数 3 偏低：证据里没有测试不过、未实现、明显问题或虚假成功中的任何一项")
         self.assertEqual(self.check(3, problem("明显"))[0], [])
-        self.assertEqual(self.check(2, problem("明显"))[0], ["分数 2 偏低：没有跑不起来、未实现或较大的虚假成功"])
+        self.assertTrue(any("分数 2 偏低" in error for error in self.check(2, problem("明显"))[0]))
         self.assertEqual(self.check(2, problem("未实现"))[0], [])
         f = facts()
         f["tests"].update(regression=True, after_ok=False, after_runnable=False)

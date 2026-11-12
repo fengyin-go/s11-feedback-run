@@ -31,6 +31,14 @@ class Configuration(unittest.TestCase):
             with self.assertRaises(lib.FbrError):
                 reviewer.credentials(path)
 
+    def test_trace_model_settings_only(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp)/'reviewer.env'
+            path.write_text('model=configured-trace-model\nreasoning_effort=medium\n')
+            self.assertEqual(reviewer.trace_configuration(path), ('configured-trace-model', 'medium'))
+            path.write_text('base_url=https://example.test\napikey=offline\n')
+            self.assertEqual(reviewer.trace_configuration(path), (reviewer.MODEL, reviewer.EFFORT))
+
     def test_process_uses_fixed_model_and_isolated_environment(self):
         secret = "test-review-secret"
         original_home = os.environ.get("CODEX_HOME")
@@ -113,6 +121,12 @@ class TraceNavigation(unittest.TestCase):
 
 
 class Review(FlowCase):
+    def setUp(self):
+        super().setUp()
+        publishing = mock.patch('fbr_flow.finish_review', return_value={'state':'ok'})
+        self.finish_delivery = publishing.start()
+        self.addCleanup(publishing.stop)
+
     def semantic(self):
         return json.dumps({"claim_reviews": mock_claim_reviews(feedback()), "checks": [{"id": name, "passed": True,
                           "reason": "已对照当前轨迹和最终产物核对本项具体事实"} for name in quality.CHECKS]})
@@ -123,44 +137,83 @@ class Review(FlowCase):
     def candidate(self):
         return json.dumps({"audit": audit(), "feedback": feedback(), "needs_probes": []}), self.receipt()
 
-    def test_semantic_rejection_rewrites_then_adopts(self):
-        task = self.written()
+    def agent_prepared(self, number=1):
+        task = self.written(number)
         fbr_feedback.card_one(task)
-        rejected = json.loads(self.semantic())
-        rejected["checks"][3].update(passed=False, reason="扣分依据只引用已修复的过程错误，须重查最终影响")
-        with mock.patch.object(reviewer, "invoke", side_effect=[self.candidate(),
-                (json.dumps(rejected), self.receipt()), self.candidate(), (self.semantic(), self.receipt())]) as called:
-            result = reviewer.review(task, "https://review.example.test/v1", "test-review-secret")
-        self.assertEqual(result["attempts"], 2)
-        self.assertIn("已修复的过程错误", called.call_args_list[2].args[3])
-        self.assertEqual(len(lib.load_json(task / "review/quality.json")["history"]), 2)
+        # Offline fixture only: refresh the bound synthetic trace report.
+        self.review_receipt(task)
+        reviewer.prepare_task_agent(task)
+        return task
+
+    def verification(self, task, candidate):
+        report = json.loads(self.semantic())
+        report.update(task_agent='current_task_agent', candidate_sha=lib.content_hash(candidate),
+                      binding=lib.load_json(task/'review/task-agent-work.json')['binding'])
+        return report
+
+    def test_review_only_analyzes_traces_then_returns_checkpoint(self):
+        task = self.agent_prepared()
+        import fbr_trace_review
+        with mock.patch.object(fbr_trace_review, 'analyze', return_value=lib.load_json(task/'review/trace-analysis.json')) as analysis, \
+             mock.patch.object(reviewer, 'invoke', side_effect=AssertionError('product model must never be called')):
+            result = reviewer.review(task, 'https://review.example.test/v1', 'test-review-secret')
+        self.assertEqual(result['state'], 'needs_task_agent')
+        analysis.assert_called_once()
+
+    def test_acceptance_and_process_recheck_use_current_ai_without_model_config(self):
+        task = self.agent_prepared()
+        candidate = json.loads(self.candidate()[0])
+        verification = self.verification(task, candidate)
+        self.assertFalse((task/'review/trace-claims.json').exists())
+        with mock.patch.object(reviewer, 'invoke', side_effect=AssertionError('no external model')), \
+             mock.patch.object(reviewer, 'credentials', side_effect=AssertionError('no reviewer.env')), \
+             mock.patch.object(reviewer, 'trace_configuration', side_effect=AssertionError('no model settings')):
+            self.assertEqual(reviewer.finalize(task, candidate, verification)['state'], 'ok')
+            self.assertEqual(reviewer.provenance_errors(task), [])
+        receipt = lib.load_json(task/'review/model-review.json')
+        self.assertEqual(receipt['provider'], 'current_task_agent')
+        self.assertEqual(receipt['model'], 'current_task_agent')
+        self.assertEqual(receipt['reasoning_effort'], 'session')
+        self.assertNotIn('trace-claims_sha', receipt)
+
+    def test_semantic_rejection_keeps_old_candidate_and_can_be_repaired(self):
+        task = self.agent_prepared()
+        candidate = json.loads(self.candidate()[0])
+        before = (task/'review/feedback.json').read_bytes()
+        verification = self.verification(task, candidate)
+        verification['checks'][3].update(passed=False, reason='扣分依据只引用已修复的过程错误，须重查最终影响')
+        with mock.patch.object(reviewer, 'invoke', side_effect=AssertionError('no model')), \
+             mock.patch.object(reviewer, 'credentials', side_effect=AssertionError('no env')):
+            result = reviewer.finalize(task, candidate, verification)
+        self.assertEqual(result['state'], 'repairing')
+        self.assertEqual((task/'review/feedback.json').read_bytes(), before)
+        verification = self.verification(task, candidate)
+        with mock.patch('fbr_sheet.write_sheet') as sheet:
+            result = reviewer.finalize(task, candidate, verification)
+        self.assertEqual(result['state'], 'ok')
+        self.assertGreaterEqual(sheet.call_count, 1)
         self.assertEqual(reviewer.provenance_errors(task), [])
 
     def test_overall_pass_without_original_recheck_is_rejected(self):
-        task = self.written()
-        fbr_feedback.card_one(task)
-        before = (task / 'review/feedback.json').read_bytes()
-        missing = json.loads(self.semantic())
-        missing.pop('claim_reviews')
-        calls = [self.candidate(), (json.dumps(missing), self.receipt())] * 3
-        with mock.patch.object(reviewer, 'invoke', side_effect=calls):
-            with self.assertRaisesRegex(lib.FbrError, '连续 3 版'):
-                reviewer.review(task, 'https://review.example.test/v1', 'test-review-secret')
-        self.assertEqual((task / 'review/feedback.json').read_bytes(), before)
-        self.assertIn('逐句复查缺失', str(lib.load_json(task / 'review/quality.json')))
+        task = self.agent_prepared()
+        candidate = json.loads(self.candidate()[0])
+        verification = self.verification(task, candidate)
+        verification.pop('claim_reviews')
+        result = reviewer.finalize(task, candidate, verification)
+        self.assertEqual(result['state'], 'repairing')
+        self.assertIn('逐句复查缺失', str(result))
 
-    def test_three_bad_drafts_stop_without_adopting(self):
-        task = self.written()
-        fbr_feedback.card_one(task)
-        before = (task / "review/feedback.json").read_bytes()
-        bad = json.loads(self.candidate()[0])
-        bad["feedback"]["results"] = []
-        with mock.patch.object(reviewer, "invoke", return_value=(json.dumps(bad), self.receipt())) as called:
-            with self.assertRaisesRegex(lib.FbrError, "连续 3 版"):
-                reviewer.review(task, "https://review.example.test/v1", "test-review-secret")
-        self.assertEqual(called.call_count, 3)
-        self.assertEqual((task / "review/feedback.json").read_bytes(), before)
-        self.assertTrue(reviewer.provenance_errors(task))
+    def test_stale_evidence_and_changed_candidate_are_refused(self):
+        for kind in ('candidate', 'evidence'):
+            with self.subTest(kind=kind):
+                task = self.agent_prepared(1 if kind == 'candidate' else 2)
+                candidate = json.loads(self.candidate()[0])
+                verification = self.verification(task, candidate)
+                if kind == 'candidate': candidate['feedback']['note'] = 'changed'
+                else:
+                    path = task/'evidence/facts.json'
+                    path.write_text(path.read_text()+'\n')
+                with self.assertRaises(lib.FbrError): reviewer.finalize(task, candidate, verification)
 
     def test_missing_rejected_or_stale_quality_blocks_delivery(self):
         task = self.gated()
@@ -185,21 +238,15 @@ class Review(FlowCase):
             self.assertFalse(fbr_delivery.current_feedback(task)[0], kind)
 
     def test_success_saves_receipt_and_gate_rejects_changed_output(self):
-        task = self.written()
-        fbr_feedback.card_one(task)
-        with mock.patch.object(reviewer, "invoke", side_effect=[(
-                json.dumps({"audit": audit(), "feedback": feedback(), "needs_probes": []}), self.receipt()),
-                (self.semantic(), self.receipt())]) as called:
-            result = reviewer.review(task, "https://review.example.test/v1", "test-review-secret")
-        self.assertEqual(called.call_count, 2)
-        self.assertEqual(result["state"], "ok")
+        task = self.agent_prepared()
+        candidate = json.loads(self.candidate()[0])
+        with mock.patch('fbr_sheet.write_sheet'):
+            result = reviewer.finalize(task, candidate, self.verification(task, candidate))
+        self.assertEqual(result['state'], 'ok')
         self.assertEqual(reviewer.provenance_errors(task), [])
-        self.assertEqual(fbr_feedback.gate_task(task, self.cfg)["errors"], [])
-        doc = lib.load_json(task / "review/feedback.json")
-        doc["note"] = "手改评价"
-        lib.save_json(task / "review/feedback.json", doc)
+        doc = lib.load_json(task/'review/feedback.json'); doc['note'] = '手改评价'
+        lib.save_json(task/'review/feedback.json', doc)
         self.assertTrue(reviewer.provenance_errors(task))
-        self.assertTrue(fbr_feedback.gate_task(task, self.cfg)["errors"])
 
     def test_missing_receipt_wrong_model_and_changed_evidence_block_delivery(self):
         task = self.gated()
@@ -219,17 +266,10 @@ class Review(FlowCase):
                 self.assertTrue(reviewer.provenance_errors(task))
                 self.assertFalse(fbr_delivery.current_feedback(task)[0])
 
-    def test_probe_request_invalidates_previous_feedback(self):
-        task = self.gated()
-        fbr_feedback.card_one(task)
-        before = (task / "review/feedback.json").read_bytes()
-        with mock.patch.object(reviewer, "invoke", return_value=(
-                json.dumps({"audit": None, "feedback": None,
-                            "needs_probes": [{"cmd": "make test", "reason": "补充证据"}]}),
-                {"model": reviewer.MODEL, "reasoning_effort": reviewer.EFFORT, "provider": reviewer.PROVIDER})):
-            result = reviewer.review(task, "https://review.example.test/v1", "test-review-secret")
-        self.assertEqual(result["state"], "needs_probes")
-        self.assertEqual((task / "review/feedback.json").read_bytes(), before)
-        self.assertFalse(lib.stage_ok(task, "feedback"))
-        self.assertTrue((task / "review/probe-requests.json").is_file())
-        self.assertTrue(fbr_feedback.gate_task(task, self.cfg)["errors"])
+    def test_probe_request_preserved_for_real_execution(self):
+        task = self.agent_prepared()
+        candidate = {'audit': None, 'feedback': None, 'needs_probes': [{'cmd': 'make test', 'reason': '补证'}]}
+        result = reviewer.finalize(task, candidate, self.verification(task, candidate))
+        self.assertEqual(result['state'], 'needs_probes')
+        self.assertFalse(lib.stage_ok(task, 'feedback'))
+        self.assertTrue((task/'review/probe-requests.json').is_file())

@@ -207,15 +207,17 @@ def facts_one(task_dir: Path, root: Path, cfg: dict, redo: bool = False) -> dict
         return run_tests(record["image"], clone, cfg)
 
     cache = root / "_registry" / "baseline-tests" / f"{lib.content_hash(identity)}.json"
-    cached = lib.load_json(cache, default={})
-    before = cached.get("result", {}) if cached.get("identity") == identity else {}
-    if any(not Path(item['output_file']).is_file() or hashlib.sha256(Path(item['output_file']).read_bytes()).hexdigest() != item.get('output_sha256')
-           for item in before.get('outputs', []) if item.get('output_file')):
-        before = {}
-    if not before:
-        before = tested(initial)
-        if before["setup_rc"] == 0 and before["test_rc"] is not None:
-            lib.save_json(cache, {"identity": identity, "result": before})
+    import fbr_dependencies
+    with fbr_dependencies.wait_lock(cache.with_suffix('.lock'), __import__('time').time()+cfg['facts']['setup_timeout']+cfg['facts']['test_timeout']+180):
+        cached = lib.load_json(cache, default={})
+        before = cached.get("result", {}) if cached.get("identity") == identity else {}
+        if any(not Path(item['output_file']).is_file() or hashlib.sha256(Path(item['output_file']).read_bytes()).hexdigest() != item.get('output_sha256')
+               for item in before.get('outputs', []) if item.get('output_file')):
+            before = {}
+        if not before:
+            before = tested(initial)
+            if before["setup_rc"] == 0 and before["test_rc"] is not None:
+                lib.save_json(cache, {"identity": identity, "result": before})
     after = before if commit == initial else tested(commit)
     before, after = copy.deepcopy(before), copy.deepcopy(after)
     for label, result in (('before', before), ('after', after)):

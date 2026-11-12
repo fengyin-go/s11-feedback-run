@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import tempfile
 import unittest
 from unittest import mock
 
@@ -214,8 +215,8 @@ class Steps(unittest.TestCase):
                 seen["command"] = command
             return fixtures.done(0, "@@FBR step=0 rc=0 secs=1\nok\n@@FBR end=0\n")
 
-        with mock.patch.object(lib, "run", fake):
-            rows = lib.run_steps_in_image("img:1", fixtures.SCRIPTS, self.STEPS[:1])
+        with tempfile.TemporaryDirectory() as temp, mock.patch.dict(os.environ, {"FBR_SCRATCH": temp}), mock.patch.object(lib, "run", fake):
+            rows = lib.run_steps_in_image("img:1", fixtures.SCRIPTS, self.STEPS[:1], _seed=False)
         command = seen["command"]
         self.assertEqual(command[:2], ["docker", "run"])
         self.assertNotIn("--rm", command)

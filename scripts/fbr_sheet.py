@@ -24,6 +24,7 @@ import fbr_trace
 import fbrlib as lib  # noqa: E402
 import fbr_delivery as delivery  # noqa: E402
 import fbr_reviewer as reviewer  # noqa: E402
+import fbr_fields
 
 PUBLIC_COLUMNS = ["User Prompt", "所属领域", "子方向", "任务类型", "任务难度", "语言/框架", "Harness", "Harness 版本",
                   "操作系统", "环境可复现等级", "初始环境快照", "SessionID", "TurnID/PromptID", "轨迹文件", "产物快照",
@@ -91,7 +92,7 @@ def build_note(doc: dict, snapshot: dict, recording: dict, attempts: list[dict])
 
 def build_row(root: Path, task_dir: Path, cfg: dict, *, delivery_manifest: dict | None = None) -> tuple[dict | None, str]:
     """返回 (一行数据, 没进结果页的原因)。"""
-    record = lib.load_task(task_dir)
+    record = fbr_fields.effective_record(task_dir)
     stages = lib.load_state(task_dir)["stages"]
     info = stages.get("feedback", {})
     if info.get("state") != "ok":
@@ -163,7 +164,7 @@ def build_row(root: Path, task_dir: Path, cfg: dict, *, delivery_manifest: dict 
 
 def prepared_fields(root: Path, task_dir: Path, cfg: dict) -> dict:
     """可核对的原始字段；不把未通过当前验收的评价或占位值当作准备完成。"""
-    task = lib.load_task(task_dir)
+    task = fbr_fields.effective_record(task_dir)
     ids = lib.load_json(task_dir / "trace/ids.json", default={})
     snapshot = lib.load_json(task_dir / "review/snapshot.json", default={})
     video = task_dir / "record/recording.mp4"
@@ -209,8 +210,19 @@ def progress_row(task_dir: Path, reason: str) -> list:
     cells, stuck = [task_dir.name], ""
     for stage in lib.STAGES:
         info = stages.get(stage, {})
-        cells.append({"ok": "✓", "failed": "✗", "dry": "演练"}.get(info.get("state"), ""))
-        if info.get("state") == "failed" and not stuck:
+        label = {"ok": "✓", "failed": "✗", "dry": "演练", "deferred": "等待"}.get(info.get("state"), "")
+        if stage == 'feedback' and info.get('state') == 'dry' and '复核中' in info.get('reason', ''):
+            label = '复核中'
+        running = False
+        if stage == 'run' and info.get('state') != 'ok':
+            import fbr_runtime
+            current = lib.load_json(task_dir / 'run/current.json', default={})
+            running = fbr_runtime.alive(current)
+            if running:
+                heartbeat = lib.load_json(task_dir / 'run/heartbeat.json', default={})
+                label = '网关重试中' if heartbeat.get('gateway_wait') else '运行中'
+        cells.append(label)
+        if info.get("state") in ("failed", "deferred") and not running and not stuck:
             detail = info.get("problems") or info.get("reason") or ""
             detail = "；".join(detail) if isinstance(detail, list) else str(detail)
             stuck = f"{STAGE_LABEL[stage]}：{lib.clip(detail, 200)}"
@@ -285,7 +297,7 @@ def write_sheet(root: Path, batch_id: str, cfg: dict) -> dict:
                       "任务难度": "task.json.difficulty", "语言/框架": "task.json.frameworks/language",
                       "Harness": "task.json.harness/settings.harness",
                       "Harness 版本": "trace/ids.json.cli_version，缺失才回退交接配置",
-                      "环境可复现等级": "task.json.repro_level",
+                      "环境可复现等级": "task.json.repro_level；有修订时核验 review/field-revisions.json 及所绑定 schema/环境证据",
                       "初始环境快照": "task.json.publish.initial_snapshot",
                       "SessionID": "trace/ids.json.session_id（原始主会话）",
                       "TurnID/PromptID": "trace/ids.json.prompt_id（首轮）",
@@ -310,13 +322,13 @@ def write_sheet(root: Path, batch_id: str, cfg: dict) -> dict:
                    "ready": all(r["数据状态"] == "可提交" for r in rows) and len(rows) == len(progress)})
 
     corrections = book.create_sheet("字段修订核对")
-    correction_columns = ["任务编号", "操作系统", "子方向", "产物快照", "运行录屏", "备注", "验收状态", "依据"]
+    correction_columns = ["任务编号", "操作系统", "子方向", "环境可复现等级", "产物快照", "运行录屏", "备注", "验收状态", "依据"]
     corrections.append(correction_columns)
     for task_dir in lib.task_dirs(root, batch_id):
         try:
-            task = lib.load_task(task_dir)
+            task = fbr_fields.effective_record(task_dir)
         except lib.FbrError as exc:
-            corrections.append([task_dir.name, "", "", "", "", "", "交接无效", str(exc)])
+            corrections.append([task_dir.name, "", "", "", "", "", "", "字段或交接无效", str(exc)])
             continue
         snapshot = lib.load_json(task_dir / "review/snapshot.json", default={})
         ids = lib.load_json(task_dir / "trace/ids.json", default={})
@@ -326,10 +338,11 @@ def write_sheet(root: Path, batch_id: str, cfg: dict) -> dict:
         corrections.append([task_dir.name,
             canonical_field("操作系统", task.get("os") or cfg["os"]),
             canonical_field("子方向", task.get("subdirection", "")),
+            task.get("repro_level", ""),
             snapshot.get("artifact_snapshot", "") if snapshot.get("pushed") else "",
             str(video.relative_to(root)) if meta and video.is_file() else "",
             fbr_trace.interruption_note(ids), status,
-            "冻结 task.json + 已核实平台枚举；snapshot.json 推送回读；record/recording.json；trace/ids.json。仅核对相关字段，不代替完整交付闸门。"])
+            "冻结 task.json；存在时核验 field-revisions.json 绑定的实时 schema 和实际环境证据；snapshot.json 推送回读；record/recording.json；trace/ids.json。"])
     corrections.freeze_panes = "B2"
     for index, column in enumerate(correction_columns, 1):
         corrections.column_dimensions[get_column_letter(index)].width = 20 if index == 1 else 38
