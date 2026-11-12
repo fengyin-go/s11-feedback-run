@@ -20,6 +20,10 @@ LEGACY_TRACE_POLICIES = {
     "a0eeac329d747bc52e6ee804ac30920511498b22344334cdb94a1910e328ca3c",
     "41e8cc299da551d1c8f22773ec0b0307262ddd13f5eb41cb2903b3bcc68d1e72",
 }
+LEGACY_FEEDBACK_POLICIES = {
+    "6a50956ab20e9c7567e9397be7e7be8d3183d84981786b9899809a6c016111d4",
+    "e7f4586b18419b0ae217edcfc1e3c6a2f8192810d77b032c11b2e27378882ff2",
+}
 TEST_CLAUSE = re.compile(r"[^。；！？\n]*(?:测试|用例|\btest\w*|\bpytest\b)[^。；！？\n]*", re.I)
 COUNT_CLAIM = re.compile(r"(?:\d+\s*(?:条|个|项)\s*(?:测试|用例)|(?:测试|用例)[^。；]{0,8}\d+|\d+\s*(?:条|个|项)?\s*(?:全[部都]?通过|通过))")
 NEGATIVE_TEST = re.compile(r"(?:未|没有|没|未曾|并未)[^。；]{0,24}(?:测试|用例|验证)|(?:测试|用例)[^。；]{0,16}(?:未执行|没跑|未跑|未重跑|缺失)")
@@ -249,7 +253,8 @@ def certificate_errors(task: Path, receipt: dict) -> list[str]:
     cert = lib.load_json(path, default={})
     if not isinstance(cert, dict) or cert.get("version") != VERSION or cert.get("state") != "accepted":
         return ["Feedback 语义复核尚未通过"]
-    if receipt.get("policy_sha") != policy_sha() or cert.get("policy_sha") != policy_sha():
+    allowed = {policy_sha()} | LEGACY_FEEDBACK_POLICIES
+    if receipt.get("policy_sha") not in allowed or cert.get("policy_sha") not in allowed:
         return ["Feedback 规则已更新，须按当前规则重新生成并复核"]
     for key in ("workflow", "trace-analysis_sha", "source_inputs", "model", "reasoning_effort", "provider", "inputs", "audit_sha", "feedback_sha"):
         if cert.get(key) != receipt.get(key):
