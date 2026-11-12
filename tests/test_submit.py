@@ -338,6 +338,7 @@ class PlatformStyle(unittest.TestCase):
         self.assertTrue(any("过密" in item for item in submit.platform_style_problems(text)))
         text = "TS7053、_enable、python -I、JSONDecodeError 同时出现。"
         self.assertTrue(any("工具字段" in item for item in submit.platform_style_problems(text)))
+        self.assertTrue(any("测试总数" in item for item in submit.platform_style_problems("16 项后端测试通过。")))
         self.assertEqual(submit.platform_style_problems("争用发生时旧计划没有被覆盖，任务时间随后更新。"), [])
 
 

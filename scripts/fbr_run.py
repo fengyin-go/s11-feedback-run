@@ -113,6 +113,61 @@ def evidence_has_key(paths, secret: str) -> bool:
     return any(lib.key_occurrences(path, secret) for path in paths)
 
 
+def prepare_legacy_progress_recovery(task_dir: Path, cfg: dict, *, execute: bool) -> dict:
+    """Issue one re-dispatch token iff an old controller killed a progressing run."""
+    path = task_dir / "run/legacy-progress-recovery.json"
+    marker = lib.load_json(path, default={})
+    current = lib.load_json(task_dir / "run/current.json", default={})
+    attempts = lib.load_json(task_dir / "run/attempts.json", default=[])
+    if not attempts:
+        return {"task_id": task_dir.name, "state": "blocked", "detail": "没有可核验的旧运行尝试"}
+    last = attempts[-1]
+    if current.get("state") != "archived" or current.get("attempt") != last.get("n"):
+        return {"task_id": task_dir.name, "state": "blocked", "detail": "旧运行不是已归档的当前尝试"}
+    if not last.get("timed_out") or str(last.get("reason", "")) not in ("进程超时", "timeout"):
+        return {"task_id": task_dir.name, "state": "blocked", "detail": "旧运行不是控制器超时"}
+    heartbeat = lib.load_json(task_dir / "run/heartbeat.json", default={})
+    budget = lib.load_json(task_dir / "run/budget.json", default={})
+    active_seconds = float(budget.get("active_seconds") or 0)
+    elapsed = float(heartbeat.get("elapsed") or 0)
+    stall = float(cfg["run"].get("stall_seconds", 480))
+    idle = float(heartbeat.get("idle") if heartbeat.get("idle") is not None else stall + 1)
+    output_idle = float(heartbeat.get("output_idle") if heartbeat.get("output_idle") is not None else stall + 1)
+    events = int(heartbeat.get("events") or 0)
+    tools = int(heartbeat.get("tools") or 0)
+    if active_seconds < cfg["run"]["task_budget"] or idle > stall or output_idle > stall or events <= 0 or tools <= 0:
+        return {"task_id": task_dir.name, "state": "blocked", "detail": "旧运行缺少持续进展证据"}
+    if marker.get("state") == "ready" and marker.get("attempt") == last.get("n"):
+        return {"task_id": task_dir.name, "state": "ready", "detail": "已有一次性进度恢复令牌"}
+    if marker.get("used_at"):
+        return {"task_id": task_dir.name, "state": "used", "detail": "一次性进度恢复令牌已使用"}
+    if not execute:
+        return {"task_id": task_dir.name, "state": "dry", "detail": "可发放一次性进度恢复令牌"}
+    lib.save_json(path, {
+        "state": "ready",
+        "attempt": last.get("n"),
+        "created_at": lib.now_iso(),
+        "reason": "旧控制器在持续进展时按累计预算超时",
+        "evidence": {"active_seconds": round(active_seconds, 3), "segment_elapsed": round(elapsed, 3),
+                     "idle": idle, "output_idle": output_idle,
+                     "events": events, "tools": tools},
+    })
+    return {"task_id": task_dir.name, "state": "ready", "detail": "已发放一次性进度恢复令牌"}
+
+
+def use_legacy_progress_recovery(task_dir: Path, attempt: int) -> bool:
+    """Consume a validated one-shot recovery token for the next attempt."""
+    path = task_dir / "run/legacy-progress-recovery.json"
+    marker = lib.load_json(path, default={})
+    current = lib.load_json(task_dir / "run/current.json", default={})
+    if (marker.get("state") != "ready" or marker.get("used_at")
+            or marker.get("attempt") != current.get("attempt")):
+        return False
+    marker.update(state="used", used_at=lib.now_iso(), used_attempt=attempt)
+    lib.save_json(path, marker)
+    return True
+
+
 def bound_key(task_dir: Path, cfg: dict, *, start: bool = False) -> str:
     """只能用起跑时的同一 key 核对泄露；缺 key 或换 key 不能降级为空扫描。"""
     path = lib.key_path(cfg)
@@ -426,7 +481,11 @@ def run_one(task_dir: Path, cfg: dict) -> dict:
         return {"task_id": name, "state": "skip", "detail": "已经跑过"}
     current = lib.load_json(task_dir / 'run/current.json', default={})
     recovering = current.get('request_id') and current.get('state') in ('running', 'exited')
-    if not recovering and (time.time() >= cfg.get('_deadline', float('inf')) or (cfg.get('_drain') and Path(cfg['_drain']).exists())):
+    legacy_recovery = lib.load_json(task_dir / 'run/legacy-progress-recovery.json', default={})
+    legacy_grant = (legacy_recovery.get('state') == 'ready' and not legacy_recovery.get('used_at')
+                    and legacy_recovery.get('attempt') == current.get('attempt'))
+    if not recovering and not legacy_grant and (time.time() >= cfg.get('_deadline', float('inf'))
+            or (cfg.get('_drain') and Path(cfg['_drain']).exists())):
         return {'task_id': name, 'state': 'deferred', 'detail': '批次已排空或预算到顶，不起新轮'}
     try:
         secret = bound_key(task_dir, cfg, start=True)
@@ -458,15 +517,18 @@ def run_one(task_dir: Path, cfg: dict) -> dict:
         if not admission['allowed']:
             lib.set_stage(task_dir, 'run', 'deferred', reason=admission['reason'])
             return {'task_id': name, 'state': 'deferred', 'detail': admission['reason']}
-        if time.time() >= cfg.get('_deadline', float('inf')) or (cfg.get('_drain') and Path(cfg['_drain']).exists()):
+        if not legacy_grant and (time.time() >= cfg.get('_deadline', float('inf'))
+                or (cfg.get('_drain') and Path(cfg['_drain']).exists())):
             return {'task_id': name, 'state': 'deferred', 'detail': '批次已排空或预算到顶，不起新轮'}
-        if budget["active_seconds"] >= cfg["run"]["task_budget"]:
+        if budget["active_seconds"] >= cfg["run"]["task_budget"] and not legacy_grant:
             lib.set_stage(task_dir, "run", "deferred", reason="单题累计运行预算耗尽，恢复不会清零预算")
             return {"task_id": name, "state": "deferred", "detail": "单题累计运行预算耗尽"}
         if cfg['run'].get('gateway_wait_task_total') is not None and budget.get('waiting_seconds', 0) >= cfg['run']['gateway_wait_task_total']:
             lib.set_stage(task_dir, 'run', 'deferred', reason='单题累计网关等待预算耗尽，未派发新的尝试')
             return {'task_id': name, 'state': 'deferred', 'detail': '单题累计网关等待预算耗尽，保留次数与容器，不发送题面'}
         number = (resume or {}).get('attempt') or max([a.get('n', 0) for a in attempts] or [0]) + 1
+        if legacy_grant and not use_legacy_progress_recovery(task_dir, number):
+            return {"task_id": name, "state": "deferred", "detail": "进度恢复令牌已被消费"}
         lib.open_permissions(task_dir / "workspace")
         started = lib.now_iso()
         lib.save_json(run_dir / "current.json", {**(resume or {}), "state": "starting", "attempt": number,
@@ -732,7 +794,7 @@ def main() -> int:
     parser.add_argument("--root")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("preflight")
-    for name in ("run", "resume", "collect", "recover", "status", "drain"):
+    for name in ("run", "resume", "collect", "recover", "legacy-recover", "status", "drain"):
         item = sub.add_parser(name)
         item.add_argument("--batch", required=True)
         item.add_argument("--tasks")
@@ -742,6 +804,7 @@ def main() -> int:
     sub.choices['resume'].add_argument('--execute', action='store_true')
     sub.choices['resume'].add_argument('--detach', action='store_true')
     sub.choices['recover'].add_argument('--execute', action='store_true')
+    sub.choices['legacy-recover'].add_argument('--execute', action='store_true')
     sub.choices['drain'].add_argument('--execute', action='store_true')
     sub.choices["collect"].add_argument("--keep-container", action="store_true")
     args = parser.parse_args()
@@ -765,6 +828,10 @@ def main() -> int:
                 return 0
             print(json.dumps([recover_one(p, cfg) for p in items], ensure_ascii=False))
             return 0
+        if args.command == 'legacy-recover':
+            rows = [prepare_legacy_progress_recovery(p, cfg, execute=args.execute) for p in items]
+            print(json.dumps(rows, ensure_ascii=False))
+            return 0 if all(row['state'] in ('ready', 'dry') for row in rows) else 1
         if args.command == 'drain':
             if args.execute:
                 directory.mkdir(parents=True, exist_ok=True)

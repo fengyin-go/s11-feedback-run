@@ -35,6 +35,7 @@ MEDIA_TYPES = {"trace_file": "attachment", "screencast": "video"}
 DENSE_REPORT_TOKEN_RE = re.compile(
     r"(?<![A-Za-z0-9_])(?:[A-Z]{2,}-[0-9]+|[0-9]{2}:[0-9]{2}(?::[0-9]{2})?|[0-9]{3,})(?![A-Za-z0-9_])")
 MACHINE_STYLE_RE = re.compile(r"\bTS\d+\b|python\s+-I|_enable\b|JSONDecodeError|Traceback")
+BARE_TEST_COUNT_RE = re.compile(r"(?:\d+\s*项(?:后端)?测试|Ran\s+\d+\s+tests)", re.I)
 FIELD_TYPES = dict.fromkeys(FIELD_MAP, "text") | {
     **dict.fromkeys(("domain", "sub_direction", "question_type", "difficulty", "harness", "os_platform", "repro_level"), "select"),
     **dict.fromkeys(("user_prompt", "feedback", "other_issues"), "textarea"),
@@ -239,6 +240,8 @@ def platform_style_problems(text: str) -> list[str]:
         errors.append("Feedback 的实体编号、时间点或大数字过密，改成用户能理解的关键场景")
     if len(machine) >= 3:
         errors.append("Feedback 原样堆叠了过多工具字段，改写成失败后果和处理经过")
+    if BARE_TEST_COUNT_RE.search(text or ""):
+        errors.append("Feedback 不要只报测试总数，要说明测试覆盖了哪些需求行为")
     return errors
 
 

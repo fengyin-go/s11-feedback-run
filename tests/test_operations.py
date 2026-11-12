@@ -29,6 +29,51 @@ import fbr_preview
 
 
 class ZeroChanges(DockerCase):
+    def test_legacy_progress_recovery_grants_one_dispatch_past_old_limits(self):
+        task = self.make_task()
+        fbr_run.bound_key(task, self.cfg, start=True)
+        lib.save_git_config(task)
+        lib.save_json(task / 'run/attempts.json', [{
+            'n': 1, 'timed_out': True, 'reason': '进程超时', 'verdict': 'retry',
+        }])
+        lib.save_json(task / 'run/current.json', {'state': 'archived', 'attempt': 1})
+        lib.save_json(task / 'run/budget.json', {
+            'active_seconds': self.cfg['run']['task_budget'] + 1, 'waiting_seconds': 0,
+        })
+        lib.save_json(task / 'run/heartbeat.json', {
+            'elapsed': self.cfg['run']['task_budget'] + 1, 'idle': 0, 'output_idle': 0,
+            'events': 10, 'tools': 1,
+        })
+        self.assertEqual(fbr_run.prepare_legacy_progress_recovery(task, self.cfg, execute=False)['state'], 'dry')
+        self.assertEqual(fbr_run.prepare_legacy_progress_recovery(task, self.cfg, execute=True)['state'], 'ready')
+        self.cfg['_deadline'] = time.time() - 1
+        self.docker.outcomes = [self.good()]
+        marker_before = lib.load_json(task / 'run/legacy-progress-recovery.json')
+        current_before = lib.load_json(task / 'run/current.json')
+        self.assertTrue(marker_before.get('state') == 'ready'
+                        and not marker_before.get('used_at')
+                        and marker_before.get('attempt') == current_before.get('attempt'),
+                        (current_before, marker_before, self.cfg))
+        row = fbr_run.run_one(task, self.cfg)
+        self.assertEqual(row['state'], 'ok', (row, lib.load_json(task / 'run/current.json'),
+                                             lib.load_json(task / 'run/legacy-progress-recovery.json')))
+        marker = lib.load_json(task / 'run/legacy-progress-recovery.json')
+        self.assertEqual((marker['state'], marker['used_attempt']), ('used', 2))
+        self.assertEqual(len(self.docker.docker_calls('run', '-i')), 1)
+
+    def test_legacy_progress_recovery_rejects_silent_old_timeout(self):
+        task = self.make_task()
+        lib.save_json(task / 'run/attempts.json', [{'n': 1, 'timed_out': True, 'reason': '进程超时'}])
+        lib.save_json(task / 'run/current.json', {'state': 'archived', 'attempt': 1})
+        lib.save_json(task / 'run/heartbeat.json', {
+            'elapsed': self.cfg['run']['task_budget'] + 1,
+            'idle': self.cfg['run']['stall_seconds'] + 1,
+            'output_idle': 0, 'events': 10, 'tools': 1,
+        })
+        row = fbr_run.prepare_legacy_progress_recovery(task, self.cfg, execute=True)
+        self.assertEqual(row['state'], 'blocked')
+        self.assertFalse((task / 'run/legacy-progress-recovery.json').exists())
+
     def test_no_change_uses_three_fresh_containers_and_archives(self):
         task = self.make_task()
         self.docker.outcomes = [self.good(effect=lambda ws: None) for _ in range(3)]
