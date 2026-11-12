@@ -9,12 +9,13 @@ import re
 import fbr_gate as gate
 import fbrlib as lib
 
-VERSION = 4
+VERSION = 8
 CHECKS = ("result_and_process", "task_specific_voice", "test_relevance", "score_alignment",
           "evidence_fidelity", "scope_discipline", "non_template")
 RULE_FILES = ("references/scoring.md", "references/feedback-writing.md", "references/feedback-calibration.md",
               "references/feedback-quality.md", "scripts/fbr_gate.py", "scripts/fbr_quality.py",
               "scripts/fbr_reviewer.py", "scripts/fbr_feedback.py", "scripts/fbr_trace_review.py", "scripts/fbr_sources.py")
+TRACE_RULE_FILES = ("scripts/fbr_trace_review.py", "scripts/fbr_sources.py", "scripts/fbr_reviewer.py")
 TEST_CLAUSE = re.compile(r"[^。；！？\n]*(?:测试|用例|\btest\w*|\bpytest\b)[^。；！？\n]*", re.I)
 COUNT_CLAIM = re.compile(r"(?:\d+\s*(?:条|个|项)\s*(?:测试|用例)|(?:测试|用例)[^。；]{0,8}\d+|\d+\s*(?:条|个|项)?\s*(?:全[部都]?通过|通过))")
 NEGATIVE_TEST = re.compile(r"(?:未|没有|没|未曾|并未)[^。；]{0,24}(?:测试|用例|验证)|(?:测试|用例)[^。；]{0,16}(?:未执行|没跑|未跑|未重跑|缺失)")
@@ -23,6 +24,13 @@ NEGATIVE_TEST = re.compile(r"(?:未|没有|没|未曾|并未)[^。；]{0,24}(?:�
 def policy_sha() -> str:
     skill = Path(__file__).resolve().parent.parent
     values = {name: hashlib.sha256((skill / name).read_bytes()).hexdigest() for name in RULE_FILES}
+    return hashlib.sha256(json.dumps(values, sort_keys=True).encode()).hexdigest()
+
+
+def trace_policy_sha() -> str:
+    """轨迹分析规则与 Feedback 写作规则分开绑定，改文字规范不重跑轨迹模型。"""
+    skill = Path(__file__).resolve().parent.parent
+    values = {name: hashlib.sha256((skill / name).read_bytes()).hexdigest() for name in TRACE_RULE_FILES}
     return hashlib.sha256(json.dumps(values, sort_keys=True).encode()).hexdigest()
 
 
@@ -98,12 +106,12 @@ def check_contract(doc: dict, task: dict, facts: dict, audit: dict, probes: list
     if not isinstance(basis, dict) or any(not isinstance(basis.get(k), str) or len(basis[k].strip()) < 6
             for k in ("delivered", "remaining", "why_this_score")):
         errors.append("score_basis 必须说明已交付、剩余缺口及本档理由；不进入正文")
-    if not isinstance(basis, dict) or basis.get("category") not in ("delivery_issue", "verification_gap", "complete"):
-        errors.append("score_basis.category 必须是 delivery_issue、verification_gap 或 complete")
+    if not isinstance(basis, dict) or basis.get("category") not in ("delivery_issue", "verification_gap", "process_issue", "complete"):
+        errors.append("score_basis.category 必须是 delivery_issue、verification_gap、process_issue 或 complete")
     elif (doc.get("score") == 5) != (basis["category"] == "complete"):
-        errors.append("complete 仅对应 5 分，其余档必须说明交付问题或验证缺口")
-    elif basis["category"] == "verification_gap" and doc.get("score") != 4:
-        errors.append("verification_gap 只用于没有已证实交付缺陷但验证不足的 4 分")
+        errors.append("complete 仅对应 5 分，其余档必须说明交付问题、验证边界或过程问题")
+    elif basis["category"] in ("verification_gap", "process_issue") and doc.get("score") != 4:
+        errors.append("verification_gap 和 process_issue 只用于没有已证实交付缺陷的 4 分")
     if isinstance(basis, dict):
         if type(basis.get('lowest_supported_score')) is not int or basis.get('lowest_supported_score') != doc.get('score'):
             errors.append('score_basis.lowest_supported_score 必须等于确凿证据支持的最低合理档位及本次分数')

@@ -11,14 +11,15 @@ import fbrlib as lib
 import fbr_gate as gate
 
 GATE = copy.deepcopy(lib.DEFAULTS["feedback_gate"])
-S1 = ("先读了 src/clipcut/packer.py 和现有测试，再把切分逻辑拆到 src/clipcut/segment.py，"
+S1 = ("模型先读了 src/clipcut/packer.py 和现有测试，再把切分逻辑拆到 src/clipcut/segment.py，"
       "第 4 步跑 make test 时有一条用例没过，改完索引计算后第 6 步重跑，14 条全部通过。")
+S1_PASS = "模型先读现有实现和测试，再写分片逻辑，随后运行完整测试，14 条全部通过。"
 S2 = ("实际执行 pack fixtures/short.mp4 --segment 10，输出目录里有 3 个分片和 index.json，清单里的条目数和分片数一致；"
       "拿 3700 秒的长输入跑了一遍，生成 370 个分片，没有报错。")
 S3 = "--segment 0 和负数都会打印 error 并以退出码 2 结束。"
 S4 = ("有一处没处理：--segment abc 这种非数字参数直接抛出 ValueError 的调用栈，退出码是 1，没有给出可读的提示，"
       "使用的人得自己从调用栈里看出是参数写错了。")
-TEXT4, TEXT5 = S1 + S2 + S3 + S4, S1 + S2 + S3
+TEXT4, TEXT5 = S1 + S2 + S3 + S4, S1_PASS + S2 + S3
 
 
 def task() -> dict:
@@ -112,7 +113,9 @@ def audit(score: int = 4) -> dict:
 
 def feedback(score: int = 4) -> dict:
     doc = {"score": score, "feedback": TEXT4 if score < 5 else TEXT5, "issues": [], "note": "",
-           "process": [{"sentence": "第 4 步跑 make test 时有一条用例没过", "steps": [4]},
+           "process": [{"sentence": "模型先读现有实现和测试，再写分片逻辑，随后运行完整测试，14 条全部通过。",
+                        "steps": [1, 2, 3, 6]}] if score == 5 else
+                      [{"sentence": "第 4 步跑 make test 时有一条用例没过", "steps": [4]},
                        {"sentence": "改完索引计算后第 6 步重跑", "steps": [5, 6]}]}
     if score < 5:
         doc["issues"] = [{
@@ -412,12 +415,31 @@ class Text(Case):
             ("对照 facts.json 看过。", "出现内部口径词：facts.json"), ("本题要求分片。", "出现指代题目的说法：本题"),
             ("Docker 里跑过一遍。", "出现运行环境或录屏现场的词（任务本身没提到）：docker"),
             ("录屏里能看到。", "出现运行环境或录屏现场的词（任务本身没提到）：录屏"),
+            ("轨迹还执行了完整回归。", "出现取证来源口吻：轨迹"),
+            ("素材卡里记录了边界。", "出现取证来源口吻：素材卡"),
             ("中途遇到限流。", "出现网络、额度、耗时这类不该算在模型头上的因素：限流"),
             ("换一台机器未必能跑。", "出现跨机器的说法：换一台机器"),
             ("输出里有“done”字样。", "出现禁用的标点或标记：“ ”"), ("跑了 `make test`。", "出现禁用的标点或标记：`"),
             ("后面没验证——直接结束。", "出现禁用的标点或标记：—— —"), ("改动**很大**。", "出现禁用的标点或标记：**"),
         ):
             self.has(self.check(TEXT4 + extra)[0], label)
+
+    def test_requires_model_process(self):
+        self.has(self.check(S2 + S3 + S4)[0], "正文缺少模型实现或验证过程的具体行为句")
+
+    def test_model_subject_appears_only_once(self):
+        self.has(self.check(TEXT4 + "模型随后又重跑了一次。")[0], "“模型”最多出现一次")
+
+    def test_rejects_coverage_only_process_recap(self):
+        text = S2 + S3 + S4 + "模型先实现主链路并完成构建，但并发到达顺序仍未覆盖。"
+        self.has(self.check(text)[0], "模型过程只写了未覆盖或未验证")
+
+    def test_accepts_real_process_failure_and_repair(self):
+        text = S2 + S3 + S4 + (
+            "模型先用并发 curl 校验重复提交，却把多个响应拼在一起按单个 JSON 解析，"
+            "报出 JSONDecodeError；它随后改成五个独立线程分别读取，确认只新增一个批次。"
+        )
+        self.assertEqual(self.check(text), ([], []))
 
     def test_environment_words_from_the_task_are_allowed(self):
         prompt = "把 Docker 镜像的构建脚本拆成两段，并且在网关超时时重试。"
@@ -441,9 +463,9 @@ class Text(Case):
         self.has(errors, "复述了任务原文：")
 
     def test_repeated_heads_is_a_warning(self):
-        errors, warnings = self.check(TEXT5 + "模型先读了代码。模型先读了测试。模型先读了文档。")
+        errors, warnings = self.check(TEXT5 + "后续检查了代码。后续检查了测试。后续检查了文档。")
         self.assertEqual(errors, [])
-        self.assertEqual(warnings, ["多句用同一个开头：模型先读"])
+        self.assertEqual(warnings, ["多句用同一个开头：后续检查"])
 
 
 class Feedback(Case):
@@ -458,6 +480,8 @@ class Feedback(Case):
     def test_verification_gap_does_not_force_invented_delivery_issue(self):
         doc = feedback(5)
         doc.update(score=4, score_basis={"category": "verification_gap"})
+        self.hasnt(self.check(doc, a=audit(5), p=probes(2))[0], "4 分至少")
+        doc["score_basis"]["category"] = "process_issue"
         self.hasnt(self.check(doc, a=audit(5), p=probes(2))[0], "4 分至少")
         unknown = audit(5)
         unknown["requirements"][1].update(verdict="看不出来", note="现有材料不足以确认该边界")
@@ -508,6 +532,9 @@ class Feedback(Case):
         f = facts()                                       # 没有工具步骤也必须反馈实际对话过程
         f["trace"]["steps"] = []
         self.has(self.check(doc, f=f)[0], "过程和产物都要写")
+        doc = feedback(4)
+        doc["process"] = doc["process"] + doc["process"][:2]
+        self.has(self.check(doc)[0], "过程段最多写 3 句")
 
     def test_score_and_issues_must_agree(self):
         doc = feedback(4)
@@ -521,6 +548,18 @@ class Feedback(Case):
         self.has(self.check(doc)[0], "4 到 5 分也要写出核对过的要求和实际验证结果")
         doc["score"] = 3
         self.hasnt(self.check(doc)[0], "4 到 5 分也要写出")
+
+    def test_five_rejects_visible_process_rework(self):
+        doc = feedback(5)
+        doc["feedback"] = S1 + S2 + S3
+        doc["process"] = [
+            {"sentence": "第 4 步跑 make test 时有一条用例没过", "steps": [4]},
+            {"sentence": "改完索引计算后第 6 步重跑", "steps": [5, 6]},
+        ]
+        self.has(self.check(doc)[0], "5 分要求过程接近一次性完美跑通")
+        doc["score"] = 4
+        doc["score_basis"] = {"category": "process_issue"}
+        self.hasnt(self.check(doc)[0], "5 分要求过程接近一次性完美跑通")
 
     def test_regression_must_be_written(self):
         f = facts()

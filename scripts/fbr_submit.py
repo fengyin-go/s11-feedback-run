@@ -546,6 +546,92 @@ def submit_one(root: Path, plan: dict, client, schema: dict, records: list[dict]
         raise
 
 
+def repair_one(root: Path, plan: dict, client, schema: dict, *, execute: bool, comment: str) -> dict:
+    task_dir = root / "batches" / plan["batch"] / plan["task_id"]
+    path = task_dir / "review/upload.json"
+    receipt = lib.load_json(path, default={})
+    if not isinstance(receipt, dict) or not valid_id(receipt.get("submission_id")):
+        raise lib.FbrError(f"{plan['task_id']}：没有可返修的平台记录")
+    submission_id = receipt["submission_id"]
+    detail = client.detail(submission_id)
+    if detail.get("status") != "PENDING_FIX" or detail.get("editable") is not True:
+        raise lib.FbrError(f"{plan['task_id']}：当前状态不是可编辑的待返修")
+    if str(detail.get("session_id")) != str(plan["data"]["session_id"]):
+        raise lib.FbrError(f"{plan['task_id']}：平台记录 SessionID 与当前交付不一致")
+    current = remote_data(detail)
+    current_trace = detail.get("trace_file")
+    if current_trace:
+        current["trace_file"] = current_trace
+    locked = set(detail.get("locked_fields") or [])
+    desired = copy.deepcopy(current)
+    for key in plan["data"]:
+        if key in MEDIA_TYPES or key in locked:
+            desired[key] = current[key]
+        else:
+            desired[key] = plan["data"][key]
+    changes = {key: {"from": current.get(key), "to": desired.get(key)}
+               for key in desired if current.get(key) != desired.get(key)}
+    if not changes:
+        raise lib.FbrError(f"{plan['task_id']}：当前交付与平台内容一致，无需返修")
+    if not execute:
+        return {"task_id": plan["task_id"], "state": "dry", "submission_id": submission_id,
+                "status": detail.get("status"), "changed_fields": sorted(changes), "changes": changes}
+
+    history = task_dir / "review/platform-history" / (lib.now_iso().replace(":", "-") + "-before-repair.json")
+    lib.save_json(history, receipt)
+    client.update(submission_id, desired, schema["fingerprint"], comment)
+    current_schema = client.schema()
+    schema_fields(current_schema)
+    if current_schema.get("fingerprint") != schema["fingerprint"]:
+        raise lib.FbrError("返修期间平台表单已变化，结果需核对")
+    updated = client.detail(submission_id)
+    actual = remote_data(updated)
+    if actual.get("trace_file") != desired.get("trace_file"):
+        raise lib.FbrError("返修回读的轨迹附件与提交值不一致")
+    for key, value in desired.items():
+        if actual.get(key) != value and not (key == "languages" and actual.get(key) == value.replace("；", ";")):
+            raise lib.FbrError(f"返修回读字段不一致：{key}")
+    if updated.get("status") not in ("QC_WAITING", "QC_RUNNING", "PENDING_FIX"):
+        raise lib.FbrError("返修后平台未进入重新质检状态")
+    receipt = {
+        **receipt,
+        "content_digest": plan["content_digest"],
+        "binding": plan["binding"],
+        "schema_fingerprint": schema["fingerprint"],
+        "state": "confirmed",
+        "remote_data": actual,
+        "remote_response_data": actual,
+        "remote_status": updated.get("status"),
+        "verified_at": lib.now_iso(),
+        "last_repair_at": lib.now_iso(),
+        "last_repair_comment": comment,
+        "version_no": updated.get("current_version"),
+    }
+    lib.save_json(path, receipt)
+    return {"task_id": plan["task_id"], "state": "confirmed", "submission_id": submission_id,
+            "status": updated.get("status"), "changed_fields": sorted(changes),
+            "url": f"{BASE_URL}/app/submissions/{submission_id}"}
+
+
+def repair_batch(root: Path, batch_id: str, *, tasks: str | None = None,
+                 execute: bool = False, confirm: str = "", comment: str = "", client=None) -> dict:
+    if execute and confirm != "REPAIR":
+        raise lib.FbrError("真实平台返修需要 --execute --confirm REPAIR")
+    if client is None:
+        from fbr_platform import Client
+        client = Client(account=ACCOUNT)
+    with submit_lock(root):
+        client.login()
+        me = client.me()
+        user = me.get("user", me)
+        if user.get("username") != ACCOUNT or user.get("must_change_password"):
+            raise lib.FbrError("登录账号不符或需要人工修改初始密码")
+        schema = client.schema()
+        plans = prepare(root, batch_id, schema, tasks, None)
+        rows = [repair_one(root, plan, client, schema, execute=execute, comment=comment) for plan in plans]
+        return {"platform": BASE_URL, "account": ACCOUNT, "execute": execute, "tasks": rows}
+
+
 def run_batch(root: Path, batch_id: str, *, tasks: str | None = None, limit: int | None = None,
               execute: bool = False, confirm: str = "", client=None) -> dict:
     if execute and confirm != "SUBMIT":
@@ -605,10 +691,22 @@ def main() -> int:
     p.add_argument("--limit", type=int)
     p.add_argument("--execute", action="store_true")
     p.add_argument("--confirm", default="")
+    r = sub.add_parser("repair", help="对待返修记录保存修正字段并重新质检")
+    r.add_argument("--batch", required=True)
+    r.add_argument("--tasks")
+    r.add_argument("--execute", action="store_true")
+    r.add_argument("--confirm", default="")
+    r.add_argument("--comment", default="")
     args = parser.parse_args()
     try:
-        result = probe() if args.command == "probe" else run_batch(lib.find_root(args.root), args.batch,
-            tasks=args.tasks, limit=args.limit, execute=args.execute, confirm=args.confirm)
+        if args.command == "probe":
+            result = probe()
+        elif args.command == "repair":
+            result = repair_batch(lib.find_root(args.root), args.batch, tasks=args.tasks,
+                                  execute=args.execute, confirm=args.confirm, comment=args.comment)
+        else:
+            result = run_batch(lib.find_root(args.root), args.batch, tasks=args.tasks,
+                               limit=args.limit, execute=args.execute, confirm=args.confirm)
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0
     except lib.FbrError as exc:

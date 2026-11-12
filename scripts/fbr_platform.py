@@ -278,6 +278,15 @@ class Client:
         self._ensure_login()
         return self.request("POST", "/submissions", json={"data": data, "schema_fingerprint": fingerprint})
 
+    def update(self, id, data: dict, fingerprint: str, comment: str = "") -> dict:
+        if isinstance(id, bool) or not re.fullmatch(r"[1-9][0-9]*", str(id)):
+            raise PlatformError("平台记录 ID 必须是正整数")
+        if not isinstance(comment, str):
+            raise PlatformError("返修说明必须是文本")
+        self._ensure_login()
+        return self.request("PUT", f"/submissions/{id}", json={
+            "data": data, "schema_fingerprint": fingerprint, "comment": comment})
+
     def upload(self, path: Path, kind: str = "attachment", expected_size: int | None = None,
                expected_sha256: str | None = None) -> dict:
         if kind not in ("attachment", "video"):

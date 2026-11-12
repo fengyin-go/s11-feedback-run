@@ -264,7 +264,8 @@ def decode_output(text: str) -> dict:
 
 
 @lib.task_locked
-def review(task: Path, base: str, secret: str, *, max_versions=3, model=MODEL, effort=EFFORT) -> dict:
+def review(task: Path, base: str, secret: str, *, max_versions=3, model=MODEL, effort=EFFORT,
+           allow_platform_repair: bool = False) -> dict:
     """Analyze traces only, then hand acceptance to the AI advancing this task."""
     lib.require_stage(task, 'facts')
     if not (task/'review/card.md').is_file():
@@ -279,12 +280,13 @@ def review(task: Path, base: str, secret: str, *, max_versions=3, model=MODEL, e
     import fbr_review_slots
     with fbr_review_slots.slot(lib.settings(lib.find_root(str(task.parents[2])))):
         fbr_trace_review.analyze(task, base, secret, engine)
-    return prepare_task_agent(task)
+    return prepare_task_agent(task, allow_platform_repair=allow_platform_repair)
 
 
-def prepare_task_agent(task: Path) -> dict:
+def prepare_task_agent(task: Path, *, allow_platform_repair: bool = False) -> dict:
     lib.require_stage(task, 'facts')
-    if lib.load_json(task/'review/upload.json', default={}).get('submission_id'):
+    if (not allow_platform_repair
+            and lib.load_json(task/'review/upload.json', default={}).get('submission_id')):
         raise lib.FbrError('任务已有平台单，不能自动重写评价')
     errors = analysis_errors(task)
     if errors:
@@ -310,7 +312,8 @@ def prepare_task_agent(task: Path) -> dict:
 
 
 @lib.task_locked
-def finalize(task: Path, candidate: dict, verification: dict, *, publish=True) -> dict:
+def finalize(task: Path, candidate: dict, verification: dict, *, publish=True,
+             allow_platform_repair: bool = False) -> dict:
     """Deterministic validation only: never load credentials or call an external model."""
     lib.require_stage(task, 'facts')
     work = lib.load_json(task/'review/task-agent-work.json', default={})
@@ -393,6 +396,9 @@ def main() -> int:
     subs.choices['finalize'].add_argument('--candidate', required=True)
     subs.choices['finalize'].add_argument('--verification', required=True)
     subs.choices['finalize'].add_argument('--no-publish', action='store_true')
+    subs.choices['prepare'].add_argument('--platform-repair', action='store_true')
+    subs.choices['review'].add_argument('--platform-repair', action='store_true')
+    subs.choices['finalize'].add_argument('--platform-repair', action='store_true')
     args = parser.parse_args()
     try:
         root = lib.find_root(args.root)
@@ -410,12 +416,15 @@ def main() -> int:
         else:
             task = lib.task_dirs(root, args.batch, args.task)[0]
             if args.command == 'review':
-                result = review(task, base, secret, model=model, effort=effort)
+                result = review(task, base, secret, model=model, effort=effort,
+                                allow_platform_repair=args.platform_repair)
             elif args.command == 'prepare':
                 with lib.file_lock(task/'.operation.lock'):
-                    result = prepare_task_agent(task)
+                    result = prepare_task_agent(task, allow_platform_repair=args.platform_repair)
             else:
-                result = finalize(task, lib.load_json(Path(args.candidate)), lib.load_json(Path(args.verification)), publish=not args.no_publish)
+                result = finalize(task, lib.load_json(Path(args.candidate)), lib.load_json(Path(args.verification)),
+                                  publish=not args.no_publish,
+                                  allow_platform_repair=args.platform_repair)
         print(json.dumps(result, ensure_ascii=False))
         return 0 if result['state'] != 'repairing' else 2
     except (lib.FbrError, OSError) as exc:

@@ -2,7 +2,7 @@
 import copy
 import unittest
 
-from test_gate import task, facts, audit, probes, TEXT5
+from test_gate import task, facts, audit, probes, TEXT5, S1_PASS
 import fbr_quality as quality
 
 
@@ -13,8 +13,8 @@ class Contract(unittest.TestCase):
                              "requirement_ids": ["R3"], "anchors": [{"type": "probe", "id": "P2"}]}],
                 "score_basis": {"lowest_supported_score": 5, "lower_score_rejected": "没有真实交付缺口，不应凭空降低档位", "anchors": [{"type": "probe", "id": "P2"}], "category": "complete", "delivered": "短输入及长输入均能正确分片",
                                 "remaining": "当前实跑范围内未发现交付缺口", "why_this_score": "需求和两个边界均有成功运行证据"},
-                "test_claims": [{"sentence": TEXT5.split("。")[0], "requirement_ids": ["R1"],
-                                 "behavior": "修复分片索引后重跑分片功能用例",
+                "test_claims": [{"sentence": S1_PASS.rstrip("。"), "requirement_ids": ["R1"],
+                                 "behavior": "运行分片功能用例并确认全部通过",
                                  "source": {"kind": "trace", "step": 6},
                                  "output_excerpt": "Ran 14 tests in 0.52s OK", "count": 14,
                                  "count_quote": "Ran 14 tests in 0.52s OK"}]}
@@ -55,7 +55,8 @@ class Contract(unittest.TestCase):
         self.assertTrue(any("35 条全部通过" in e for e in self.errors(doc)))
 
     def test_score_category_cannot_conflict(self):
-        for score, category in ((5, "delivery_issue"), (4, "complete"), (3, "verification_gap"), (4, "anything")):
+        for score, category in ((5, "delivery_issue"), (4, "complete"), (3, "verification_gap"),
+                                (3, "process_issue"), (4, "anything")):
             doc = self.doc()
             doc["score"], doc["score_basis"]["category"] = score, category
             doc["score_basis"]["lowest_supported_score"] = score
