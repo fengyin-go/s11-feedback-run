@@ -20,7 +20,7 @@ fbr_sheet.py --root "<root>" --batch b1110-01
 
 ## 凭据和认证
 
-优先读取 `~/.codex/coding-agent-satisfaction/solo-qa-accounts/gonghao.json`，不存在时才读取 `~/.codex/coding-agent-satisfaction/solo-qa.json`。两者均要求普通文件、权限 600、`username` 恰为 `gonghao`，密码只读到内存。优先文件损坏或不安全时不能悄悄退回备用文件。禁止打印文件、密码、Cookie、CSRF 或完整登录响应；凭据不放工作目录、仓库、回执或交付目录。
+默认账号为 `zouyonghong`，可用环境变量 `SOLO11_PLATFORM_ACCOUNT` 覆盖。优先读取 `~/.codex/coding-agent-satisfaction/solo-qa-accounts/<账号>.json`，不存在时才读取 `~/.codex/coding-agent-satisfaction/solo-qa.json`。两者均要求普通文件、权限 600、`username` 恰为所选账号，密码只读到内存。优先文件损坏或不安全时不能悄悄退回备用文件。禁止打印文件、密码、Cookie、CSRF 或完整登录响应；凭据不放工作目录、仓库、回执或交付目录。
 
 登录：`POST /auth/login`，JSON 为 `username`、`password`。会话由内存 CookieJar 保存；写请求使用 `solo_qa_csrf` Cookie 解码后的值作为 `X-CSRF-Token`。不保存 Cookie 文件，不跟随跨 origin 重定向，不自动重试 POST。登录后 GET `/auth/me` 核对用户名和是否需要修改初始密码；需要改密码时停止。
 
@@ -66,7 +66,7 @@ fbr_sheet.py --root "<root>" --batch b1110-01
 
 成功上传一项立即落盘；下一项上传失败可复用已确认那项。建单前先落 `creating`；连接中断、超时或返回缺 ID 时记 `uncertain`。再次调用先按本账号历史 SessionID 回查，能与原上传和所有字段一致对应才恢复确认。结果未知却查不到记录时必须停下核查，不能自动再 POST。已有相同 SessionID 且无匹配回执也不重复建单，不自动覆盖、返修或删除远端数据。
 
-回执确认后重新生成结果表，才会采用平台媒体地址、`gonghao` 与平台 `created_at`。本地正文/附件变化、旧占位回执或回读字段不一致，均不能继续显示有效已提交。若需要更新远端内容，另行分析平台返修锁定字段并取得用户授权；本版本不自动 PUT。
+回执确认后重新生成结果表，才会采用平台媒体地址、所选平台账号与平台 `created_at`。本地正文/附件变化、旧占位回执或回读字段不一致，均不能继续显示有效已提交。若需要更新远端内容，另行分析平台返修锁定字段并取得用户授权；本版本不自动 PUT。
 
 平台 `other_issues` 不从本地“备注”复制。新交与返修都只允许中断续写说明：模型自行中断次数、已输入“继续”的次数、综合所有续写评价且表中标识仍取首轮。没有中断续写时显式发送 `""`；重跑、Git 历史、录屏问题、修复说明等仍保留在本地证据中。
 

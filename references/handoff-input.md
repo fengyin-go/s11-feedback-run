@@ -2,7 +2,7 @@
 
 运行侧消费同一个 `<root>/batches/<batch_id>/`，不要重新复制其他任务的代码来替代 workspace，也不要按表格重新拼题面。一个任务目录对应一个提示词、一个独立 Git 仓库、一个容器会话和一份验收结果。
 
-新出题入口为 [`s11-gsb-prompt-create`](../../s11-gsb-prompt-create/SKILL.md)，其 `prepare_handoff.py` 直接写本目录下的 V2 输入。任务目录与容器名统一为 `s11-六位数字`，不按 Excel 再拼一套任务路径。
+新出题入口为 [`s11-gsb-prompt-create`](../../s11-gsb-prompt-create/SKILL.md)，其 `prepare_handoff.py` 直接写本目录下的 V2 输入。新批次任务目录与容器名使用 `<仓库名>-01-<类型>`；旧 `s11-六位数字` 批次仍兼容，不按 Excel 再拼一套任务路径。
 
 新批次固定单份 `origin/` + `workspace/`：origin 留在初始提交并保存出题预检依赖；workspace 是交接时从远端 main 克隆的干净源码，起跑时不带宿主依赖缓存。运行容器只挂载 workspace。GitHub 仓库只有 main；产物快照直接推进 main，初始快照永远使用不可变的 `/commit/<initial_commit>`。
 
