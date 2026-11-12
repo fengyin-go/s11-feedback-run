@@ -88,7 +88,7 @@ class Runtime(DockerCase):
         self.assertEqual(fbr_run.run_one(task, self.cfg)["state"], "ok")
         self.assertEqual(len(self.docker.docker_calls("kill")), 1)
         attempts = lib.load_json(task / "run/attempts.json")
-        self.assertEqual(attempts[0]["reason"], "进程超时")
+        self.assertIn("未保留具体原因", attempts[0]["reason"])
         self.assertEqual(len(attempts[0]["continuations"]), 1)
 
     def test_configuration_cannot_increase_hard_limit(self):

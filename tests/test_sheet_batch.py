@@ -127,7 +127,7 @@ class Columns(unittest.TestCase):
 
 class BuildRow(SheetCase):
     def test_not_gated(self):
-        self.assertEqual(self.row(self.written()), (None, "Feedback 还没过闸门"))
+        self.assertEqual(self.row(self.written()), (None, "模型已跑完，待完成验收与 Feedback"))
 
     def test_full_row(self):
         task_dir = self.gated()
@@ -316,9 +316,9 @@ class WriteSheet(SheetCase):
         lines = [[c.value for c in line] for line in board.iter_rows(min_row=2)]
         self.assertEqual(lines[0], ["s11-000001", "✓", "✓", "✓", "✓", "✓", "✓", "✓", None])
         self.assertEqual(lines[1], ["s11-000002", "✓", "✓", "✓", "✓", "✓", "✓", None, NOT_PUSHED])
-        self.assertEqual(lines[2], ["s11-000003", "✓", "✓", "✓", "✓", None, None, None, "Feedback 还没过闸门"])
+        self.assertEqual(lines[2], ["s11-000003", "✓", "✓", "✓", "✓", None, None, None, "模型已跑完，待取证"])
         self.assertEqual(lines[3][:8], ["s11-000004", "✓", "✓", "✓", "✓", "✓", "✗", None])
-        self.assertTrue(lines[3][8].startswith("Feedback："))
+        self.assertTrue(lines[3][8].startswith("Feedback 校验失败，待返修复验："))
         self.assertIn("5 分不写缺口：issues 应当为空", lines[3][8])
         self.assertEqual(lines[4], ["s11-000005", None, None, None, None, None, None, None, "s11-000005/task.json 缺少 image"])
 
@@ -492,7 +492,7 @@ class Spotcheck(SheetCase):
         self.check("退回", note="第 4 步之后的描述不准")
         stage = self.stage(task_dir, "feedback")
         self.assertEqual((stage["state"], stage["problems"]), ("failed", ["抽检退回：第 4 步之后的描述不准"]))
-        self.assertEqual(self.row(task_dir), (None, "Feedback 还没过闸门"))
+        self.assertEqual(self.row(task_dir), (None, "Feedback 校验失败，待返修复验：抽检退回：第 4 步之后的描述不准"))
         self.assertEqual(fbr_batch.status(self.root, BATCH)[0]["detail"], "抽检退回：第 4 步之后的描述不准")
         row, = fbr_feedback.gate_batch(self.root, BATCH, self.cfg)[0]          # 正文没改，重过闸门也不放行
         self.assertEqual((row["state"], row["errors"]), ("failed", ["抽检退回过（第 4 步之后的描述不准），正文还没改"]))

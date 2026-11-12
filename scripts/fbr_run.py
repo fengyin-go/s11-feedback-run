@@ -362,7 +362,8 @@ def recover_one(task_dir: Path, cfg: dict) -> dict:
         lib.save_json(budget_path, budget)
     import fbr_completion
     decision = fbr_trace.classify_attempt(done['rc'], current.get('timed_out', False) or done.get('timed_out', False), segment, tail,
-                                          completed_cleanup=fbr_completion.valid(task_dir, current, done))
+                                          completed_cleanup=fbr_completion.valid(task_dir, current, done),
+                                          termination_reason=current.get('reason', 'worker_guard' if done.get('timed_out') else ''))
     if segment.get('model') and segment['model'] != cfg.get('model', 'auto_model/urm'):
         decision = {'verdict': 'stop', 'reason': '实际模型不符', 'detail': '模型与起跑预期不符'}
     if runtime.auth_error(segment, tail):
@@ -395,7 +396,9 @@ def recover_one(task_dir: Path, cfg: dict) -> dict:
             decision = {'verdict': 'retry', 'reason': '零代码改动', 'detail': '最终树没有代码改动'}
     if not any(a['n'] == current['attempt'] for a in attempts):
         attempts.append({'n': current['attempt'], 'started_at': current['started_at'], 'ended_at': lib.now_iso(),
-                         'rc': done['rc'], 'continuations': continuations, 'session_id': segment['session_id'], **decision})
+                         'rc': done['rc'], 'timed_out': current.get('timed_out', False) or done.get('timed_out', False),
+                         'termination_reason': current.get('reason', 'worker_guard' if done.get('timed_out') else ''),
+                         'continuations': continuations, 'session_id': segment['session_id'], **decision})
         lib.save_json(attempts_path, attempts)
     if decision['verdict'] == 'accept':
         lib.set_stage(task_dir, 'run', 'ok', attempts=current['attempt'], started_at=current['started_at'],
@@ -446,21 +449,27 @@ def run_one(task_dir: Path, cfg: dict) -> dict:
     attempts = lib.load_json(run_dir / "attempts.json", default=[])
     budget_path = run_dir / "budget.json"
     budget = lib.load_json(budget_path, default={"active_seconds": 0, "waiting_seconds": 0})
-    limit = int(cfg["run"]["max_attempts"])
-    while len(attempts) < limit:
+    import fbr_retry
+    while True:
+        admission = fbr_retry.admission(attempts, cfg)
+        lib.save_json(run_dir / 'retry-ledger.json', admission)
+        if not admission['allowed']:
+            lib.set_stage(task_dir, 'run', 'deferred', reason=admission['reason'])
+            return {'task_id': name, 'state': 'deferred', 'detail': admission['reason']}
         if time.time() >= cfg.get('_deadline', float('inf')) or (cfg.get('_drain') and Path(cfg['_drain']).exists()):
             return {'task_id': name, 'state': 'deferred', 'detail': '批次已排空或预算到顶，不起新轮'}
         if budget["active_seconds"] >= cfg["run"]["task_budget"]:
             lib.set_stage(task_dir, "run", "deferred", reason="单题累计运行预算耗尽，恢复不会清零预算")
             return {"task_id": name, "state": "deferred", "detail": "单题累计运行预算耗尽"}
-        if budget.get('waiting_seconds', 0) >= cfg['run']['gateway_wait_total']:
+        if cfg['run'].get('gateway_wait_task_total') is not None and budget.get('waiting_seconds', 0) >= cfg['run']['gateway_wait_task_total']:
             lib.set_stage(task_dir, 'run', 'deferred', reason='单题累计网关等待预算耗尽，未派发新的尝试')
             return {'task_id': name, 'state': 'deferred', 'detail': '单题累计网关等待预算耗尽，保留次数与容器，不发送题面'}
-        number = len(attempts) + 1
+        number = (resume or {}).get('attempt') or max([a.get('n', 0) for a in attempts] or [0]) + 1
         lib.open_permissions(task_dir / "workspace")
         started = lib.now_iso()
         lib.save_json(run_dir / "current.json", {**(resume or {}), "state": "starting", "attempt": number,
             "started_at": started, "owner_pid": os.getpid(), "owner_identity": runtime.process_identity(),
+            "attempt_waiting_base": (resume or {}).get("attempt_waiting_base", budget.get("waiting_seconds", 0)),
             "generation": lib.content_hash([record['prompt'], record['initial_commit'], record['task_repo_full']]),
             "script_sha": lib.content_hash({p.name: runtime.hashlib.sha256(p.read_bytes()).hexdigest()
                             for p in Path(__file__).parent.glob('*.py')}),
@@ -525,7 +534,8 @@ def run_one(task_dir: Path, cfg: dict) -> dict:
             completion = lib.load_json(run_dir / 'current.json', default={})
             completed_exit = lib.load_json(Path(completion.get('result', '/nonexistent')), default={})
             decision = fbr_trace.classify_attempt(rc, timed_out, segment, tail,
-                                                  completed_cleanup=fbr_completion.valid(task_dir, completion, completed_exit))
+                                                  completed_cleanup=fbr_completion.valid(task_dir, completion, completed_exit),
+                                                  termination_reason=completion.get('reason', 'worker_guard' if completed_exit.get('timed_out') else ''))
             if runtime.auth_error(segment, tail):
                 decision = {"verdict": "stop", "reason": "网关鉴权失败", "detail": "鉴权失败，停止开新轮，检查凭据"}
             if segment.get('model') and segment['model'] != cfg.get('model', 'auto_model/urm'):
@@ -577,7 +587,29 @@ def run_one(task_dir: Path, cfg: dict) -> dict:
             changed = code_changes(task_dir, record)
             if not changed:
                 verdict = {"verdict": "retry", "reason": "零代码改动", "detail": "最终产物没有代码改动，归档后新容器重跑"}
+        terminal = lib.load_json(run_dir / 'current.json', default={})
+        if timed_out and terminal.get('reason') not in ('batch_budget', 'worker_guard'):
+            # Gateway errors can reach disk only after process termination; retain both decisions.
+            time.sleep(cfg['run'].get('reclassify_settle_seconds', 8))
+            stream = fbr_trace.read_stream(run_dir / 'stream.jsonl')
+            with (run_dir / 'stream.jsonl').open('rb') as late_stream:
+                late_stream.seek(terminal.get('stream_bytes_before_stop', (run_dir / 'stream.jsonl').stat().st_size))
+                late_tail = late_stream.read().decode('utf-8', 'replace')
+            late_signals = []
+            for line in late_tail.splitlines():
+                try:
+                    signal = runtime.gateway_signal(json.loads(line))
+                except (ValueError, TypeError):
+                    continue
+                if signal:
+                    late_signals.append(signal)
+            if late_signals and terminal.get('reason') in ('', 'stalled', 'timeout') and not ((stream.get('result') or {}).get('is_error') is False):
+                verdict = {**verdict, 'failure_category': 'throttle' if any(x in ('limit', 'soft') for x in late_signals) else 'infra',
+                           'reclassified': {'from': verdict['reason'], 'source': 'late_stream_api_error'},
+                           'detail': verdict['detail'] + '；停止后重读原始流发现网关错误'}
+        terminal_api = stream.get("result") if (stream.get("result") or {}).get("is_error") else None
         attempts.append({"n": number, "started_at": started, "ended_at": lib.now_iso(), "rc": rc,
+                         "api_error": terminal_api, "termination_reason": terminal.get('reason', 'worker_guard' if completed_exit.get('timed_out') else ''),
                          "timed_out": timed_out, "events": stream["events"], "session_id": stream["session_id"],
                          "continuations": continuations, **verdict, "detail": lib.redact(verdict["detail"], [secret])})
         lib.save_json(run_dir / "attempts.json", attempts)
@@ -601,16 +633,19 @@ def run_one(task_dir: Path, cfg: dict) -> dict:
             archive_attempt(task_dir, record, number, secret)
         except lib.KeyLeakError:
             return halt_for_key(task_dir, "run")
-        if gateway and verdict['reason'] == '网关报错':
+        assessment = fbr_retry.classify_attempt(attempts[-1])
+        if gateway and assessment['category'] in ('throttle', 'infra'):
             gateway.event('limit' if runtime.LIMIT.search(tail) else 'soft' if runtime.SOFT.search(tail) else 'network')
-            delay = min(cfg['gateway']['retry_max'], cfg['gateway']['retry_base'] * 2 ** (number - 1))
-            until = time.time() + delay
-            while time.time() < until:
-                time.sleep(min(5, until - time.time()))
-    last = attempts[-1]
-    lib.set_stage(task_dir, "run", "failed", attempts=len(attempts), reason=last["reason"])
-    return {"task_id": name, "state": "failed",
-            "detail": f"重跑 {len(attempts)} 次仍然不行（{last['reason']}），这题换掉"}
+        delay = min(cfg['gateway']['retry_max'], cfg['gateway']['retry_base'] * 2 ** min(number - 1, 8)) if assessment['category'] in ('throttle', 'infra') else 0
+        retry_after = time.time() + delay
+        lib.save_json(run_dir / 'retry-ledger.json', fbr_retry.admission(attempts, cfg))
+        lib.set_stage(task_dir, 'run', 'deferred', reason=verdict['reason'], retry_after=retry_after)
+        if cfg.get('_single_attempt'):
+            return {'task_id': name, 'state': 'retry', 'retry_after': retry_after,
+                    'detail': verdict['reason'], 'failure_category': assessment['category']}
+        while time.time() < retry_after:
+            time.sleep(min(5, retry_after - time.time()))
+
 
 
 # ---------- R2 ----------
@@ -769,7 +804,11 @@ def main() -> int:
             batch_budget = {'deadline': runtime.batch_deadline(root, args.batch, cfg)}
             lib.save_json(budget_path, batch_budget)
             cfg.update(_deadline=batch_budget['deadline'], _drain=str(directory / 'drain'))
-            rows = fan_out(todo, lambda p: run_one(p, cfg), cfg["concurrency"])
+            import fbr_schedule
+            cfg['_single_attempt'] = True
+            rows = fbr_schedule.rolling(todo, lambda p: run_one(p, cfg), parallel=cfg['concurrency'],
+                deadline=cfg['_deadline'], stopped=lambda: Path(cfg['_drain']).exists(),
+                on_result=lambda task, row: print(f"{task.name}  {row['state']}  {row.get('detail', '')}", flush=True))
         return 0 if all(r["state"] in ("ok", "skip") for r in rows) else 1
     except lib.FbrError as exc:
         print(f"错误：{exc}", file=sys.stderr)

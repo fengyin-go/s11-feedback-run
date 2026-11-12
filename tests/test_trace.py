@@ -179,7 +179,7 @@ class Attempts(Sandbox):
         ok = self.stream(stream_text(SID))
         cut = self.stream(stream_text(SID, with_result=False))
         cases = [
-            (trace.classify_attempt(0, True, ok), "进程超时"),
+            (trace.classify_attempt(0, True, ok), "进程超时（历史记录未保留具体原因）"),
             (trace.classify_attempt(1, False, cut, "API Error: 529 overloaded"), "网关报错"),
             (trace.classify_attempt(137, False, cut, "Killed"), "进程异常退出"),
             (trace.classify_attempt(0, False, cut), "无故中断"),

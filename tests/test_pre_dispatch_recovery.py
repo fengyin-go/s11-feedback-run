@@ -88,6 +88,7 @@ class PreDispatch(DockerCase):
             self.assertFalse(gateway.track_existing(info))
 
     def test_exhausted_wait_budget_does_not_dispatch_prepared_attempt(self):
+        self.cfg['run']['gateway_wait_task_total'] = self.cfg['run']['gateway_wait_total']
         task, _, current = self.prepared()
         budget = {'active_seconds': 12, 'waiting_seconds': self.cfg['run']['gateway_wait_total']}
         lib.save_json(task / 'run/budget.json', budget)
@@ -102,6 +103,7 @@ class PreDispatch(DockerCase):
         self.assertEqual(len(self.docker.docker_calls('run', '-i')), 1)
 
     def test_exhausted_wait_budget_does_not_create_fresh_attempt(self):
+        self.cfg['run']['gateway_wait_task_total'] = self.cfg['run']['gateway_wait_total']
         task = self.make_task()
         lib.save_json(task / 'run/budget.json', {'active_seconds': 12,
             'waiting_seconds': self.cfg['run']['gateway_wait_total'] + 2})

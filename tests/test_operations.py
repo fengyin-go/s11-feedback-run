@@ -33,13 +33,13 @@ class ZeroChanges(DockerCase):
         task = self.make_task()
         self.docker.outcomes = [self.good(effect=lambda ws: None) for _ in range(3)]
         row = fbr_run.run_one(task, self.cfg)
-        self.assertEqual(row['state'], 'failed')
+        self.assertEqual(row['state'], 'deferred')
         attempts = lib.load_json(task / 'run/attempts.json')
         self.assertEqual([a['reason'] for a in attempts], ['零代码改动'] * 3)
         self.assertEqual(len(self.docker.docker_calls('run', '-i')), 3)
         self.assertEqual(len(self.docker.docker_calls('rm')), 3)
         self.assertTrue(all((task / f'run/attempt-{n}/projects').is_dir() for n in (1, 2, 3)))
-        self.assertEqual(fbr_run.run_one(task, self.cfg)['state'], 'failed')
+        self.assertEqual(fbr_run.run_one(task, self.cfg)['state'], 'deferred')
         self.assertEqual(len(self.docker.docker_calls('run', '-i')), 3)
 
     def test_docs_only_does_not_count(self):
@@ -240,7 +240,7 @@ class Flow(Sandbox):
 
     def test_resumed_ready_task_does_not_wait_for_busy_generation_pool(self):
         first, second = self.make_task(1), self.make_task(2)
-        cfg=lib.settings(self.root);cfg['concurrency']=1
+        cfg=lib.settings(self.root);cfg['concurrency']=1;cfg['run']['batch_budget']=.5
         events={}
         for stage in ('run','collect','commit','record','facts'):
             lib.set_stage(second,stage,'ok')
@@ -261,7 +261,10 @@ class Flow(Sandbox):
              mock.patch('fbr_sheet.write_sheet'):
             result=fbr_flow.run_flow(self.root,opts)
         self.assertLess(events['ready_review'],events['produced'])
-        self.assertEqual(result['state'],'needs_task_agent')
+        self.assertEqual(result['state'],'budget')
+        waiting=lib.load_json(first.parent/'flow/waiting.json')
+        self.assertTrue(waiting['tasks'])
+        self.assertEqual(waiting['state'],'waiting_for_task_ai')
 
     def test_frozen_production_does_not_invoke_runner(self):
         task = self.make_task()

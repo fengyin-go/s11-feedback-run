@@ -93,6 +93,7 @@ def pressure_update(state, event, options, now):
             floor = 1 if event == 'limit' else min(ceiling, options['soft_floor'])
             cap = min(cap, max(floor, cap - 1))
             state['last_drop'] = now
+            state.setdefault('initial_drop', now)
             state.setdefault('next_spike', now + options['spike_interval'])
         if event == 'limit':
             state.update(last_limit=now, successes=0, probe_ok=0)
@@ -101,7 +102,7 @@ def pressure_update(state, event, options, now):
     elif event in ('probe_ok', 'probe_fail'):
         state['probe_ok'] = state.get('probe_ok', 0) + 1 if event == 'probe_ok' else 0
         state['last_probe'] = now
-    stable = now - max(state.get('last_limit', 0), state.get('last_drop', 0)) >= options['stable_seconds']
+    stable = now - state.get('last_limit', state.get('initial_drop', 0)) >= options['stable_seconds']
     cooled = now - state.get('last_ramp', 0) >= options['stable_seconds']
     if cap < ceiling and stable and cooled and (state.get('successes', 0) >= 1 or
                                                state.get('probe_ok', 0) >= options['probe_successes']):
@@ -156,7 +157,10 @@ class Gateway:
             pressure_update(data, kind, self.options, time.time())
 
     def acquire(self, deadline, *, once=False):
+        deadline = min(deadline, self.cfg.get('_deadline', float('inf')))
         while time.time() < deadline:
+            if self.cfg.get('_drain') and Path(self.cfg['_drain']).exists():
+                return False
             with self.transaction() as data:
                 if data.get('auth_blocked'):
                     raise lib.FbrError('同一网关凭据已出现鉴权失败，暂停新轮，检查凭据')
@@ -321,11 +325,17 @@ def monitored_stream(command, stdin_text, stdout_path, stderr_path, timeout, con
     request_path = task / 'run' / f'exec-{request_id}.json'
     result_path = task / 'run' / f'exit-{request_id}.json'
     starting_budget = lib.load_json(task / 'run/budget.json', default={'active_seconds': 0, 'waiting_seconds': 0})
+    current = lib.load_json(task / 'run/current.json', default={})
+    attempt_wait_base = current.get('attempt_waiting_base', 0 if current.get('segment', 0) else starting_budget.get('waiting_seconds', 0))
+    attempt_wait_used = max(0, starting_budget.get('waiting_seconds', 0) - attempt_wait_base)
+    wait_remaining = max(0, cfg['gateway_wait_total'] - attempt_wait_used)
+    if cfg.get('gateway_wait_task_total') is not None:
+        wait_remaining = min(wait_remaining, max(0, cfg['gateway_wait_task_total'] - starting_budget.get('waiting_seconds', 0)))
     guard = min(context['cfg'].get('_deadline', float('inf')), time.time() +
-        min(timeout + cfg['grace_seconds'], max(0, cfg['task_budget'] - starting_budget['active_seconds'])) +
-        max(0, cfg['gateway_wait_total'] - starting_budget.get('waiting_seconds', 0)))
+        min(timeout + cfg['grace_seconds'], max(0, cfg['task_budget'] - starting_budget['active_seconds'])) + wait_remaining)
     request = {'id': request_id, 'command': command, 'stdin': stdin_text,
                'task': str(task), 'guard_deadline': guard, 'started_epoch': time.time(), 'base_budget': starting_budget,
+               'attempt_waiting_base': attempt_wait_base,
                'stdout': str(stdout_path), 'stderr': str(stderr_path), 'result': str(result_path), 'timeout': timeout}
     lib.save_json(request_path, request)
     process = subprocess.Popen([sys.executable, str(Path(__file__).with_name('fbr_worker.py')), str(request_path)],
@@ -437,19 +447,14 @@ def monitor_process(process, request, base, context, *, started=None, adopted=Fa
                     continue
         protected = watcher.protected(now, cfg)
         if protected and not waiting_started:
+            # The worker retries autonomously and can resume without admission.
+            # Keep its reservation until it exits so retry recovery cannot exceed cap.
             waiting_started = now
-            gateway.release()
         elif waiting_started and not protected:
-            # A resumed response is already running inside this same worker.
-            # Count it even if new-dispatch capacity has since been reduced;
-            # quota admission cannot pause an in-flight API stream.
-            resumed = watcher.progress == now and gateway.track_existing(base, claim=True)
-            if resumed or gateway.acquire(now + .1, once=True):
-                gateway.transfer(process.pid)
-                duration = now - waiting_started
-                waiting_total += duration
-                deadline += duration
-                waiting_started = 0
+            duration = now - waiting_started
+            waiting_total += duration
+            deadline += duration
+            waiting_started = 0
         if watcher.retry_at > last_pressure:
             gateway.event(watcher.kind)
             last_pressure = watcher.retry_at
@@ -457,13 +462,18 @@ def monitor_process(process, request, base, context, *, started=None, adopted=Fa
                      'output_idle': now - watcher.output, 'events': watcher.events, 'tools': watcher.tools,
                      'session_id': watcher.session_id, 'model': watcher.model,
                      'gateway_wait': bool(waiting_started), 'waiting_seconds': waiting_total +
-                         (now - waiting_started if waiting_started else 0), 'pid': process.pid}
+                         (now - waiting_started if waiting_started else 0), 'pid': process.pid,
+                     'attempt_waiting_base': request.get('attempt_waiting_base', base_budget.get('waiting_seconds', 0)),
+                     'attempt_waiting_seconds': max(0, base_budget.get('waiting_seconds', 0) + waiting_total + (now - waiting_started if waiting_started else 0) - request.get('attempt_waiting_base', base_budget.get('waiting_seconds', 0))),
+                     'waiting_limit_attempt': cfg['gateway_wait_total'], 'waiting_limit_task': cfg.get('gateway_wait_task_total')}
         lib.save_json(task / 'run/heartbeat.json', heartbeat)
         spent_wait = waiting_total + (now - waiting_started if waiting_started else 0)
         save_budget(now, spent_wait)
         reason = ''
         if waiting_started:
-            if now - waiting_started >= cfg['gateway_wait_limit'] or base_budget.get('waiting_seconds', 0) + spent_wait >= cfg['gateway_wait_total']:
+            if (now - waiting_started >= cfg['gateway_wait_limit']
+                    or base_budget.get('waiting_seconds', 0) + spent_wait - request.get('attempt_waiting_base', base_budget.get('waiting_seconds', 0)) >= cfg['gateway_wait_total']
+                    or (cfg.get('gateway_wait_task_total') is not None and base_budget.get('waiting_seconds', 0) + spent_wait >= cfg['gateway_wait_task_total'])):
                 reason = 'gateway_wait_exhausted'
         elif now >= deadline:
             if not extended and now - watcher.progress <= 180:
@@ -482,6 +492,7 @@ def monitor_process(process, request, base, context, *, started=None, adopted=Fa
         if now >= request.get('guard_deadline', float('inf')):
             reason = 'worker_guard'
         if reason:
+            before_stop_bytes = stdout_path.stat().st_size if stdout_path.exists() else 0
             # 先停止容器内进程，再等 worker 写出退出码。原始证据仍在容器中。
             lib.run(['docker', 'kill', task.name], timeout=60)
             try:
@@ -489,7 +500,16 @@ def monitor_process(process, request, base, context, *, started=None, adopted=Fa
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait(timeout=10)
-            base.update(state='exited', rc=124, timed_out=True, reason=reason)
+            diagnosis = {'at': lib.now_iso(), 'reason': reason, 'attempt': base.get('attempt'), 'stream_bytes_before_stop': before_stop_bytes,
+                         'request_id': base.get('request_id'), 'monitor_rc': 124,
+                         'elapsed': now - started, 'active_seconds': active,
+                         'waiting_seconds': base_budget.get('waiting_seconds', 0) + spent_wait,
+                         'heartbeat': heartbeat,
+                         'limits': {k: cfg.get(k) for k in ('gateway_wait_limit', 'gateway_wait_total', 'task_budget', 'timeout', 'stall_seconds')},
+                         'batch_deadline': context['cfg'].get('_deadline'),
+                         'worker_exit': lib.load_json(Path(base.get('result', '/nonexistent')), default={})}
+            lib.save_json(task / 'run' / ('termination-' + str(base.get('request_id', 'unknown')) + '.json'), diagnosis)
+            base.update(state='exited', rc=124, timed_out=True, reason=reason, stream_bytes_before_stop=before_stop_bytes)
             lib.save_json(task / 'run/current.json', base)
             return 124, True
         if process.poll() is not None:

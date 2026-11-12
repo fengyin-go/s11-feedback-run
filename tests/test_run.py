@@ -174,14 +174,14 @@ class RunOne(DockerCase):
         self.docker.outcomes = [{"stdout": stream_text(SID, with_result=False), "rc": 1, "projects": self.projects(f"p{i}")}
                                 for i in range(4)]
         row = fbr_run.run_one(task_dir, self.cfg)
-        self.assertEqual(row["state"], "failed")
-        self.assertEqual(row["detail"], "重跑 3 次仍然不行（进程异常退出），这题换掉")
+        self.assertEqual(row["state"], "deferred")
+        self.assertEqual(row["detail"], "max_attempts")
         self.assertEqual(len(self.docker.outcomes), 1)      # 只跑了 3 次
-        self.assertEqual(lib.load_state(task_dir)["stages"]["run"]["state"], "failed")
+        self.assertEqual(lib.load_state(task_dir)["stages"]["run"]["state"], "deferred")
         self.assertEqual(self.docker.containers, set())
         self.assertEqual(sh(task_dir / "workspace", "status", "--porcelain", "--ignored"), "")
         # 用尽之后再跑也不会再起容器
-        self.assertEqual(fbr_run.run_one(task_dir, self.cfg)["state"], "failed")
+        self.assertEqual(fbr_run.run_one(task_dir, self.cfg)["state"], "deferred")
         self.assertEqual(len(self.docker.outcomes), 1)
 
     def test_timeout_kills_container(self):
@@ -190,7 +190,7 @@ class RunOne(DockerCase):
                                 self.good()]
         self.assertEqual(fbr_run.run_one(task_dir, self.cfg)["state"], "ok")
         self.assertEqual(self.docker.docker_calls("kill"), [["docker", "kill", "s11-000001"]])
-        self.assertEqual(lib.load_json(task_dir / "run" / "attempts.json")[0]["reason"], "进程超时")
+        self.assertIn("未保留具体原因", lib.load_json(task_dir / "run" / "attempts.json")[0]["reason"])
 
     def test_archive_failure_keeps_container(self):
         task_dir = self.make_task()

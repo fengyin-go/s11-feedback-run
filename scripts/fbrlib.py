@@ -64,7 +64,11 @@ DEFAULTS = {
         "gateway_wait_limit": 1800,
         "gateway_wait_total": 2700,
         "poll_seconds": 5,
-        "max_attempts": 3,          # 含首次；工程异常或零代码改动重跑
+        "max_attempts": 3,          # 模型责任尝试上限；物理编号独立递增
+        "max_infra_attempts": 3, "max_throttle_attempts": 8,
+        "max_physical_attempts": None, # 已授权批次可额外限制物理派发总数
+        "gateway_wait_task_total": None, # 显式批次授权的跨尝试等待上限
+        "reclassify_settle_seconds": 8,
         "max_continuations": 2,     # 同题累计最多两次，只发送“继续”
         "context_limit": 1000000,   # 镜像里固化的 max context token，不符不起跑
     },

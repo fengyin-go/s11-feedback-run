@@ -16,6 +16,7 @@ import argparse
 import hashlib
 import re
 import sys
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -96,7 +97,7 @@ def build_row(root: Path, task_dir: Path, cfg: dict, *, delivery_manifest: dict 
     stages = lib.load_state(task_dir)["stages"]
     info = stages.get("feedback", {})
     if info.get("state") != "ok":
-        return None, "Feedback 还没过闸门"
+        return None, pending_reason(task_dir)
     doc = lib.load_json(task_dir / "review" / "feedback.json", default={})
     text = str(doc.get("feedback", "")).strip()
     if hashlib.sha256(str(doc.get("feedback", "")).encode("utf-8")).hexdigest() != info.get("feedback_sha"):
@@ -205,30 +206,81 @@ def row_problems(row: dict, ids: dict, snapshot: dict) -> list[str]:
     return list(dict.fromkeys(problems))
 
 
-def progress_row(task_dir: Path, reason: str) -> list:
-    stages = lib.load_state(task_dir)["stages"]
-    cells, stuck = [task_dir.name], ""
+def run_activity(task_dir: Path) -> str:
+    import fbr_runtime
+    current = lib.load_json(task_dir / 'run/current.json', default={})
+    if fbr_runtime.alive(current):
+        heartbeat = lib.load_json(task_dir / 'run/heartbeat.json', default={})
+        return '网关内部重试中，模型尚未跑完' if heartbeat.get('pid') == current.get('pid') and heartbeat.get('gateway_wait') else '模型运行中，尚未跑完'
+    owner = {'pid': current.get('owner_pid'), 'identity': current.get('owner_identity')}
+    if current.get('state') == 'starting' and fbr_runtime.alive(owner):
+        return '等待共享网关额度，尚未派发模型'
+    # Only a live batch controller and current admission can establish queued work.
+    import fbr_retry
+    root = task_dir.parents[2]
+    for kind in ('runner', 'flow'):
+        directory = task_dir.parent / kind
+        controller = lib.load_json(directory / 'process.json', default={})
+        plan = lib.load_json(directory / 'plan.json', default={})
+        selected = plan.get('tasks')
+        if not fbr_runtime.alive(controller) or (selected and task_dir.name not in selected):
+            continue
+        if plan.get('deadline', float('inf')) <= time.time() or any((directory / flag).exists() for flag in ('drain', 'pause')):
+            continue
+        cfg = lib.settings(root)
+        cfg['run'].update(plan.get('run_limits', {}))
+        budget = lib.load_json(task_dir / 'run/budget.json', default={})
+        if not fbr_retry.admission(lib.load_json(task_dir / 'run/attempts.json', default=[]), cfg)['allowed']:
+            continue
+        if budget.get('active_seconds', 0) >= cfg['run']['task_budget']:
+            continue
+        wait_limit = cfg['run'].get('gateway_wait_task_total')
+        if wait_limit is not None and budget.get('waiting_seconds', 0) >= wait_limit:
+            continue
+        return '等待当前批次运行槽位，尚未跑完'
+    return ''
+
+
+def pending_reason(task_dir: Path) -> str:
+    stages = lib.load_state(task_dir)['stages']
+    if stages.get('run', {}).get('state') != 'ok':
+        active = run_activity(task_dir)
+        if active:
+            return active
     for stage in lib.STAGES:
         info = stages.get(stage, {})
-        label = {"ok": "✓", "failed": "✗", "dry": "演练", "deferred": "等待"}.get(info.get("state"), "")
-        if stage == 'feedback' and info.get('state') == 'dry' and '复核中' in info.get('reason', ''):
-            label = '复核中'
-        running = False
+        if info.get('state') == 'ok':
+            continue
+        detail = info.get('problems') or info.get('reason') or ''
+        detail = '；'.join(detail) if isinstance(detail, list) else str(detail)
+        if stage == 'feedback':
+            gate = lib.load_json(task_dir / 'review/gate.json', default={})
+            if gate.get('passed') is False or info.get('state') == 'failed':
+                errors = gate.get('errors') or gate.get('problems') or detail
+                if isinstance(errors, list):
+                    errors = '；'.join(str(x) for x in errors)
+                return 'Feedback 校验失败，待返修复验：' + lib.clip(str(errors), 200)
+            return '模型已跑完，待完成验收与 Feedback' + ('：' + lib.clip(detail, 200) if detail else '')
+        if info.get('state') in ('failed', 'deferred'):
+            return STAGE_LABEL[stage] + '：' + lib.clip(detail, 200)
+        return ('模型尚未跑完，等待运行' if stage == 'run' else '模型已跑完，待' + STAGE_LABEL[stage])
+    return ''
+
+
+def progress_row(task_dir: Path, reason: str) -> list:
+    stages = lib.load_state(task_dir)['stages']
+    cells = [task_dir.name]
+    for stage in lib.STAGES:
+        info = stages.get(stage, {})
+        label = {'ok': '✓', 'failed': '✗', 'dry': '待验收', 'deferred': '等待'}.get(info.get('state'), '')
         if stage == 'run' and info.get('state') != 'ok':
-            import fbr_runtime
-            current = lib.load_json(task_dir / 'run/current.json', default={})
-            running = fbr_runtime.alive(current)
-            if running:
-                heartbeat = lib.load_json(task_dir / 'run/heartbeat.json', default={})
-                label = '网关重试中' if heartbeat.get('gateway_wait') else '运行中'
+            active = run_activity(task_dir)
+            if active:
+                label = active.split('，')[0]
         cells.append(label)
-        if info.get("state") in ("failed", "deferred") and not running and not stuck:
-            detail = info.get("problems") or info.get("reason") or ""
-            detail = "；".join(detail) if isinstance(detail, list) else str(detail)
-            stuck = f"{STAGE_LABEL[stage]}：{lib.clip(detail, 200)}"
-    snapshot = lib.load_json(task_dir / "review" / "snapshot.json", default={})
-    cells.append("✓" if snapshot.get("pushed") else "")
-    cells.append(stuck or reason)
+    snapshot = lib.load_json(task_dir / 'review/snapshot.json', default={})
+    cells.append('✓' if snapshot.get('pushed') else '')
+    cells.append(reason or pending_reason(task_dir))
     return cells
 
 

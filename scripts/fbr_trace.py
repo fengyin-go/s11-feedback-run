@@ -295,19 +295,24 @@ def read_stream(path: Path) -> dict:
     return out
 
 
-def classify_attempt(rc: int, timed_out: bool, stream: dict, stderr_tail: str = "", *, completed_cleanup: bool = False) -> dict:
+def classify_attempt(rc: int, timed_out: bool, stream: dict, stderr_tail: str = "", *, completed_cleanup: bool = False, termination_reason: str = "") -> dict:
     """判断这次运行算不算数。只有进程异常、网关报错、无故中断才重跑；
 
     模型正常结束但没改代码、改错了、答非所问，都是有效数据，不重跑。
     """
     result = stream.get("result")
     if timed_out:
-        return {"verdict": "retry", "reason": "进程超时", "detail": ""}
+        labels = {'gateway_wait_exhausted': '网关等待预算耗尽', 'timeout': '单次有效运行超时',
+                  'stalled': '运行无进展超时', 'task_budget': '单题累计有效运行预算耗尽',
+                  'batch_budget': '批次运行截止', 'worker_guard': '执行器保护时限到达'}
+        return {"verdict": "retry", "reason": labels.get(termination_reason, "进程超时（历史记录未保留具体原因）"), "detail": termination_reason}
     if result is None:
         why = "网关报错" if GATEWAY_RE.search(stderr_tail or "") else "进程异常退出" if rc != 0 else "无故中断"
         return {"verdict": "retry", "reason": why, "detail": lib.clip(stderr_tail, 300)}
     if stream.get("problems"):
         return {"verdict": "stop", "reason": "流式输出字段不符", "detail": "；".join(stream["problems"])}
+    if result["is_error"] and re.search(r'API Error:\s*400\b', result.get('text', '')) and 'context_management' in result.get('text', '') and 'not supported' in result.get('text', ''):
+        return {"verdict": "stop", "reason": "网关协议不兼容（API 400）", "detail": "context_management 不被上游支持；核实协议兼容后再恢复，禁止原配置盲重试"}
     if result["is_error"]:
         why = "网关报错" if GATEWAY_RE.search(result["text"] + " " + (stderr_tail or "")) else "无故中断"
         return {"verdict": "retry", "reason": why, "detail": lib.clip(result["text"] or result["subtype"], 300)}

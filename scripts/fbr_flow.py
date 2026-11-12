@@ -58,6 +58,8 @@ def produce(task, cfg, options):
         while result.get('state') == 'running' and not options.stopped():
             time.sleep(5)
             result = fbr_run.run_one(task, cfg)
+        if result.get('state') == 'retry':
+            return result
         checked(result)
     checked(fbr_run.collect_one(task, cfg))
     checked(fbr_snapshot.commit_one(task, cfg))
@@ -180,6 +182,7 @@ def run_flow(root, args):
     with lib.file_lock(directory / 'flow.lock'):
         cfg = lib.settings(root)
         cfg['_managed'] = True
+        cfg['_single_attempt'] = True
         args.delivery_lock = threading.Lock()
         if getattr(args,'publish',None) is None: args.publish=True
         saved = lib.load_json(directory / 'plan.json', default={})
@@ -222,16 +225,47 @@ def run_flow(root, args):
                 return 2
             return 3
         pending={}
+        retry_queue=[]
+        author_waiting={}
         for task in tasks:
             step=resume_step(task)
             pending[enqueue(step,task)]=(step,task)
         try:
-            while pending:
-                completed, _ = futures.wait(pending, timeout=5, return_when=futures.FIRST_COMPLETED)
+            while pending or retry_queue or author_waiting:
+                for name, task in list(author_waiting.items()):
+                    if lib.stage_ok(task, 'feedback'):
+                        pending[enqueue(3,task)] = (3,task)
+                        author_waiting.pop(name)
+                lib.save_json(directory / 'waiting.json', {'at':lib.now_iso(), 'state':'waiting_for_task_ai' if author_waiting else 'active',
+                    'tasks':[{'task_id':task.name,'reason':'待当前任务 AI 完成产物验收、Feedback 或具体返修',
+                              'checkpoint':str(task/'review/task-agent-checkpoint.json'),
+                              'gate':str(task/'review/gate.json')} for task in author_waiting.values()],
+                    'next':'依据检查点真实补证/修正文并 finalize；不调用 reviewer.env 生成产物评价'})
+                if args.stopped() and author_waiting:
+                    rows.extend({'task_id':task.name,'state':'needs_task_agent','detail':'保留任务AI验收/返修检查点'} for task in author_waiting.values())
+                    author_waiting.clear()
+                due = [(when, task) for when, task in retry_queue if when <= time.time()]
+                for item in due:
+                    retry_queue.remove(item)
+                    if not args.stopped():
+                        pending[enqueue(0,item[1])] = (0,item[1])
+                    else:
+                        rows.append({'task_id':item[1].name,'state':'deferred','detail':'排空或批次截止，保留待重排'})
+                if args.stopped() and retry_queue:
+                    rows.extend({'task_id':task.name,'state':'deferred','detail':'排空或批次截止，未派发'} for _, task in retry_queue)
+                    retry_queue.clear()
+                if not pending:
+                    time.sleep(1)
+                    continue
+                completed, _ = futures.wait(pending, timeout=1, return_when=futures.FIRST_COMPLETED)
                 for future in completed:
                     step, task = pending.pop(future)
                     result = future.result()
-                    if isinstance(result,dict) and result.get('state') in ('repairing','needs_probes'):
+                    if isinstance(result,dict) and result.get('state') == 'retry':
+                        retry_queue.append((result.get('retry_after',time.time()),task))
+                    elif isinstance(result,dict) and result.get('state') == 'needs_task_agent':
+                        author_waiting[task.name]=task
+                    elif isinstance(result,dict) and result.get('state') in ('repairing','needs_probes'):
                         if time.time()>=deadline or (directory/'pause').exists():
                             rows.append({'task_id':task.name,'state':'deferred','detail':'保留评价/补证检查点'})
                         else:
@@ -247,7 +281,7 @@ def run_flow(root, args):
                         next_step=3 if step==4 else step+1
                         pending[enqueue(next_step,task)]=(next_step,task)
                 report = {'at': lib.now_iso(), 'active': [{'task_id': t.name, 'stage': s} for s, t in pending.values()],
-                          'results': rows, 'deadline': deadline,
+                          'results': rows, 'deadline': deadline, 'waiting_for_task_ai': list(author_waiting),
                           'phases': {t.name: phase(t) for t in tasks}}
                 lib.save_json(directory / 'state.json', report)
         finally:

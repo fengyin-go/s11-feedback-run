@@ -40,7 +40,8 @@ class Adoption(Sandbox):
         self.assertEqual(result, (0, False))
         self.assertTrue(any(b['gateway_wait'] for b in beats))
         self.assertTrue(any(b['events'] == 2 and not b['gateway_wait'] for b in beats))
-        self.assertEqual(gateway.track_existing.call_count, 1)
+        self.assertEqual(gateway.track_existing.call_count, 0)
+        gateway.release.assert_not_called()
         self.assertEqual(len(list((task / 'run').glob('exec-*.json'))), 1)
 
     def orphan(self):
