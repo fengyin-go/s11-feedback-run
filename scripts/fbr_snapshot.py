@@ -169,6 +169,8 @@ def commit_one(task_dir: Path, cfg: dict) -> dict:
 
 class Hub:
     def __init__(self, owner: str) -> None:
+        if owner != "fengyin-go":
+            raise lib.FbrError("数据发布仅允许 GitHub 账号 fengyin-go，拒绝其他账号")
         self.owner = owner
         result = lib.run(["gh", "auth", "token", "--hostname", "github.com", "--user", owner], timeout=60)
         self.token = result.stdout.strip()

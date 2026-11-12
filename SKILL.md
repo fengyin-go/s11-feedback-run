@@ -9,6 +9,8 @@ description: solo11（26.11 领域专项，单轮 pointwise）的运行侧：把
 
 # s11-feedback-run
 
+本机数据仓库只允许发布到 GitHub 账号 `fengyin-go`。建仓和推送前核对目标 owner 与凭据实际账号；禁止使用 `fengyin-solo` 或自动回退到其他账号。旧交付链接与历史证据保持原样，迁移既有仓库需另行明确处理。
+
 这一期的运行侧，从「批次目录已铺好、每题一个 GitHub 仓库」做到「结果表和 SOLO2 平台上的一条可核对提交」。造仓库、出题、铺批次由出题侧完成。S11 单次运行批次优先接收 [`s11-gsb-prompt-create`](../s11-gsb-prompt-create/SKILL.md) 的交接；已有 `cc-domain-task-create` 批次继续兼容。
 
 工作目录是带 `_config/settings.json` 的那个文件夹（下文叫 `<root>`）。脚本按 `--root` > 环境变量 `SOLO11_ROOT` > 当前目录向上找 的顺序定位它。下面的命令都省略了脚本目录前缀 `python3 <skill>/scripts/`。
