@@ -332,6 +332,15 @@ SCHEMA = json.loads(r'''{
 }''')
 
 
+class PlatformStyle(unittest.TestCase):
+    def test_dense_report_fields_are_rejected(self):
+        text = "SCHE-0001 在 09:00 使用水位 2400，SCHE-0002 在 09:05 使用 2500，SCHE-0003 在 09:10 使用 2600。"
+        self.assertTrue(any("过密" in item for item in submit.platform_style_problems(text)))
+        text = "TS7053、_enable、python -I、JSONDecodeError 同时出现。"
+        self.assertTrue(any("工具字段" in item for item in submit.platform_style_problems(text)))
+        self.assertEqual(submit.platform_style_problems("争用发生时旧计划没有被覆盖，任务时间随后更新。"), [])
+
+
 class FakeClient:
     def __init__(self):
         self.current_schema = copy.deepcopy(SCHEMA)

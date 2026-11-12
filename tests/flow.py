@@ -32,14 +32,14 @@ P_LONG = ("python3 -m clipcut pack fixtures/long.mp4 --segment 10", 1,
 
 # 两份说的是同一件事、用词不同的正文，给批内查重用
 TEXT_A = (
-    "先读了 src/clipcut/packer.py，第 2 步改了它，第 3 步跑 make test 是通过的，"
+    "模型先读了 src/clipcut/packer.py，第 2 步改了它，第 3 步跑 make test 是通过的，"
     "但第 4 步又改了一次 packer.py，之后没有再跑测试。"
     "实际执行 pack fixtures/short.mp4 --segment 10 能切出 6 个分片，--segment 0 会打印 error 并以退出码 2 结束。"
     "超过一小时的输入没有做：拿 fixtures/long.mp4 去跑，直接抛出 RuntimeError: input longer than 3600s is not supported，"
     "退出码 1，packer.py 里对应的位置只留了一行 TODO，长素材完全打不了包。"
     "另外最后的回答里说新增了 docs/usage.md，产物里并没有这个文件，照着回答去找用法说明会扑空。")
 TEXT_B = (
-    "过程上是读完 src/clipcut/packer.py 就动手改，第 3 步的 make test 通过，"
+    "模型读完 src/clipcut/packer.py 就动手改，第 3 步的 make test 通过，"
     "可第 4 步再次修改 packer.py 以后没有重新验证。"
     "用 fixtures/short.mp4 加 --segment 10 试过，拿到 6 个分片；--segment 0 被拒绝，返回码是 2。"
     "长时长这一项落空了：fixtures/long.mp4 一跑就是 RuntimeError: input longer than 3600s is not supported，"

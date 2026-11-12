@@ -38,10 +38,23 @@ HARNESS_WORDS = ["容器", "镜像", "挂载", "docker", "harness", "录屏", "�
 SCOPE_WORDS = ["网关", "限流", "额度", "余额", "api error", "网络错误", "网络故障", "网络超时", "断网", "推理时长",
                "思考时间", "响应慢", "速度慢", "耗时过长", "戛然而止"]
 OTHER_MACHINE_WORDS = ["其他机器", "别的机器", "换一台机器", "另一台机器", "其他环境下", "别人的电脑"]
+EVIDENCE_METHOD_WORDS = ["轨迹", "素材卡", "事实卡", "原始会话", "工具返回",
+                         "证据显示", "证据表明", "证据中", "证据里"]
 BANNED_MARKS = ["“", "”", "‘", "’", "《", "》", "「", "」", "『", "』", "——", "—", "……", "…", "**", "`"]
 SUBJECT_RE = re.compile(r"(?:^|[。；！？\n])\s*(这条|这一版|这份交付|本次交付|该交付|这次交付)")
 SCORE_TALK_RE = re.compile(r"[给打评得判][了为到出]?\s*[1-5一二三四五]\s*分|扣分|满分|得分|评分|分数|档位")
 SELF_RE = re.compile(r"我们?|本人|笔者")
+MODEL_PROCESS_RE = re.compile(
+    r"(?:^|[。；！？\n])[^。；！？\n]{0,24}模型[^。；！？\n]{0,160}"
+    r"(?:先|最初|随后|最后|尝试|实现|修改|重写|验证|修正|重跑|完成|遗漏|没有|未|误判|判断)"
+)
+PROCESS_GAP_ONLY_RE = re.compile(r"未覆盖|没覆盖|没有覆盖|仍未验证|还没有验证|没有验证|未验证")
+PROCESS_PROBLEM_RE = re.compile(
+    r"失败|报错|误判|错判|判断错|错误|异常|中断|不通过|没过|冲突|超时|无法|返工|JSONDecodeError|Error|Traceback|TS\d+",
+    re.I,
+)
+PROCESS_REPAIR_RE = re.compile(r"修正|修复|改为|改成|补上|补齐|重跑|重试|重新验证|换用|回查")
+PROCESS_CONSEQUENCE_RE = re.compile(r"导致|因此|结果|最终|最后|仍|仍然|只|没有|无法|不能|保留|通过|成功")
 FAIL_WORDS_RE = re.compile(r"不通过|没通过|未通过|没过|失败|报错|跑不起来|起不来|编译不过|无法运行|无法启动|无法编译")
 # 「没有报错」「不会失败」是在说没出问题，不能当成写了失败
 NEGATED_FAIL_RE = re.compile(r"(?:没有|不再|不会|没|未|无|不)(?:报错|失败)")
@@ -313,6 +326,7 @@ def check_text(text: str, prompt: str, gate: dict) -> tuple[list[str], list[str]
         ("运行环境或录屏现场的词（任务本身没提到）", hits(HARNESS_WORDS, True)),
         ("网络、额度、耗时这类不该算在模型头上的因素", hits(SCOPE_WORDS, True)),
         ("跨机器的说法", hits(OTHER_MACHINE_WORDS)),
+        ("取证来源口吻", hits(EVIDENCE_METHOD_WORDS)),
         ("禁用的标点或标记", [m for m in BANNED_MARKS if m in body]),
     ):
         if found:
@@ -323,6 +337,18 @@ def check_text(text: str, prompt: str, gate: dict) -> tuple[list[str], list[str]
         errors.append("正文里不写给分结论（几分、扣分、档位）")
     if SELF_RE.search(body):
         errors.append("正文里不写验收人自己（我、我们、本人）")
+    if body.count("模型") > 1:
+        errors.append("正文里“模型”最多出现一次，第一次点明主体后改用“它”承接或省略主语")
+    if not MODEL_PROCESS_RE.search(body):
+        errors.append("正文缺少模型实现或验证过程的具体行为句")
+    model_sentences = [sentence for sentence in sentences(body) if "模型" in sentence]
+    concrete_process = [
+        sentence for sentence in model_sentences
+        if PROCESS_PROBLEM_RE.search(sentence)
+        and (PROCESS_REPAIR_RE.search(sentence) or PROCESS_CONSEQUENCE_RE.search(sentence))
+    ]
+    if any(PROCESS_GAP_ONLY_RE.search(sentence) for sentence in model_sentences) and not concrete_process:
+        errors.append("模型过程只写了未覆盖或未验证，缺少实际过程问题、处理动作和后果")
     if REQ_REF_RE.search(body):
         errors.append("正文里不写需求点编号（R1 这类），直接说是哪条要求")
     norm = lib.normalize(body)
@@ -379,22 +405,30 @@ def check_feedback(doc: dict, task: dict, facts: dict, audit: dict, ev: dict, ga
             errors += [f"{where}：轨迹里没有第 {s} 步" for s in steps if s not in ev["steps"]]
     if not process:
         errors.append("过程和产物都要写：正文里至少有一句讲过程，并在 process 里标出对应的轨迹步骤")
+    elif len(process) > 3:
+        errors.append("过程段最多写 3 句，只保留最能解释交付结果的事件")
 
     if isinstance(score, int) and not isinstance(score, bool):
         if score == 5 and issues:
             errors.append("5 分不写缺口：issues 应当为空")
-        verification_only = (score == 4 and isinstance(doc.get("score_basis"), dict)
-                             and doc["score_basis"].get("category") == "verification_gap"
+        process_or_verification_gap = (score == 4 and isinstance(doc.get("score_basis"), dict)
+                             and doc["score_basis"].get("category") in ("verification_gap", "process_issue")
                              and all(r.get("verdict") in ("做到", "看不出来") for r in audit.get("requirements", []))
                              and audit.get("false_success") == "无"
                              and not facts["tests"]["regression"]
                              and not any(c.get("found_problem") for c in audit.get("counterexamples", [])))
-        if score < 5 and not issues and not verification_only:
+        if score < 5 and not issues and not process_or_verification_gap:
             errors.append(f"{score} 分至少要有一处问题句")
         if score >= 4 and len(re.findall(r"[A-Za-z_][\w./-]{2,}|\d+", text, flags=re.A)) < 2:
             errors.append("4 到 5 分也要写出核对过的要求和实际验证结果，正文里看不到具体的命令、文件或数值")
     if facts["tests"]["regression"] and not FAIL_WORDS_RE.search(NEGATED_FAIL_RE.sub("", text)):
         errors.append("产物上构建或测试不通过，正文必须明写")
+    process_sentences = [squash(str(item.get("sentence") or "")) for item in process if isinstance(item, dict)]
+    process_problem = any(PROCESS_PROBLEM_RE.search(sentence) or PROCESS_GAP_ONLY_RE.search(sentence)
+                          for sentence in process_sentences)
+    process_repair = any(PROCESS_REPAIR_RE.search(sentence) for sentence in process_sentences)
+    if score == 5 and process_problem and process_repair:
+        errors.append("5 分要求过程接近一次性完美跑通；正文已写真实错误验证、返工或关键缺口，应降到 4 分并说明过程问题")
     covered = {str(a.get("id")) for item in issues if isinstance(item, dict)
                for a in (item.get("anchors") or []) if isinstance(a, dict) and a.get("type") == "req"}
     for req in audit.get("requirements", []):

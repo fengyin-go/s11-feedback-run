@@ -211,7 +211,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="solo11 批次进度、抽检预览、交付导出与平台提交")
     parser.add_argument("--root")
     sub = parser.add_subparsers(dest="command", required=True)
-    for name in ("status", "preview", "spotcheck", "upload", "export"):
+    for name in ("status", "preview", "spotcheck", "upload", "repair", "export"):
         sub.add_parser(name).add_argument("--batch", required=True)
     sub.choices["preview"].add_argument("--tasks")
     upload = sub.choices["upload"]
@@ -219,6 +219,11 @@ def main() -> int:
     upload.add_argument("--limit", type=int)
     upload.add_argument("--execute", action="store_true")
     upload.add_argument("--confirm", default="")
+    repair = sub.choices["repair"]
+    repair.add_argument("--tasks")
+    repair.add_argument("--execute", action="store_true")
+    repair.add_argument("--confirm", default="")
+    repair.add_argument("--comment", default="")
     check = sub.choices["spotcheck"]
     check.add_argument("--task", required=True)
     check.add_argument("--state", required=True)
@@ -240,6 +245,11 @@ def main() -> int:
             print(f"导出 {len(manifest['tasks'])} 题，排除 {len(manifest['excluded'])} 题；没有复制 workspace 或 .git")
             for row in manifest["excluded"]:
                 print(f"{row['task_id']}  未导出：{row['reason']}")
+        elif args.command == "repair":
+            import fbr_submit
+            result = fbr_submit.repair_batch(root, args.batch, tasks=args.tasks,
+                                             execute=args.execute, confirm=args.confirm, comment=args.comment)
+            print(json.dumps(result, ensure_ascii=False, indent=2))
         else:
             import fbr_submit
             result = fbr_submit.run_batch(root, args.batch, tasks=args.tasks, limit=args.limit,

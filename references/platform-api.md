@@ -20,7 +20,7 @@ fbr_sheet.py --root "<root>" --batch b1110-01
 
 ## 凭据和认证
 
-优先读取 `~/.codex/coding-agent-satisfaction/solo-qa-accounts/gonghao.json`，不存在时才读取 `~/.codex/coding-agent-satisfaction/solo-qa.json`。两者均要求普通文件、权限 600、`username` 恰为 `gonghao`，密码只读到内存。优先文件损坏或不安全时不能悄悄退回备用文件。禁止打印文件、密码、Cookie、CSRF 或完整登录响应；凭据不放工作目录、仓库、回执或交付目录。
+默认账号为 `zouyonghong`，可用环境变量 `SOLO11_PLATFORM_ACCOUNT` 覆盖。优先读取 `~/.codex/coding-agent-satisfaction/solo-qa-accounts/<账号>.json`，不存在时才读取 `~/.codex/coding-agent-satisfaction/solo-qa.json`。两者均要求普通文件、权限 600、`username` 恰为所选账号，密码只读到内存。优先文件损坏或不安全时不能悄悄退回备用文件。禁止打印文件、密码、Cookie、CSRF 或完整登录响应；凭据不放工作目录、仓库、回执或交付目录。
 
 登录：`POST /auth/login`，JSON 为 `username`、`password`。会话由内存 CookieJar 保存；写请求使用 `solo_qa_csrf` Cookie 解码后的值作为 `X-CSRF-Token`。不保存 Cookie 文件，不跟随跨 origin 重定向，不自动重试 POST。登录后 GET `/auth/me` 核对用户名和是否需要修改初始密码；需要改密码时停止。
 
@@ -66,7 +66,26 @@ fbr_sheet.py --root "<root>" --batch b1110-01
 
 成功上传一项立即落盘；下一项上传失败可复用已确认那项。建单前先落 `creating`；连接中断、超时或返回缺 ID 时记 `uncertain`。再次调用先按本账号历史 SessionID 回查，能与原上传和所有字段一致对应才恢复确认。结果未知却查不到记录时必须停下核查，不能自动再 POST。已有相同 SessionID 且无匹配回执也不重复建单，不自动覆盖、返修或删除远端数据。
 
-回执确认后重新生成结果表，才会采用平台媒体地址、`gonghao` 与平台 `created_at`。本地正文/附件变化、旧占位回执或回读字段不一致，均不能继续显示有效已提交。若需要更新远端内容，另行分析平台返修锁定字段并取得用户授权；本版本不自动 PUT。
+回执确认后重新生成结果表，才会采用平台媒体地址、所选平台账号与平台 `created_at`。本地正文/附件变化、旧占位回执或回读字段不一致，均不能继续显示有效已提交。若需要更新远端内容，另行分析平台返修锁定字段并取得用户授权；本版本不自动 PUT。
+
+## 返修 PENDING_FIX
+
+2026-11-12 已从平台前端代码和实际返修验证确认：返修保存使用 `PUT /submissions/{id}`，请求体为 `{"data": {...19字段...}, "schema_fingerprint": "...", "comment": "..."}`。页面只允许 `status=PENDING_FIX` 且 `editable=true` 的记录进入返修；`locked_fields` 内的字段和两份附件必须沿用平台当前值，不能通过返修更换会话或环境。
+
+本地修复顺序：
+
+```bash
+fbr_reviewer.py review --batch b1110-01 --task s11-000123 --platform-repair --execute
+fbr_reviewer.py prepare --batch b1110-01 --task s11-000123 --platform-repair --execute
+# 修改 candidate / verification 后
+fbr_reviewer.py finalize --batch b1110-01 --task s11-000123 \
+  --candidate ... --verification ... --platform-repair --execute
+fbr_batch.py repair --batch b1110-01 --tasks s11-000123
+fbr_batch.py repair --batch b1110-01 --tasks s11-000123 \
+  --comment "按平台打回原因重写 Feedback" --execute --confirm REPAIR
+```
+
+`repair` 只更新非锁定字段，当前实现会保留平台附件值。演练必须显示实际变化字段；真实执行后重新 GET 详情，确认版本递增、字段一致且 `qc_running=true` 或 `stage=QC_RUNNING/QC_WAITING`。如果 PUT 已成功但回执尚未落盘，再次运行会按当前详情识别 `already_applied`，不得重复 PUT。返修完成后轮询详情，只有 `QC_PASSED` 才算通过；`PENDING_FIX` 要继续按新的 `qc_summary` 和失败 `qc_checks` 处理。
 
 平台 `other_issues` 不从本地“备注”复制。新交与返修都只允许中断续写说明：模型自行中断次数、已输入“继续”的次数、综合所有续写评价且表中标识仍取首轮。没有中断续写时显式发送 `""`；重跑、Git 历史、录屏问题、修复说明等仍保留在本地证据中。
 

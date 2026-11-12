@@ -363,7 +363,7 @@ def task_locked(fn):
         with file_lock(Path(task) / ".operation.lock"):
             if fn.__name__ in ('run_one', 'recover_one', 'collect_one', 'commit_one', 'record_one', 'facts_one', 'review', 'finalize', 'probe_one'):
                 receipt = load_json(Path(task) / 'review/upload.json', default={})
-                if receipt.get('submission_id'):
+                if receipt.get('submission_id') and not bound.get('allow_platform_repair', False):
                     raise FbrError('任务已有平台单，生产证据已冻结；不能自动重跑、重录或重写评价')
             return fn(*args, **kwargs)
     return guarded

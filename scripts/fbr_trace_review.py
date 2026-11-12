@@ -10,8 +10,9 @@ VERSION = 1
 def identity(task, reviewer):
     names = ['task.json', 'trace/ids.json', 'review/trace-index.jsonl']
     names += [p.relative_to(task).as_posix() for p in sorted((task/'trace/projects').rglob('*.jsonl'))]
+    policy = getattr(reviewer.quality, 'trace_policy_sha', reviewer.quality.policy_sha)
     return {'version': VERSION, 'inputs': {name: reviewer.file_sha(task/name) for name in names if (task/name).is_file()},
-            'policy_sha': reviewer.quality.policy_sha()}
+            'policy_sha': policy()}
 
 
 def validate_sources(task, rows):
