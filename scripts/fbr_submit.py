@@ -413,7 +413,6 @@ def prepare(root: Path, batch_id: str, schema: dict, tasks: str | None = None, l
                         if p not in ("缺提交人", "缺提交时间") and not any(p.startswith(prefix) for prefix in online_options)]
             plan = plan_from_row(root, task_dir, row, manifest)
             problems += validate_plan(plan, schema)
-            problems += platform_style_problems(str(plan["data"].get("feedback", "")))
             if problems:
                 raise lib.FbrError("；".join(dict.fromkeys(problems)))
             plans.append(plan)
@@ -489,6 +488,10 @@ def submit_one(root: Path, plan: dict, client, schema: dict, records: list[dict]
         raise lib.FbrError("提交回执必须为JSON对象，旧格式需先核对，不能自动覆盖")
     same = (receipt.get("content_digest") == plan["content_digest"] and receipt.get("account") == ACCOUNT
             and receipt.get("platform") == BASE_URL)
+    if not (same and valid_id(receipt.get("submission_id"))):
+        style_errors = platform_style_problems(str(plan["data"].get("feedback", "")))
+        if style_errors:
+            raise lib.FbrError("；".join(style_errors))
     if same:
         if not isinstance(receipt.get("uploads"), dict) or set(receipt["uploads"]) - set(MEDIA_TYPES):
             raise lib.FbrError("回执中的附件清单格式无效，先核对再继续")
@@ -567,6 +570,9 @@ def repair_one(root: Path, plan: dict, client, schema: dict, *, execute: bool, c
     receipt = lib.load_json(path, default={})
     if not isinstance(receipt, dict) or not valid_id(receipt.get("submission_id")):
         raise lib.FbrError(f"{plan['task_id']}：没有可返修的平台记录")
+    style_errors = platform_style_problems(str(plan["data"].get("feedback", "")))
+    if style_errors:
+        raise lib.FbrError("；".join(style_errors))
     submission_id = receipt["submission_id"]
     detail = client.detail(submission_id)
     if str(detail.get("session_id")) != str(plan["data"]["session_id"]):
@@ -603,8 +609,6 @@ def repair_one(root: Path, plan: dict, client, schema: dict, *, execute: bool, c
 
     qc_active = detail.get("qc_running") is True or detail.get("stage") in ("QC_WAITING", "QC_RUNNING")
     if not changes:
-        if not qc_active:
-            raise lib.FbrError(f"{plan['task_id']}：当前交付与平台内容一致，但没有重新进入质检")
         if not execute:
             return {"task_id": plan["task_id"], "state": "dry", "submission_id": submission_id,
                     "status": detail.get("status"), "changed_fields": [], "already_applied": True}
