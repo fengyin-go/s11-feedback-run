@@ -247,6 +247,7 @@ class Transport(HTTPCase):
             ("GET", "/api/v1/submissions"): {"items": [{"id": 7}], "total": 1},
             ("GET", "/api/v1/submissions/7"): {"id": 7, "data": {}},
             ("POST", "/api/v1/submissions"): {"id": 8, "data": {"title": "示例"}},
+            ("PUT", "/api/v1/submissions/7"): {"id": 7, "data": {"title": "修正"}},
         }
         for (method, path), response in responses.items():
             self.api.reply(method, path, response)
@@ -257,6 +258,8 @@ class Transport(HTTPCase):
         self.assertEqual(self.client.detail(7), responses[("GET", "/api/v1/submissions/7")])
         self.assertEqual(self.client.create({"title": "示例"}, FINGERPRINT),
                          responses[("POST", "/api/v1/submissions")])
+        self.assertEqual(self.client.update(7, {"title": "修正"}, FINGERPRINT, "按打回原因修改"),
+                         responses[("PUT", "/api/v1/submissions/7")])
         self.assertEqual(len(self.calls("POST", "/api/v1/auth/login")), 1)
         listing, = self.calls("GET", "/api/v1/submissions")
         self.assertEqual(parse_qs(urlsplit(listing["path"]).query),
@@ -264,6 +267,9 @@ class Transport(HTTPCase):
         creation, = self.calls("POST", "/api/v1/submissions")
         self.assertEqual(json.loads(creation["body"]),
                          {"data": {"title": "示例"}, "schema_fingerprint": FINGERPRINT})
+        update, = self.calls("PUT", "/api/v1/submissions/7")
+        self.assertEqual(json.loads(update["body"]), {
+            "data": {"title": "修正"}, "schema_fingerprint": FINGERPRINT, "comment": "按打回原因修改"})
 
     def test_login_failure_has_one_post_and_does_not_disclose_credentials(self):
         self.api.reply("POST", "/api/v1/auth/login", {"error": PASSWORD}, status=401)

@@ -213,7 +213,10 @@ def analysis_errors(task: Path, expected_sha=None) -> list[str]:
             or doc.get('receipt', {}).get('provider') != PROVIDER):
         return ['轨迹分析尚未完成或调用回执缺失']
     engine = SimpleNamespace(file_sha=file_sha, quality=quality)
-    if doc.get('identity') != fbr_trace_review.identity(task, engine):
+    identity = doc.get('identity') or {}
+    current = fbr_trace_review.identity(task, engine)
+    if (identity.get('inputs') != current.get('inputs')
+            or identity.get('policy_sha') not in ({current.get('policy_sha')} | quality.LEGACY_TRACE_POLICIES)):
         return ['轨迹分析来源或规则已变化，须重新分析']
     try:
         fbr_trace_review.validate_sources(task, doc.get('statements'))

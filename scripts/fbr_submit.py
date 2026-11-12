@@ -32,6 +32,9 @@ FIELD_MAP = {
     "feedback": "Feedback", "other_issues": "备注",
 }
 MEDIA_TYPES = {"trace_file": "attachment", "screencast": "video"}
+DENSE_REPORT_TOKEN_RE = re.compile(
+    r"(?<![A-Za-z0-9_])(?:[A-Z]{2,}-[0-9]+|[0-9]{2}:[0-9]{2}(?::[0-9]{2})?|[0-9]{3,})(?![A-Za-z0-9_])")
+MACHINE_STYLE_RE = re.compile(r"\bTS\d+\b|python\s+-I|_enable\b|JSONDecodeError|Traceback")
 FIELD_TYPES = dict.fromkeys(FIELD_MAP, "text") | {
     **dict.fromkeys(("domain", "sub_direction", "question_type", "difficulty", "harness", "os_platform", "repro_level"), "select"),
     **dict.fromkeys(("user_prompt", "feedback", "other_issues"), "textarea"),
@@ -228,6 +231,17 @@ def validate_uploaded(key: str, info: dict, local: dict) -> dict:
     return {k: info[k] for k in ("url", "name")}
 
 
+def platform_style_problems(text: str) -> list[str]:
+    dense = list(dict.fromkeys(DENSE_REPORT_TOKEN_RE.findall(text or "")))
+    machine = list(dict.fromkeys(MACHINE_STYLE_RE.findall(text or "")))
+    errors = []
+    if len(dense) >= 6:
+        errors.append("Feedback 的实体编号、时间点或大数字过密，改成用户能理解的关键场景")
+    if len(machine) >= 3:
+        errors.append("Feedback 原样堆叠了过多工具字段，改写成失败后果和处理经过")
+    return errors
+
+
 def payload_with_media(plan: dict, uploads: dict) -> dict:
     data = copy.deepcopy(plan["data"])
     data["trace_file"] = [validate_uploaded("trace_file", uploads["trace_file"], plan["files"]["trace_file"])]
@@ -399,6 +413,7 @@ def prepare(root: Path, batch_id: str, schema: dict, tasks: str | None = None, l
                         if p not in ("缺提交人", "缺提交时间") and not any(p.startswith(prefix) for prefix in online_options)]
             plan = plan_from_row(root, task_dir, row, manifest)
             problems += validate_plan(plan, schema)
+            problems += platform_style_problems(str(plan["data"].get("feedback", "")))
             if problems:
                 raise lib.FbrError("；".join(dict.fromkeys(problems)))
             plans.append(plan)
@@ -554,8 +569,6 @@ def repair_one(root: Path, plan: dict, client, schema: dict, *, execute: bool, c
         raise lib.FbrError(f"{plan['task_id']}：没有可返修的平台记录")
     submission_id = receipt["submission_id"]
     detail = client.detail(submission_id)
-    if detail.get("status") != "PENDING_FIX" or detail.get("editable") is not True:
-        raise lib.FbrError(f"{plan['task_id']}：当前状态不是可编辑的待返修")
     if str(detail.get("session_id")) != str(plan["data"]["session_id"]):
         raise lib.FbrError(f"{plan['task_id']}：平台记录 SessionID 与当前交付不一致")
     current = remote_data(detail)
@@ -571,8 +584,36 @@ def repair_one(root: Path, plan: dict, client, schema: dict, *, execute: bool, c
             desired[key] = plan["data"][key]
     changes = {key: {"from": current.get(key), "to": desired.get(key)}
                for key in desired if current.get(key) != desired.get(key)}
+
+    def save_receipt(updated: dict, actual: dict) -> dict:
+        receipt.update({
+            "content_digest": plan["content_digest"],
+            "binding": plan["binding"],
+            "schema_fingerprint": schema["fingerprint"],
+            "state": "confirmed",
+            "remote_data": actual,
+            "remote_response_data": actual,
+            "remote_status": updated.get("status"),
+            "verified_at": lib.now_iso(),
+            "last_repair_at": lib.now_iso(),
+            "last_repair_comment": comment,
+            "version_no": updated.get("current_version"),
+        })
+        lib.save_json(path, receipt)
+
+    qc_active = detail.get("qc_running") is True or detail.get("stage") in ("QC_WAITING", "QC_RUNNING")
     if not changes:
-        raise lib.FbrError(f"{plan['task_id']}：当前交付与平台内容一致，无需返修")
+        if not qc_active:
+            raise lib.FbrError(f"{plan['task_id']}：当前交付与平台内容一致，但没有重新进入质检")
+        if not execute:
+            return {"task_id": plan["task_id"], "state": "dry", "submission_id": submission_id,
+                    "status": detail.get("status"), "changed_fields": [], "already_applied": True}
+        save_receipt(detail, current)
+        return {"task_id": plan["task_id"], "state": "confirmed", "submission_id": submission_id,
+                "status": detail.get("status"), "changed_fields": [], "already_applied": True,
+                "url": f"{BASE_URL}/app/submissions/{submission_id}"}
+    if detail.get("status") != "PENDING_FIX" or detail.get("editable") is not True:
+        raise lib.FbrError(f"{plan['task_id']}：当前状态不是可编辑的待返修")
     if not execute:
         return {"task_id": plan["task_id"], "state": "dry", "submission_id": submission_id,
                 "status": detail.get("status"), "changed_fields": sorted(changes), "changes": changes}
@@ -591,23 +632,11 @@ def repair_one(root: Path, plan: dict, client, schema: dict, *, execute: bool, c
     for key, value in desired.items():
         if actual.get(key) != value and not (key == "languages" and actual.get(key) == value.replace("；", ";")):
             raise lib.FbrError(f"返修回读字段不一致：{key}")
-    if updated.get("status") not in ("QC_WAITING", "QC_RUNNING", "PENDING_FIX"):
+    if (updated.get("qc_running") is not True
+            and updated.get("stage") not in ("QC_WAITING", "QC_RUNNING")
+            and updated.get("status") not in ("QC_WAITING", "QC_RUNNING")):
         raise lib.FbrError("返修后平台未进入重新质检状态")
-    receipt = {
-        **receipt,
-        "content_digest": plan["content_digest"],
-        "binding": plan["binding"],
-        "schema_fingerprint": schema["fingerprint"],
-        "state": "confirmed",
-        "remote_data": actual,
-        "remote_response_data": actual,
-        "remote_status": updated.get("status"),
-        "verified_at": lib.now_iso(),
-        "last_repair_at": lib.now_iso(),
-        "last_repair_comment": comment,
-        "version_no": updated.get("current_version"),
-    }
-    lib.save_json(path, receipt)
+    save_receipt(updated, actual)
     return {"task_id": plan["task_id"], "state": "confirmed", "submission_id": submission_id,
             "status": updated.get("status"), "changed_fields": sorted(changes),
             "url": f"{BASE_URL}/app/submissions/{submission_id}"}

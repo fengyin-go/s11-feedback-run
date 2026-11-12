@@ -14,8 +14,12 @@ CHECKS = ("result_and_process", "task_specific_voice", "test_relevance", "score_
           "evidence_fidelity", "scope_discipline", "non_template")
 RULE_FILES = ("references/scoring.md", "references/feedback-writing.md", "references/feedback-calibration.md",
               "references/feedback-quality.md", "scripts/fbr_gate.py", "scripts/fbr_quality.py",
-              "scripts/fbr_reviewer.py", "scripts/fbr_feedback.py", "scripts/fbr_trace_review.py", "scripts/fbr_sources.py")
-TRACE_RULE_FILES = ("scripts/fbr_trace_review.py", "scripts/fbr_sources.py", "scripts/fbr_reviewer.py")
+              "scripts/fbr_feedback.py", "scripts/fbr_trace_review.py", "scripts/fbr_sources.py")
+TRACE_RULE_FILES = ("scripts/fbr_trace_review.py", "scripts/fbr_sources.py")
+LEGACY_TRACE_POLICIES = {
+    "a0eeac329d747bc52e6ee804ac30920511498b22344334cdb94a1910e328ca3c",
+    "41e8cc299da551d1c8f22773ec0b0307262ddd13f5eb41cb2903b3bcc68d1e72",
+}
 TEST_CLAUSE = re.compile(r"[^。；！？\n]*(?:测试|用例|\btest\w*|\bpytest\b)[^。；！？\n]*", re.I)
 COUNT_CLAIM = re.compile(r"(?:\d+\s*(?:条|个|项)\s*(?:测试|用例)|(?:测试|用例)[^。；]{0,8}\d+|\d+\s*(?:条|个|项)?\s*(?:全[部都]?通过|通过))")
 NEGATIVE_TEST = re.compile(r"(?:未|没有|没|未曾|并未)[^。；]{0,24}(?:测试|用例|验证)|(?:测试|用例)[^。；]{0,16}(?:未执行|没跑|未跑|未重跑|缺失)")
