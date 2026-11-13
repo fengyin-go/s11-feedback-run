@@ -188,7 +188,7 @@ fbr_sheet.py --batch b1110-01                       # 确认回执后回填媒�
 
 本地“备注”和平台“其他问题”（`other_issues`）只允许两类由原始轨迹自动生成的事实：中断续写说明，以及 `模型运行时读取了 apikey`。两类同时存在时用中文分号连接；其余时候一律提交空字符串 `""`，返修也相同。备注不从 `feedback.note`、重跑、历史改写、录屏或验收说明复制；当前脚本不自动返修，另行获准返修时也必须遵守此字段规则。
 
-提交前必须读 [references/platform-api.md](references/platform-api.md)。平台固定为 `https://solo2.jzxhnh.com`，默认使用本机保存的 `zouyonghong` 凭据，可用 `SOLO11_PLATFORM_ACCOUNT` 覆盖，忽略旧凭据文件中的平台地址。每次读取当前表单和指纹，按最新字段校验；遇到新增字段或类型变化就停止。账号以首次提交锁定领域，同账号不能跨领域提交。
+提交前必须读 [references/platform-api.md](references/platform-api.md)。平台固定为 `https://solo2.jzxhnh.com`，默认使用本机保存的 `gonghao` 凭据，可用 `SOLO11_PLATFORM_ACCOUNT` 覆盖，忽略旧凭据文件中的平台地址。每次读取当前表单和指纹，按最新字段校验；遇到新增字段或类型变化就停止。账号以首次提交锁定领域，同账号不能跨领域提交。
 
 平台只收一个主会话 `.jsonl`，子会话保留在本地交付目录。轨迹和视频先上传，再用返回的附件信息建单，最后回读每个字段。回执存任务源目录的 `review/upload.json`，绑定本次正文、字段和附件 SHA256；内容变动即失效。超时或结果未知时先回查 SessionID，不能盲目重发。再次运行默认演练可回读已有回执和最新质检状态；`confirmed` 代表已建单且字段一致，平台质检结论另看 `status`，不把建单成功写成质检通过。
 

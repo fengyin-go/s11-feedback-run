@@ -22,7 +22,7 @@ import fbr_trace
 import fbr_delivery as delivery
 
 BASE_URL = "https://solo2.jzxhnh.com"
-ACCOUNT = os.environ.get("SOLO11_PLATFORM_ACCOUNT", "zouyonghong")
+ACCOUNT = os.environ.get("SOLO11_PLATFORM_ACCOUNT", "gonghao")
 FIELD_MAP = {
     "domain": "所属领域", "sub_direction": "子方向", "question_type": "任务类型",
     "difficulty": "任务难度", "languages": "语言/框架", "harness": "Harness",
