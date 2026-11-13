@@ -68,8 +68,10 @@ def canonical_field(name: str, value):
     """仅映射实时平台已证实的等价值；不猜测未知枚举。"""
     aliases = {
         "操作系统": {"Linux arm64": "MacOS/Linux", "Linux amd64": "MacOS/Linux",
-                   "Linux": "MacOS/Linux", "MacOS": "MacOS/Linux"},
-        "子方向": {"数据采集、爬虫与RPA": "数据采集、爬虫与 RPA"},
+                   "Linux": "MacOS/Linux", "MacOS": "MacOS/Linux",
+                   "Debian GNU/Linux 12 (Linux arm64)": "MacOS/Linux"},
+        "子方向": {"数据采集、爬虫与RPA": "数据采集、爬虫与 RPA",
+                 "网页数据采集、调度与RPA自动化": "数据采集、爬虫与 RPA"},
     }
     return aliases.get(name, {}).get(value, value)
 
