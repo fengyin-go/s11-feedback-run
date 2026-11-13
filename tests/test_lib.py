@@ -53,6 +53,14 @@ class Tasks(Sandbox):
         with self.assertRaisesRegex(lib.FbrError, "settings.json 缺少 image_id"):
             lib.settings(self.root)
 
+    def test_fixed_github_owner_is_not_required_or_selected_by_settings(self):
+        path = self.root / "_config" / "settings.json"
+        data = lib.load_json(path)
+        data["github_owner"] = "legacy-fixed-owner"
+        lib.save_json(path, data)
+        cfg = lib.settings(self.root)
+        self.assertNotIn("github_owner", cfg)
+
     def test_task_dirs(self):
         self.make_task(1, repo=False)
         self.make_task(2, repo=False)
@@ -93,6 +101,20 @@ class Tasks(Sandbox):
             handle.write("not json\n[1, 2]\n")
         lib.append_jsonl(rows, {"a": 2})
         self.assertEqual(lib.read_jsonl(rows), [{"a": 1}, {"a": 2}])
+
+
+class ActiveGithubAccount(unittest.TestCase):
+    def test_uses_current_gh_login_and_rejects_fengyin_solo(self):
+        with mock.patch.object(lib, "run", return_value=fixtures.done(0, "another-user\n")):
+            self.assertEqual(lib.active_github_account(), "another-user")
+        with mock.patch.object(lib, "run", return_value=fixtures.done(0, "fengyin-solo\n")):
+            with self.assertRaisesRegex(lib.FbrError, "立即停止"):
+                lib.active_github_account()
+
+    def test_missing_login_is_reported_without_fallback(self):
+        with mock.patch.object(lib, "run", return_value=fixtures.done(1, "", "not logged in")):
+            with self.assertRaisesRegex(lib.FbrError, "当前活跃 GitHub 账号"):
+                lib.active_github_account()
 
 
 class GitConfig(Sandbox):

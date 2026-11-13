@@ -40,6 +40,7 @@ SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 STAGES = ["run", "collect", "commit", "record", "facts", "feedback"]
 MARK = "@@FBR"
 TRACE_SRC = "/home/node/.claude/projects"
+FORBIDDEN_ACTIVE_GITHUB_ACCOUNTS = {"fengyin-solo"}
 
 DEFAULTS = {
     "image": "adminfather/benzhi-claude-code2:20261110",
@@ -51,7 +52,6 @@ DEFAULTS = {
     "publish_after_review": False,
     "dependencies": {"enabled": True, "paths": [], "smoke_cmd": ""},
     "record_parallel": 2,
-    "daily_cutoff": "20:00",
     "key_file": "~/.codex/solo11/gateway.env",
     "run": {
         "timeout": 3600,
@@ -174,7 +174,8 @@ def _merge(base: dict, extra: dict) -> dict:
 
 def settings(root: Path) -> dict:
     cfg = _merge(DEFAULTS, load_json(root / "_config" / "settings.json"))
-    for key in ("image", "image_id", "harness", "harness_version", "github_owner"):
+    cfg.pop("github_owner", None)
+    for key in ("image", "image_id", "harness", "harness_version"):
         if not cfg.get(key):
             raise FbrError(f"_config/settings.json 缺少 {key}")
     cfg["review_parallel"] = min(5, max(1, int(cfg["review_parallel"])))
@@ -189,6 +190,21 @@ def settings(root: Path) -> dict:
     if type(cfg["run"]["max_attempts"]) is not int or not 1 <= cfg["run"]["max_attempts"] <= 3:
         raise FbrError("run.max_attempts 必须为 1 到 3")
     return cfg
+
+
+def active_github_account() -> str:
+    """Return the login behind the currently effective gh token."""
+    result = run(["gh", "api", "user", "--jq", ".login"], timeout=60)
+    account = result.stdout.strip()
+    if result.returncode != 0 or not account:
+        detail = (result.stderr or result.stdout or "gh api user returned no login").strip()
+        raise FbrError(f"无法确认本机当前活跃 GitHub 账号：{detail[:300]}")
+    if account.lower() in FORBIDDEN_ACTIVE_GITHUB_ACCOUNTS:
+        raise FbrError(
+            f"当前活跃 GitHub 账号为 {account}，禁止开始任务；"
+            "请立即停止并切换到允许的账号后再重试"
+        )
+    return account
 
 
 def now_iso() -> str:
@@ -232,12 +248,19 @@ def content_hash(value) -> str:
                                      separators=(",", ":")).encode("utf-8")).hexdigest()
 
 
-def handoff_payload(record: dict, recording: dict) -> dict:
+def handoff_payload(
+    record: dict,
+    recording: dict,
+    *,
+    include_domain_contract: bool = True,
+) -> dict:
     keys = ("task_id", "repo_id", "baseline_id", "initial_commit", "prompt", "task_type", "difficulty",
             "domain", "subdirection", "language", "frameworks", "repro_level", "requirements",
             "image", "image_id", "harness", "harness_version", "os", "task_repo", "task_repo_full")
     if record.get("producer") == "s11-gsb-prompt-create":
         keys += ("producer", "execution_mode", "branch", "origin", "workspace")
+        if include_domain_contract:
+            keys += ("domain_contract", "domain_gate_version")
     return {"task": {key: record.get(key) for key in keys}, "recording": recording}
 
 
@@ -253,6 +276,20 @@ def validate_handoff(task_dir: Path, record: dict) -> None:
         raise FbrError(f"{task_dir.name}：不支持交接版本 {version}")
     if record.get("producer") == "s11-gsb-prompt-create" or manifest.get("producer") == "s11-gsb-prompt-create":
         validate_single_layout(task_dir, record, manifest)
+        if record.get("domain_gate_version") is not None:
+            contract = record.get("domain_contract")
+            if record.get("domain_gate_version") != 1 or not isinstance(contract, dict):
+                raise FbrError(f"{task_dir.name}：领域题位契约缺失或版本不支持")
+            for key in ("domain", "subdirection", "topic_id", "main_task", "business_result", "conclusion"):
+                if not str(contract.get(key) or "").strip():
+                    raise FbrError(f"{task_dir.name}：领域题位契约缺少 {key}")
+            for key in ("source_evidence", "domain_objects", "domain_results"):
+                if not isinstance(contract.get(key), list) or not contract[key]:
+                    raise FbrError(f"{task_dir.name}：领域题位契约缺少 {key}")
+            if contract.get("conclusion") != "pass":
+                raise FbrError(f"{task_dir.name}：领域题位契约未通过")
+            if contract.get("domain") != record.get("domain") or contract.get("subdirection") != record.get("subdirection"):
+                raise FbrError(f"{task_dir.name}：领域题位契约与冻结领域字段不一致")
     baseline = record.get("baseline")
     if not isinstance(baseline, dict) or content_hash(baseline) != record.get("baseline_id"):
         raise FbrError(f"{task_dir.name}：基线摘要不一致")
@@ -263,7 +300,18 @@ def validate_handoff(task_dir: Path, record: dict) -> None:
     if baseline.get("commit") != record["initial_commit"] or record.get("base_commit") != record["initial_commit"]:
         raise FbrError(f"{task_dir.name}：初始提交与冻结基线不一致")
     recording = load_json(task_dir / "recording-plan.json")
-    if content_hash(handoff_payload(record, recording)) != record.get("handoff_hash"):
+    handoff_hashes = {
+        content_hash(handoff_payload(record, recording)),
+    }
+    if record.get("domain_contract") is None and record.get("domain_gate_version") is None:
+        # The domain contract was added after some producer tasks were already frozen.
+        # Accept their original digest only when no contract fields existed at all.
+        handoff_hashes.add(content_hash(handoff_payload(
+            record,
+            recording,
+            include_domain_contract=False,
+        )))
+    if record.get("handoff_hash") not in handoff_hashes:
         raise FbrError(f"{task_dir.name}：题面、需求点、录屏方案或任务基础信息发生变化，请重新交接")
     prompt_file = task_dir / "prompt.txt"
     if not prompt_file.is_file() or prompt_file.read_text(encoding="utf-8") != record["prompt"]:

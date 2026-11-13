@@ -1,4 +1,5 @@
 """Recover only a provably untouched container before the first dispatch."""
+import os
 import time
 from unittest import mock
 from fixtures import done, write
@@ -59,6 +60,13 @@ class PreDispatch(DockerCase):
         task, record, current = self.prepared()
         with mock.patch.object(rt, 'alive', return_value=True):
             self.assertIn('原调度仍活着', fbr_run.prepared_problems(task, record, self.cfg, current)[0])
+
+    def test_current_runner_can_take_over_own_prepared_container(self):
+        task, record, current = self.prepared()
+        current['owner_pid'] = os.getpid()
+        current['owner_identity'] = 'current-runner'
+        with mock.patch.object(rt, 'alive', return_value=True):
+            self.assertEqual(fbr_run.prepared_problems(task, record, self.cfg, current), [])
 
     def test_dirty_workspace_and_mismatched_attempts_block(self):
         task, record, current = self.prepared()

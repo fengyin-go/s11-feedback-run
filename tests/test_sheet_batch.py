@@ -63,7 +63,7 @@ class Columns(unittest.TestCase):
             "环境可复现等级", "初始环境快照", "SessionID", "TurnID/PromptID", "轨迹文件", "产物快照", "运行录屏",
             "交付完整性", "Feedback", "备注", "提交人", "提交时间"])
         self.assertEqual(fbr_sheet.INTERNAL_COLUMNS, [
-            "任务编号", "批次", "底座仓库", "任务仓库", "运行开始", "运行结束", "提交截止", "尝试次数", "证据路径",
+            "任务编号", "批次", "底座仓库", "任务仓库", "运行开始", "运行结束", "尝试次数", "证据路径",
             "闸门状态", "抽检状态", "数据状态", "上传状态"])
         self.assertFalse(set(fbr_sheet.PUBLIC_COLUMNS) & set(fbr_sheet.INTERNAL_COLUMNS))
 
@@ -87,11 +87,7 @@ class Columns(unittest.TestCase):
         self.assertEqual(fbr_sheet.show_time("2026-11-10T15:04:05"), "2026-11-10 15:04")
         self.assertEqual(fbr_sheet.show_time("昨天"), "")
         self.assertEqual(fbr_sheet.show_time(""), "")
-        self.assertEqual(fbr_sheet.deadline("2026-11-10T15:00:00+0800", "20:00"), "2026-11-10 20:00")
-        self.assertEqual(fbr_sheet.deadline("2026-11-10T20:00:00+0800", "20:00"), "2026-11-10 20:00")
-        self.assertEqual(fbr_sheet.deadline("2026-11-10T21:00:00+0800", "20:00"), "2026-11-11 20:00")
-        self.assertEqual(fbr_sheet.deadline("2026-11-30T23:10:00+0800", "18:30"), "2026-12-01 18:30")
-        self.assertEqual(fbr_sheet.deadline("", "20:00"), "")
+        self.assertNotIn("提交截止", fbr_sheet.INTERNAL_COLUMNS)
 
     def test_note_excludes_all_engineering_facts(self):
         self.assertEqual(fbr_sheet.build_note({"note": "人工说明"},
@@ -147,13 +143,13 @@ class BuildRow(SheetCase):
             "交付完整性": 3, "Feedback": TEXT_A, "备注": "", "提交人": "",
             "任务编号": "s11-000001", "批次": BATCH, "底座仓库": "s11r001-clipcut",
             "任务仓库": f"{OWNER}/s11-000001-clipcut", "运行开始": "2026-11-10 14:00", "运行结束": "2026-11-10 15:30",
-            "提交截止": "2026-11-10 20:00", "尝试次数": 1, "证据路径": f"batches/{BATCH}/s11-000001/evidence",
+            "尝试次数": 1, "证据路径": f"batches/{BATCH}/s11-000001/evidence",
             "闸门状态": "通过", "抽检状态": "未抽检", "上传状态": "未提交", "数据状态": "可提交"})
 
     def test_not_pushed_and_no_video(self):
         row, _ = self.row(self.gated())
         self.assertEqual((row["产物快照"], row["运行录屏"], row["数据状态"]), ("", "", NOT_PUSHED))
-        self.assertEqual((row["运行开始"], row["运行结束"], row["提交截止"], row["尝试次数"]), ("", "", "", ""))
+        self.assertEqual((row["运行开始"], row["运行结束"], row["尝试次数"]), ("", "", ""))
 
     def test_changes_after_the_gate_void_it(self):
         task_dir = self.gated()

@@ -112,6 +112,20 @@ class SingleProducer(Sandbox):
         with self.assertRaisesRegex(lib.FbrError, "A/B"):
             lib.load_task(task)
 
+    def test_pre_domain_contract_handoff_hash_remains_compatible(self):
+        task, record = self.single_task()
+        legacy = dict(record, domain_contract=None, domain_gate_version=None)
+        legacy["handoff_hash"] = lib.content_hash(lib.handoff_payload(
+            legacy,
+            lib.load_json(task / "recording-plan.json"),
+            include_domain_contract=False,
+        ))
+        lib.save_json(task / "task.json", legacy)
+        row = self.manifest["tasks"][0]
+        row["handoff_hash"] = legacy["handoff_hash"]
+        lib.save_json(task.parent / "batch-manifest.json", self.manifest)
+        self.assertEqual(lib.load_task(task), legacy)
+
     def test_single_mode_and_path_drift_block(self):
         task, record = self.single_task()
         for field, value in (("execution_mode", "pairwise"), ("branch", "A"), ("workspace", "other/workspace"),

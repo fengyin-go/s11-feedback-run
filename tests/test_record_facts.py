@@ -343,6 +343,22 @@ class RecordOne(RecordCase):
         self.assertNotIn("s11-000003", out.getvalue())
 
 
+class CommandInput(unittest.TestCase):
+    def test_start_command_is_typed_before_execution(self):
+        import io
+        screen = fbr_record.ScreenBuffer()
+        ticks = []
+        raw = io.BytesIO()
+        seconds = fbr_record.type_command(
+            screen, raw, "npm run dev", lambda: ticks.append(screen.snapshot()),
+            max_input_seconds=0.04,
+        )
+        self.assertGreater(seconds, 0)
+        self.assertGreater(len(ticks), len("npm run dev"))
+        self.assertEqual(screen.snapshot(), "$ npm run dev\n")
+        self.assertEqual(raw.getvalue(), b"$ npm run dev\n")
+
+
 # ---------- 取证 ----------
 
 class ParseTests(unittest.TestCase):

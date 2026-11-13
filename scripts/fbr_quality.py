@@ -9,11 +9,12 @@ import re
 import fbr_gate as gate
 import fbrlib as lib
 
-VERSION = 8
+VERSION = 10
 CHECKS = ("result_and_process", "task_specific_voice", "test_relevance", "score_alignment",
           "evidence_fidelity", "scope_discipline", "non_template")
 RULE_FILES = ("references/scoring.md", "references/feedback-writing.md", "references/feedback-calibration.md",
-              "references/feedback-quality.md", "scripts/fbr_gate.py", "scripts/fbr_quality.py",
+              "references/feedback-quality.md", "references/process-attribution-audit.md",
+              "scripts/fbr_gate.py", "scripts/fbr_quality.py",
               "scripts/fbr_feedback.py", "scripts/fbr_trace_review.py", "scripts/fbr_sources.py")
 TRACE_RULE_FILES = ("scripts/fbr_trace_review.py", "scripts/fbr_sources.py")
 LEGACY_TRACE_POLICIES = {
@@ -27,6 +28,16 @@ LEGACY_FEEDBACK_POLICIES = {
 TEST_CLAUSE = re.compile(r"[^。；！？\n]*(?:测试|用例|\btest\w*|\bpytest\b)[^。；！？\n]*", re.I)
 COUNT_CLAIM = re.compile(r"(?:\d+\s*(?:条|个|项)\s*(?:测试|用例)|(?:测试|用例)[^。；]{0,8}\d+|\d+\s*(?:条|个|项)?\s*(?:全[部都]?通过|通过))")
 NEGATIVE_TEST = re.compile(r"(?:未|没有|没|未曾|并未)[^。；]{0,24}(?:测试|用例|验证)|(?:测试|用例)[^。；]{0,16}(?:未执行|没跑|未跑|未重跑|缺失)")
+PROCESS_AUDIT_CHECKS = ("full_trace", "baseline", "timeline", "source_boundary", "scope")
+PROCESS_EXTERNAL_EVIDENCE = re.compile(r"(?:独立\s*)?(?:边界\s*)?probe|验收侧|录制侧", re.I)
+PROCESS_PAGE_ACTION = re.compile(r"浏览器操作|页面操作|实际点击|点击[^。；]{0,16}按钮")
+PROCESS_NEGATED_PAGE_ACTION = re.compile(
+    r"(?:没有|未|没|并不)[^。；]{0,30}(?:浏览器|页面)?[^。；]{0,20}(?:点击|操作)[^。；]{0,20}(?:按钮|页面)"
+)
+PROCESS_BROWSER_TRACE = re.compile(r"playwright|puppeteer|browser|chromium|page\.click|locator\(", re.I)
+PROCESS_TIMELINE = re.compile(r"最初|起初|最初|收尾|最后|随后|后来|最终")
+PROCESS_CAUSAL = re.compile(r"让|使|造成|导致|引入|归因")
+PROCESS_SCOPE = re.compile(r"只|仅|从未|没有|未实际|唯一")
 
 
 def policy_sha() -> str:
@@ -83,6 +94,55 @@ def source_text(claim: dict, facts: dict, probes: list[dict]) -> str:
     return ""
 
 
+def trace_has_browser_action(facts: dict) -> bool:
+    for step in facts.get("trace", {}).get("steps", []):
+        haystack = f"{step.get('tool', '')} {step.get('target', '')}"
+        if PROCESS_BROWSER_TRACE.search(haystack):
+            return True
+    return False
+
+
+def process_audit_errors(doc: dict, facts: dict) -> list[str]:
+    """Ensure process prose describes verified model behaviour, not evaluator evidence."""
+    process = doc.get("process")
+    audit = doc.get("process_audit")
+    if not isinstance(process, list) or not process:
+        return []
+    if not isinstance(audit, list) or len(audit) != len(process):
+        return ["process_audit 必须按顺序覆盖全部过程句"]
+    browser_seen = trace_has_browser_action(facts)
+    errors = []
+    for index, (item, checked) in enumerate(zip(process, audit), 1):
+        label = f"第 {index} 个过程句归因"
+        raw_sentence = str(item.get("sentence") or "") if isinstance(item, dict) else ""
+        sentence = gate.squash(raw_sentence)
+        if not isinstance(checked, dict):
+            errors.append(label + "格式不对")
+            continue
+        if checked.get("sentence") != raw_sentence:
+            errors.append(label + "必须对应同一条过程句原文")
+        if checked.get("subject") != "model":
+            errors.append(label + "的 subject 必须是 model；验收 probe、演示和页面验收结果不能写成模型动作")
+        if checked.get("verdict") != "supported":
+            errors.append(label + "必须已完成原文、基线、时间线和后续状态核对")
+        checks = checked.get("checks")
+        if not isinstance(checks, dict) or any(checks.get(name) is not True for name in PROCESS_AUDIT_CHECKS):
+            errors.append(label + "必须完成 full_trace、baseline、timeline、source_boundary、scope 五项检查")
+        if len(str(checked.get("note") or "").strip()) < 8:
+            errors.append(label + "缺少具体归因核对说明")
+        if PROCESS_EXTERNAL_EVIDENCE.search(sentence):
+            errors.append(label + "混入了独立 probe 或验收侧证据；模型过程只能写模型轨迹中的行为")
+        if PROCESS_PAGE_ACTION.search(sentence) and not browser_seen and not PROCESS_NEGATED_PAGE_ACTION.search(sentence):
+            errors.append(label + "写了页面或浏览器操作，但轨迹中没有对应浏览器动作；应改写为模型实现或最终产物现象")
+        if PROCESS_TIMELINE.search(sentence) and isinstance(checks, dict) and checks.get("timeline") is not True:
+            errors.append(label + "含时间判断，必须核对完整前置和后续步骤")
+        if PROCESS_CAUSAL.search(sentence) and isinstance(checks, dict) and checks.get("baseline") is not True:
+            errors.append(label + "含因果或归属判断，必须对照初始提交，区分基线已有行为与模型引入")
+        if PROCESS_SCOPE.search(sentence) and isinstance(checks, dict) and checks.get("scope") is not True:
+            errors.append(label + "含只、仅、从未、没有等范围判断，必须扫描完整轨迹后再写")
+    return errors
+
+
 def check_contract(doc: dict, task: dict, facts: dict, audit: dict, probes: list[dict]) -> list[str]:
     """摘要真实存在不等于语义真实；此处检查可确定的出处，含义交给另一次指定模型复核。"""
     errors = []
@@ -130,6 +190,8 @@ def check_contract(doc: dict, task: dict, facts: dict, audit: dict, probes: list
             errors.append('评分依据必须绑定最终交付证据 anchors')
         else:
             errors += gate._anchor_problems(anchors, ev, '评分依据')
+
+    errors += process_audit_errors(doc, facts)
 
     claims = doc.get("test_claims")
     if not isinstance(claims, list):
@@ -200,6 +262,11 @@ def claim_report_errors(report: dict, doc: dict, task: Path) -> list[str]:
     """强制逐句复查及原文摘录；摘录能否支持含义仍由当前任务 AI 逐句复核。"""
     rows = report.get('claim_reviews')
     units = public_units(doc.get('feedback', ''))
+    process_sentences = {
+        gate.squash(str(item.get('sentence') or ''))
+        for item in doc.get('process', [])
+        if isinstance(item, dict)
+    }
     if not isinstance(rows, list) or len(rows) != len(units):
         return ['逐句复查缺失：claim_reviews 必须按顺序覆盖全部正文句段']
     errors = []
@@ -221,6 +288,12 @@ def claim_report_errors(report: dict, doc: dict, task: Path) -> list[str]:
         if not isinstance(sources, list) or not sources:
             errors.append(label + '缺少回查原文')
             continue
+        if gate.squash(unit) in process_sentences and not any(
+                isinstance(source, dict)
+                and str(source.get('path', '')).startswith('trace/projects/')
+                and str(source.get('path', '')).endswith('.jsonl')
+                for source in sources):
+            errors.append(label + '是模型过程句，来源中必须包含原始轨迹 JSONL，不能只靠 probe、录屏或最终源码')
         for source in sources:
             if not isinstance(source, dict):
                 errors.append(label + '原文来源格式错误')

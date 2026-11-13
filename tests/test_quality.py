@@ -142,3 +142,51 @@ class ClaimReview(unittest.TestCase):
     def test_changed_original_invalidates_quote(self):
         self.source.write_text('first: command failed\n')
         self.assertTrue(self.errors())
+
+    def test_process_sentence_requires_trace_source(self):
+        self.doc['process'] = [{'sentence': self.doc['feedback'].split('。')[0], 'steps': [1]}]
+        self.report['claim_reviews'][0]['sources'] = [
+            {'path': 'evidence/probes.jsonl', 'excerpt': 'first: command failed'}
+        ]
+        self.assertTrue(any('原始轨迹 JSONL' in error for error in self.errors()))
+
+
+class ProcessAudit(unittest.TestCase):
+    def facts(self, *, browser=False):
+        steps = [{"step": 1, "tool": "Bash", "target": "npm run typecheck"},
+                 {"step": 2, "tool": "Bash", "target": "curl http://127.0.0.1/api/health"}]
+        if browser:
+            steps.append({"step": 3, "tool": "Playwright", "target": "page.click('权限编排')"})
+        return {"trace": {"steps": steps}}
+
+    def doc(self, sentence="模型修复请求体后重新运行 HTTP 检查"):
+        return {
+            "process": [{"sentence": sentence, "steps": [1]}],
+            "process_audit": [{
+                "sentence": sentence, "subject": "model", "verdict": "supported",
+                "checks": {name: True for name in quality.PROCESS_AUDIT_CHECKS},
+                "note": "已回查完整轨迹、基线、时间线和后续最终状态",
+            }],
+        }
+
+    def test_valid_process_attribution(self):
+        self.assertEqual(quality.process_audit_errors(self.doc(), self.facts()), [])
+
+    def test_external_probe_cannot_be_model_action(self):
+        doc = self.doc("模型修正后两个边界 probe 都通过")
+        doc["process_audit"][0]["sentence"] = doc["process"][0]["sentence"]
+        self.assertTrue(any("独立 probe" in error for error in
+                            quality.process_audit_errors(doc, self.facts())))
+
+    def test_page_action_requires_browser_trace(self):
+        doc = self.doc("模型在页面操作里点击权限编排按钮")
+        doc["process_audit"][0]["sentence"] = doc["process"][0]["sentence"]
+        self.assertTrue(any("浏览器动作" in error for error in
+                            quality.process_audit_errors(doc, self.facts())))
+        self.assertEqual(quality.process_audit_errors(doc, self.facts(browser=True)), [])
+
+    def test_audit_must_cover_every_process_sentence(self):
+        doc = self.doc()
+        doc["process_audit"] = []
+        self.assertTrue(any("按顺序覆盖" in error for error in
+                            quality.process_audit_errors(doc, self.facts())))

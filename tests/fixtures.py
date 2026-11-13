@@ -86,7 +86,7 @@ class Sandbox(unittest.TestCase):
         os.chmod(self.key_file, 0o600)
         lib.save_json(self.root / "_config" / "settings.json", {
             "image": IMAGE, "image_id": IMAGE_ID, "harness": "Claude Code", "harness_version": VERSION,
-            "github_owner": OWNER, "git_user_name": "Self Test", "git_user_email": "selftest@example.com",
+            "git_user_name": "Self Test", "git_user_email": "selftest@example.com",
             "submitter": "测试员", "key_file": str(self.key_file), "concurrency": 2, "gateway": {"retry_base": 0}})
         (self.root / "batches" / BATCH).mkdir(parents=True)
         self.cfg = lib.settings(self.root)

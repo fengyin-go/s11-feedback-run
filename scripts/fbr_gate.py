@@ -31,6 +31,9 @@ RUBRIC = [
 AI_WORDS = ["综上所述", "综上", "总的来说", "总体而言", "整体来看", "可以看出",
             "值得一提", "值得注意的是", "需要指出的是", "极大地", "显著提升", "充分体现"]
 VAGUE_WORDS = ["完美完成", "效果很好", "基本可用", "表现出色", "整体不错", "质量较高", "完成度高"]
+EMPTY_COMPLETENESS_RE = re.compile(
+    r"(?:未发现|没有发现|没有|无)(?:其他)?(?:明确)?(?:未完成功能|未完成项|功能缺口|未完成要求)"
+)
 INTERNAL_WORDS = ["触发点在", "实际行为是", "后果是", "业务影响是", "反例", "逐条核对", "核对依据", "本侧", "该侧", "锚点",
                   "题面", "素材卡", "facts.json", "audit.json"]
 TOPIC_WORDS = ["这道题", "该题", "本题", "此题"]
@@ -339,6 +342,8 @@ def check_text(text: str, prompt: str, gate: dict) -> tuple[list[str], list[str]
         errors.append("正文里不写验收人自己（我、我们、本人）")
     if body.count("模型") > 1:
         errors.append("正文里“模型”最多出现一次，第一次点明主体后改用“它”承接或省略主语")
+    if EMPTY_COMPLETENESS_RE.search(body):
+        errors.append("删除“未发现其他明确未完成功能”这类空泛完成度句；直接写完成了什么、没完成什么或仍有哪项问题")
     if not MODEL_PROCESS_RE.search(body):
         errors.append("正文缺少模型实现或验证过程的具体行为句")
     model_sentences = [sentence for sentence in sentences(body) if "模型" in sentence]
@@ -398,6 +403,8 @@ def check_feedback(doc: dict, task: dict, facts: dict, audit: dict, ev: dict, ga
         steps = item.get("steps") if isinstance(item, dict) else None
         if len(sentence) < 6 or sentence not in flat:
             errors.append(f"{where}：sentence 要是正文里的原句")
+        elif sentence not in {squash(unit) for unit in sentences(text)}:
+            errors.append(f"{where}：必须对应正文中的一个完整句段，不能跨分号、句号或换行拼接多个动作")
         conversation = isinstance(item, dict) and item.get("source") == "conversation" and not ev["steps"] and steps == []
         if (not isinstance(steps, list) or not steps) and not conversation:
             errors.append(f"{where}：要写它对应轨迹里的哪几步（steps）")

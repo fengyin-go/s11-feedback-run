@@ -371,7 +371,7 @@ class Push(SnapshotCase):
     def test_wrong_owner_and_missing_stage(self):
         task_dir, _ = self.committed(task_repo_full="someone-else/s11-000001-clipcut")
         hub = FakeHub(self.tmp / "remotes")
-        with self.assertRaisesRegex(lib.FbrError, f"不在 {OWNER} 名下"):
+        with self.assertRaisesRegex(lib.FbrError, f"不在当前活跃账号 {OWNER} 名下"):
             snap.push_one(hub, task_dir, self.cfg)
         self.assertEqual(hub.calls, [])
         other, _ = self.collected(2)
@@ -386,6 +386,7 @@ class HubClass(SnapshotCase):
         def fake(command, **kwargs):
             self.seen.append((command, kwargs.get("env") or {}))
             return responses[" ".join(command[1:3])]
+        responses.setdefault("api user", done(0, OWNER + "\n"))
         self.seen = []
         patcher = mock.patch.object(lib, "run", fake)
         patcher.start()
@@ -394,7 +395,8 @@ class HubClass(SnapshotCase):
 
     def test_token_goes_through_env_only(self):
         hub = self.hub({"auth token": done(0, HUB_TOKEN + "\n")})
-        self.assertEqual(self.seen[0][0], ["gh", "auth", "token", "--hostname", "github.com", "--user", OWNER])
+        self.assertEqual(self.seen[0][0], ["gh", "api", "user", "--jq", ".login"])
+        self.assertEqual(self.seen[1][0], ["gh", "auth", "token", "--hostname", "github.com"])
         ws = self.make_task() / "workspace"
         header = hub.git(ws, "config", "--get", "http.https://github.com/.extraHeader").stdout.strip()
         self.assertTrue(header.startswith("Authorization: Basic "))
@@ -404,7 +406,7 @@ class HubClass(SnapshotCase):
         self.assertEqual(hub.url("a/b"), "https://github.com/a/b.git")
 
     def test_no_login(self):
-        with self.assertRaisesRegex(lib.FbrError, f"gh 里没有 {OWNER} 的登录态"):
+        with self.assertRaisesRegex(lib.FbrError, f"gh 里没有当前活跃账号 {OWNER} 的登录态"):
             self.hub({"auth token": done(1, "", "no oauth token")})
 
     def test_api_parsing(self):
@@ -432,7 +434,7 @@ class CommandLine(SnapshotCase):
         out, err = io.StringIO(), io.StringIO()
         made = []
 
-        def factory(owner):
+        def factory(owner=None):
             made.append(owner)
             if hub is None:
                 raise AssertionError("这里不该去拿 token")
@@ -463,7 +465,7 @@ class CommandLine(SnapshotCase):
         self.assertEqual((code, made), (2, []))
         self.assertIn("真推需要 --confirm PUBLISH", err)
         code, out, _, made = self.call("push", "--batch", BATCH, "--execute", "--confirm", "PUBLISH", hub=hub)
-        self.assertEqual((code, made), (0, [OWNER]))
+        self.assertEqual((code, made), (0, [None]))
         self.assertIn("s11-000001  ok  https://github.com/", out)
         code, out, _, _ = self.call("push", "--batch", BATCH)
         self.assertIn("没有待推送的产物快照", out)
@@ -477,7 +479,7 @@ class CommandLine(SnapshotCase):
         hub.login = lambda: "another-account"
         code, _, err, _ = self.call("push", "--batch", BATCH, "--execute", "--confirm", "PUBLISH", hub=hub)
         self.assertEqual(code, 2)
-        self.assertIn(f"token 对应的账号不是 {OWNER}", err)
+        self.assertIn(f"token 对应的账号不是当前活跃账号 {OWNER}", err)
         hub = FakeHub(self.tmp / "remotes")      # 四个任务都没有远端仓库
         code, out, _, _ = self.call("push", "--batch", BATCH, "--execute", "--confirm", "PUBLISH", hub=hub)
         self.assertEqual(code, 1)

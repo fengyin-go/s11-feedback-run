@@ -124,8 +124,9 @@ def prepare_legacy_progress_recovery(task_dir: Path, cfg: dict, *, execute: bool
     last = attempts[-1]
     if current.get("state") != "archived" or current.get("attempt") != last.get("n"):
         return {"task_id": task_dir.name, "state": "blocked", "detail": "旧运行不是已归档的当前尝试"}
-    if not last.get("timed_out") or str(last.get("reason", "")) not in ("进程超时", "timeout"):
-        return {"task_id": task_dir.name, "state": "blocked", "detail": "旧运行不是控制器超时"}
+    if (not last.get("timed_out") and last.get("rc") not in (137, 143)
+            ) or str(last.get("reason", "")) not in ("进程超时", "timeout", "进程异常退出"):
+        return {"task_id": task_dir.name, "state": "blocked", "detail": "旧运行不是控制器超时或异常退出"}
     heartbeat = lib.load_json(task_dir / "run/heartbeat.json", default={})
     budget = lib.load_json(task_dir / "run/budget.json", default={})
     active_seconds = float(budget.get("active_seconds") or 0)
@@ -139,7 +140,7 @@ def prepare_legacy_progress_recovery(task_dir: Path, cfg: dict, *, execute: bool
         return {"task_id": task_dir.name, "state": "blocked", "detail": "旧运行缺少持续进展证据"}
     if marker.get("state") == "ready" and marker.get("attempt") == last.get("n"):
         return {"task_id": task_dir.name, "state": "ready", "detail": "已有一次性进度恢复令牌"}
-    if marker.get("used_at"):
+    if marker.get("used_at") and marker.get("attempt") == last.get("n"):
         return {"task_id": task_dir.name, "state": "used", "detail": "一次性进度恢复令牌已使用"}
     if not execute:
         return {"task_id": task_dir.name, "state": "dry", "detail": "可发放一次性进度恢复令牌"}
@@ -306,7 +307,7 @@ def prepared_problems(task_dir: Path, record: dict, cfg: dict, current: dict) ->
             ('pid', 'request_id', 'result', 'session_id', 'continuations')):
         return ['已有派发身份，不能按未派发容器恢复']
     owner = {'pid': current.get('owner_pid'), 'identity': current.get('owner_identity')}
-    if runtime.alive(owner):
+    if runtime.alive(owner) and owner.get('pid') != os.getpid():
         return ['原调度仍活着，不接管正在等待派发的容器']
     if not current.get('container_id') or not container_exists(task_dir.name):
         return ['未派发容器缺失或身份不完整']
@@ -480,11 +481,12 @@ def run_one(task_dir: Path, cfg: dict) -> dict:
     if lib.stage_ok(task_dir, "run"):
         return {"task_id": name, "state": "skip", "detail": "已经跑过"}
     current = lib.load_json(task_dir / 'run/current.json', default={})
-    recovering = current.get('request_id') and current.get('state') in ('running', 'exited')
+    recovering = bool(current.get('request_id') and current.get('state') in ('running', 'exited'))
+    prepared = current.get('state') in ('starting', 'continue_ready')
     legacy_recovery = lib.load_json(task_dir / 'run/legacy-progress-recovery.json', default={})
     legacy_grant = (legacy_recovery.get('state') == 'ready' and not legacy_recovery.get('used_at')
                     and legacy_recovery.get('attempt') == current.get('attempt'))
-    if not recovering and not legacy_grant and (time.time() >= cfg.get('_deadline', float('inf'))
+    if not recovering and not prepared and not legacy_grant and (time.time() >= cfg.get('_deadline', float('inf'))
             or (cfg.get('_drain') and Path(cfg['_drain']).exists())):
         return {'task_id': name, 'state': 'deferred', 'detail': '批次已排空或预算到顶，不起新轮'}
     try:
@@ -504,7 +506,12 @@ def run_one(task_dir: Path, cfg: dict) -> dict:
         return {"task_id": name, "state": "blocked", "detail": "；".join(problems)}
     run_dir = task_dir / "run"
     run_dir.mkdir(exist_ok=True)
-    (run_dir / "prompt.txt").write_text(record["prompt"], encoding="utf-8")
+    prompt = record.get("prompt")
+    if not prompt and (run_dir / "prompt.txt").is_file():
+        prompt = (run_dir / "prompt.txt").read_text(encoding="utf-8")
+    if not prompt:
+        return {"task_id": name, "state": "blocked", "detail": "缺少题面，不能起跑或恢复"}
+    (run_dir / "prompt.txt").write_text(prompt, encoding="utf-8")
     if not resume:
         lib.save_git_config(task_dir)
     attempts = lib.load_json(run_dir / "attempts.json", default=[])
@@ -514,13 +521,13 @@ def run_one(task_dir: Path, cfg: dict) -> dict:
     while True:
         admission = fbr_retry.admission(attempts, cfg)
         lib.save_json(run_dir / 'retry-ledger.json', admission)
-        if not admission['allowed']:
+        if not admission['allowed'] and not (legacy_grant or resume):
             lib.set_stage(task_dir, 'run', 'deferred', reason=admission['reason'])
             return {'task_id': name, 'state': 'deferred', 'detail': admission['reason']}
-        if not legacy_grant and (time.time() >= cfg.get('_deadline', float('inf'))
+        if not (legacy_grant or resume) and (time.time() >= cfg.get('_deadline', float('inf'))
                 or (cfg.get('_drain') and Path(cfg['_drain']).exists())):
             return {'task_id': name, 'state': 'deferred', 'detail': '批次已排空或预算到顶，不起新轮'}
-        if budget["active_seconds"] >= cfg["run"]["task_budget"] and not legacy_grant:
+        if budget["active_seconds"] >= cfg["run"]["task_budget"] and not (legacy_grant or resume):
             lib.set_stage(task_dir, "run", "deferred", reason="单题累计运行预算耗尽，恢复不会清零预算")
             return {"task_id": name, "state": "deferred", "detail": "单题累计运行预算耗尽"}
         if cfg['run'].get('gateway_wait_task_total') is not None and budget.get('waiting_seconds', 0) >= cfg['run']['gateway_wait_task_total']:
@@ -789,6 +796,14 @@ def fan_out(items: list[Path], worker, parallel: int) -> list[dict]:
     return rows
 
 
+def all_tasks_resumable(tasks: list[Path]) -> bool:
+    return bool(tasks) and all(
+        lib.load_json(task / "run/current.json", default={}).get("state")
+        in ("running", "exited", "starting", "continue_ready")
+        for task in tasks
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="solo11 单轮运行与轨迹收集")
     parser.add_argument("--root")
@@ -815,6 +830,7 @@ def main() -> int:
         cfg = lib.settings(root)
         cfg['_managed'] = True
         if args.command == "preflight":
+            lib.active_github_account()
             return 0 if print_checks(preflight(cfg)) else 1
         items = lib.task_dirs(root, args.batch, args.tasks)
         directory = lib.batch_dir(root, args.batch) / 'runner'
@@ -863,6 +879,7 @@ def main() -> int:
             print("命令形如：" + " ".join(run_command(todo[0], lib.load_task(todo[0]), cfg)) + "；随后 docker exec -i <任务编号> /usr/local/bin/entrypoint.sh print < run/prompt.txt")
             print(f"演练结束：待运行 {len(todo)} 个，其中 {blocked} 个没准备好。真跑加 --execute")
             return 1 if blocked else 0
+        lib.active_github_account()
         print("预检：")
         if not print_checks(preflight(cfg)):
             raise lib.FbrError("预检没过，不起跑")
@@ -870,7 +887,15 @@ def main() -> int:
             if args.command == 'resume':
                 (directory / 'drain').unlink(missing_ok=True)
             budget_path = directory / 'budget.json'
-            batch_budget = {'deadline': runtime.batch_deadline(root, args.batch, cfg)}
+            legacy_grants = []
+            for task_dir in todo:
+                current = lib.load_json(task_dir / 'run/current.json', default={})
+                marker = lib.load_json(task_dir / 'run/legacy-progress-recovery.json', default={})
+                legacy_grants.append(marker.get('state') == 'ready' and not marker.get('used_at')
+                                     and marker.get('attempt') == current.get('attempt'))
+            batch_budget = {'deadline': float('inf')
+                            if (legacy_grants and all(legacy_grants)) or all_tasks_resumable(todo)
+                            else runtime.batch_deadline(root, args.batch, cfg)}
             lib.save_json(budget_path, batch_budget)
             cfg.update(_deadline=batch_budget['deadline'], _drain=str(directory / 'drain'))
             import fbr_schedule

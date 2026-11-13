@@ -168,14 +168,15 @@ def commit_one(task_dir: Path, cfg: dict) -> dict:
 # ---------- 推送 ----------
 
 class Hub:
-    def __init__(self, owner: str) -> None:
-        if owner != "fengyin-go":
-            raise lib.FbrError("数据发布仅允许 GitHub 账号 fengyin-go，拒绝其他账号")
-        self.owner = owner
-        result = lib.run(["gh", "auth", "token", "--hostname", "github.com", "--user", owner], timeout=60)
+    def __init__(self, owner: str | None = None) -> None:
+        active = lib.active_github_account()
+        if owner and owner != active:
+            raise lib.FbrError(f"请求的 GitHub 账号 {owner} 与当前活跃账号 {active} 不一致")
+        self.owner = active
+        result = lib.run(["gh", "auth", "token", "--hostname", "github.com"], timeout=60)
         self.token = result.stdout.strip()
         if result.returncode != 0 or not self.token:
-            raise lib.FbrError(f"gh 里没有 {owner} 的登录态")
+            raise lib.FbrError(f"gh 里没有当前活跃账号 {active} 的登录态")
 
     def url(self, full: str) -> str:
         return f"https://github.com/{full}.git"
@@ -226,9 +227,9 @@ def push_one(hub, task_dir: Path, cfg: dict) -> dict:
     lib.require_stage(task_dir, "commit")
     snapshot = lib.load_json(task_dir / "review" / "snapshot.json")
     was_pushed = snapshot.get("pushed", False)
-    full = record.get("task_repo_full") or f"{cfg['github_owner']}/{record['task_repo']}"
-    if full.split("/")[0] != cfg["github_owner"]:
-        raise lib.FbrError(f"{name}：任务仓库 {full} 不在 {cfg['github_owner']} 名下")
+    full = record.get("task_repo_full") or f"{hub.owner}/{record['task_repo']}"
+    if full.split("/")[0] != hub.owner:
+        raise lib.FbrError(f"{name}：任务仓库 {full} 不在当前活跃账号 {hub.owner} 名下")
     lib.restore_git_config(task_dir)
     url, commit, initial = hub.url(full), snapshot["commit"], snapshot["initial_commit"]
     if not hub.is_public(full):
@@ -297,9 +298,9 @@ def main() -> int:
             return 0
         if args.confirm != "PUBLISH":
             raise lib.FbrError("真推需要 --confirm PUBLISH")
-        hub = Hub(cfg["github_owner"])
-        if hub.login() != cfg["github_owner"]:
-            raise lib.FbrError(f"token 对应的账号不是 {cfg['github_owner']}")
+        hub = Hub()
+        if hub.login() != hub.owner:
+            raise lib.FbrError(f"token 对应的账号不是当前活跃账号 {hub.owner}")
         streak = 0
         for task_dir, _ in todo:
             try:

@@ -74,6 +74,27 @@ class ZeroChanges(DockerCase):
         self.assertEqual(row['state'], 'blocked')
         self.assertFalse((task / 'run/legacy-progress-recovery.json').exists())
 
+    def test_legacy_progress_recovery_handles_killed_recovery_attempt(self):
+        task = self.make_task()
+        lib.save_json(task / 'run/attempts.json', [
+            {'n': 1, 'timed_out': True, 'reason': '进程超时'},
+            {'n': 2, 'timed_out': False, 'rc': 137, 'reason': '进程异常退出'},
+        ])
+        lib.save_json(task / 'run/current.json', {'state': 'archived', 'attempt': 2})
+        lib.save_json(task / 'run/budget.json', {
+            'active_seconds': self.cfg['run']['task_budget'] + 600, 'waiting_seconds': 0,
+        })
+        lib.save_json(task / 'run/heartbeat.json', {
+            'elapsed': 525, 'idle': 0, 'output_idle': 0, 'events': 1000, 'tools': 10,
+        })
+        lib.save_json(task / 'run/legacy-progress-recovery.json', {
+            'state': 'used', 'attempt': 1, 'used_attempt': 2, 'used_at': 'earlier',
+        })
+        row = fbr_run.prepare_legacy_progress_recovery(task, self.cfg, execute=True)
+        self.assertEqual(row['state'], 'ready')
+        marker = lib.load_json(task / 'run/legacy-progress-recovery.json')
+        self.assertEqual((marker['state'], marker['attempt']), ('ready', 2))
+
     def test_no_change_uses_three_fresh_containers_and_archives(self):
         task = self.make_task()
         self.docker.outcomes = [self.good(effect=lambda ws: None) for _ in range(3)]

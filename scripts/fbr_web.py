@@ -42,7 +42,7 @@ def validate_plan(plan):
 
 def render(plan, container, port, out_dir, rec):
     from playwright.sync_api import sync_playwright
-    from fbr_record import PAGE, ScreenBuffer
+    from fbr_record import PAGE, ScreenBuffer, type_command
     validate_plan(plan)
     url = plan.get('url', 'http://127.0.0.1:{port}/').replace('{port}', str(port))
     parsed = urlparse(url)
@@ -51,13 +51,10 @@ def render(plan, container, port, out_dir, rec):
     command = plan['serve_cmd'].replace('{port}', str(port)).replace('{host}', '0.0.0.0')
     size = {'width': rec['width'], 'height': rec['height']}
     screen = ScreenBuffer()
-    master, slave = pty.openpty()
-    process = subprocess.Popen(['docker', 'exec', '-it', '-w', '/workspace', container, 'bash', '-lc', command],
-                               stdin=slave, stdout=slave, stderr=slave, start_new_session=True)
-    os.close(slave)
+    master = process = thread = raw = None
     stop = threading.Event()
     errors, steps, action_errors = [], [], []
-    raw = open(out_dir / 'terminal.raw.log', 'wb')
+
     def drain():
         while not stop.is_set():
             if select.select([master], [], [], .1)[0]:
@@ -70,12 +67,13 @@ def render(plan, container, port, out_dir, rec):
                 raw.write(chunk)
                 raw.flush()
                 screen.feed(chunk)
-    thread = threading.Thread(target=drain, daemon=True)
-    thread.start()
+
     ready = False
     startup_end = 0
     page_seconds = 0
     page_segment = False
+    input_seconds = 0
+    raw = open(out_dir / 'terminal.raw.log', 'wb')
     try:
         with sync_playwright() as play:
             browser = play.chromium.launch(headless=True)
@@ -83,10 +81,26 @@ def render(plan, container, port, out_dir, rec):
             page = context.new_page()
             page.set_content(PAGE % {'w': rec['width'], 'h': rec['height']})
             page.screenshot()
+
+            def tick():
+                page.evaluate("t => { const o = document.getElementById('output'); o.textContent=t;"
+                              " o.scrollTop = o.scrollHeight; }", screen.snapshot())
+
+            # Recording begins with the operator-facing prompt and the command entry itself.
+            video_began = time.monotonic()
+            input_seconds = type_command(screen, raw, command, tick)
+            master, slave = pty.openpty()
+            process = subprocess.Popen(
+                ['docker', 'exec', '-it', '-w', '/workspace', container, 'bash', '-lc', command],
+                stdin=slave, stdout=slave, stderr=slave, start_new_session=True,
+            )
+            os.close(slave)
+            thread = threading.Thread(target=drain, daemon=True)
+            thread.start()
             began = time.monotonic()
             startup_budget = min(float(plan.get('startup_timeout', 45)), rec['max_seconds'] - 15)
             while time.monotonic() - began < startup_budget:
-                page.evaluate("t => document.getElementById('output').textContent=t", screen.snapshot())
+                tick()
                 if not ready:
                     try:
                         # 不受宿主代理影响，只请求本次映射的本地端口。
@@ -107,7 +121,7 @@ def render(plan, container, port, out_dir, rec):
             startup_end = time.monotonic() - began
             steps.append({'cmd': command, 'show': '服务启动', 'rc': process.poll() if process.poll() is not None else None,
                           'seconds': startup_end, 'cut': False, 'skipped': False, 'tail': screen.snapshot()[-3000:],
-                          'startup_ready': ready})
+                          'startup_ready': ready, 'input_recorded': True, 'input_seconds': input_seconds})
             if ready:
                 page.on('pageerror', lambda error: errors.append(str(error)))
                 page_began = time.monotonic()
@@ -117,7 +131,7 @@ def render(plan, container, port, out_dir, rec):
                     if plan.get('ready_selector'):
                         page.locator(plan['ready_selector']).wait_for(timeout=5000)
                     for item in plan['steps']:
-                        remaining = rec['max_seconds'] - 3 - (time.monotonic() - began)
+                        remaining = rec['max_seconds'] - 3 - (time.monotonic() - video_began)
                         if remaining < 2:
                             steps.append({'cmd': item['action'], 'rc': None, 'cut': True, 'skipped': True, 'tail': '页面演示预算不足'})
                             continue
@@ -150,13 +164,13 @@ def render(plan, container, port, out_dir, rec):
                                           'skipped': False, 'tail': str(exc)[:1500]})
                         # 关键结果可停留供观看；始终预留封装视频所需时间。
                         pause = min(item.get('pause_ms', 300), max(0, int(
-                            (rec['max_seconds'] - 3 - (time.monotonic() - began)) * 1000)))
+                            (rec['max_seconds'] - 3 - (time.monotonic() - video_began)) * 1000)))
                         steps[-1].update(url=page.url, pause_ms=pause)
                         page.wait_for_timeout(pause)
                 except Exception as exc:
                     errors.append(str(exc)[:1500])
                 page.wait_for_timeout(max(0, min(8000 - (time.monotonic() - page_began) * 1000,
-                                                (rec['max_seconds'] - 2 - (time.monotonic() - began)) * 1000)))
+                                                (rec['max_seconds'] - 2 - (time.monotonic() - video_began)) * 1000)))
                 page.screenshot(path=str(out_dir / "page.png"), full_page=True)
                 page_seconds = time.monotonic() - page_began
             else:
@@ -167,10 +181,13 @@ def render(plan, container, port, out_dir, rec):
             browser.close()
     finally:
         stop.set()
-        thread.join(timeout=2)
-        raw.close()
-        os.close(master)
-        if process.poll() is None:
+        if thread is not None:
+            thread.join(timeout=2)
+        if raw is not None:
+            raw.close()
+        if master is not None:
+            os.close(master)
+        if process is not None and process.poll() is None:
             process.terminate()
             try:
                 process.wait(timeout=5)
@@ -178,5 +195,6 @@ def render(plan, container, port, out_dir, rec):
                 process.kill()
                 process.wait(timeout=5)
     return steps, {'mode': 'web', 'startup_ready': ready, 'startup_seconds': startup_end,
+                   'command_input_seconds': input_seconds,
                    'page_segment': page_segment, 'page_seconds': page_seconds, 'page_errors': errors, 'action_errors': action_errors,
                    'status': 'startup_failed' if not ready else 'page_error' if errors or action_errors else 'observed'}

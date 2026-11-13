@@ -96,6 +96,24 @@ class ScreenBuffer:
             return "\n".join(self.lines)
 
 
+def type_command(screen: ScreenBuffer, raw_log, command: str, tick, *, max_input_seconds: float = 1.2) -> float:
+    """Render a shell prompt and type the command before executing it."""
+    started = time.monotonic()
+    text = "$ " + command
+    delay = min(0.04, max_input_seconds / max(1, len(text)))
+    for char in text:
+        chunk = char.encode("utf-8")
+        raw_log.write(chunk)
+        screen.feed(chunk)
+        tick()
+        time.sleep(delay)
+    raw_log.write(b"\n")
+    raw_log.flush()
+    screen.feed(b"\n")
+    tick()
+    return round(time.monotonic() - started, 2)
+
+
 def run_in_pty(command: list[str], screen: ScreenBuffer, raw_log, limit: float, tick) -> tuple[int, bool, float]:
     """在伪终端里跑一条命令，输出喂给 screen。返回 (退出码, 是否被截断, 用时)。tick 每 0.1 秒调一次刷新画面。"""
     master, slave = pty.openpty()
@@ -248,16 +266,15 @@ def render(session_cmds: list[dict], exec_prefix: list[str], out_dir: Path, rec:
                 steps.append({"cmd": item["cmd"], "show": item.get("show", ""), "rc": None, "seconds": 0,
                               "cut": True, "tail": "", "skipped": True})
                 continue
-            screen.line(f"$ {item['cmd']}")
-            raw_log.write(f"$ {item['cmd']}\n".encode())
-            tick()
+            input_seconds = type_command(screen, raw_log, item["cmd"], tick)
             mark = len(screen.snapshot())
             rc, cut, seconds = run_in_pty([*exec_prefix, "bash", "-lc", item["cmd"]], screen, raw_log,
                                           min(rec["step_timeout"], left), tick)
             tick()
             page.wait_for_timeout(1200)
             steps.append({"cmd": item["cmd"], "show": item.get("show", ""), "rc": rc, "seconds": seconds,
-                          "cut": cut, "tail": lib.clip(screen.snapshot()[mark:][-1500:], 1500), "skipped": False})
+                          "cut": cut, "tail": lib.clip(screen.snapshot()[mark:][-1500:], 1500), "skipped": False,
+                          "input_recorded": True, "input_seconds": input_seconds})
         page.wait_for_timeout(500)
         video = page.video
         context.close()

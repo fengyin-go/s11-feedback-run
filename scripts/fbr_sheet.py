@@ -17,7 +17,7 @@ import hashlib
 import re
 import sys
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -30,7 +30,7 @@ import fbr_fields
 PUBLIC_COLUMNS = ["User Prompt", "所属领域", "子方向", "任务类型", "任务难度", "语言/框架", "Harness", "Harness 版本",
                   "操作系统", "环境可复现等级", "初始环境快照", "SessionID", "TurnID/PromptID", "轨迹文件", "产物快照",
                   "运行录屏", "交付完整性", "Feedback", "备注", "提交人", "提交时间"]
-INTERNAL_COLUMNS = ["任务编号", "批次", "底座仓库", "任务仓库", "运行开始", "运行结束", "提交截止", "尝试次数", "证据路径",
+INTERNAL_COLUMNS = ["任务编号", "批次", "底座仓库", "任务仓库", "运行开始", "运行结束", "尝试次数", "证据路径",
                     "闸门状态", "抽检状态", "数据状态", "上传状态"]
 OPTIONAL = {"备注", "提交人", "提交时间"}
 OPTIONS = {
@@ -62,18 +62,6 @@ def parse_time(text: str) -> datetime | None:
 def show_time(text: str) -> str:
     moment = parse_time(text)
     return moment.strftime("%Y-%m-%d %H:%M") if moment else ""
-
-
-def deadline(ended: str, cutoff: str) -> str:
-    """提交截止：运行结束当天的截止时间；已经过了就顺延到第二天。"""
-    moment = parse_time(ended)
-    if not moment:
-        return ""
-    hour, minute = (int(v) for v in cutoff.split(":"))
-    limit = moment.replace(hour=hour, minute=minute, second=0)
-    if moment > limit:
-        limit += timedelta(days=1)
-    return limit.strftime("%Y-%m-%d %H:%M")
 
 
 def canonical_field(name: str, value):
@@ -142,7 +130,6 @@ def build_row(root: Path, task_dir: Path, cfg: dict, *, delivery_manifest: dict 
         "任务编号": record["task_id"], "批次": record.get("batch") or task_dir.parent.name,
         "底座仓库": record.get("repo_id", ""), "任务仓库": record.get("task_repo_full") or record.get("task_repo", ""),
         "运行开始": show_time(run.get("started_at", "")), "运行结束": show_time(run.get("ended_at", "")),
-        "提交截止": deadline(run.get("ended_at", ""), cfg["daily_cutoff"]),
         "尝试次数": run.get("attempts", len(attempts) or ""), "证据路径": str(rel / "evidence"),
         "闸门状态": "通过", "抽检状态": spot.get("state", "未抽检"), "上传状态": "未提交",
     }

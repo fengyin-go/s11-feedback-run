@@ -18,7 +18,7 @@ from pathlib import Path
 from unittest import mock
 
 from fixtures import BATCH
-from test_record_facts import GOOD, FactsCase
+from test_record_facts import GOOD, SID, FactsCase
 
 import fbrlib as lib
 import fbr_facts
@@ -32,14 +32,16 @@ P_LONG = ("python3 -m clipcut pack fixtures/long.mp4 --segment 10", 1,
 
 # 两份说的是同一件事、用词不同的正文，给批内查重用
 TEXT_A = (
-    "模型先读了 src/clipcut/packer.py，第 2 步改了它，第 3 步跑 make test 是通过的，"
-    "但第 4 步又改了一次 packer.py，之后没有再跑测试。"
+    "模型先读了 src/clipcut/packer.py，并在第 2 步改了它。"
+    "make test 在第 3 步通过。"
+    "随后第 4 步又改了一次 packer.py，之后没有再跑测试。"
     "实际执行 pack fixtures/short.mp4 --segment 10 能切出 6 个分片，--segment 0 会打印 error 并以退出码 2 结束。"
     "超过一小时的输入没有做：拿 fixtures/long.mp4 去跑，直接抛出 RuntimeError: input longer than 3600s is not supported，"
     "退出码 1，packer.py 里对应的位置只留了一行 TODO，长素材完全打不了包。"
     "另外最后的回答里说新增了 docs/usage.md，产物里并没有这个文件，照着回答去找用法说明会扑空。")
 TEXT_B = (
-    "模型读完 src/clipcut/packer.py 就动手改，第 3 步的 make test 通过，"
+    "模型先查看 src/clipcut/packer.py，再动手改。"
+    "第 3 步运行 make test 时通过。"
     "可第 4 步再次修改 packer.py 以后没有重新验证。"
     "用 fixtures/short.mp4 加 --segment 10 试过，拿到 6 个分片；--segment 0 被拒绝，返回码是 2。"
     "长时长这一项落空了：fixtures/long.mp4 一跑就是 RuntimeError: input longer than 3600s is not supported，"
@@ -47,9 +49,9 @@ TEXT_B = (
     "收尾的说明还提到 docs/usage.md 这份文档，仓库里找不到它，按说明去查用法的人拿不到任何东西。")
 PARTS = {
     TEXT_A: {"gap": "超过一小时的输入没有做", "claim": "最后的回答里说新增了 docs/usage.md，产物里并没有这个文件",
-             "process": [("第 3 步跑 make test 是通过的", [3]), ("第 4 步又改了一次 packer.py，之后没有再跑测试", [4])]},
+             "process": [("make test 在第 3 步通过", [3]), ("随后第 4 步又改了一次 packer.py，之后没有再跑测试", [4])]},
     TEXT_B: {"gap": "长时长这一项落空了", "claim": "收尾的说明还提到 docs/usage.md 这份文档，仓库里找不到它",
-             "process": [("第 3 步的 make test 通过", [3]), ("第 4 步再次修改 packer.py 以后没有重新验证", [4])]},
+             "process": [("第 3 步运行 make test 时通过", [3]), ("可第 4 步再次修改 packer.py 以后没有重新验证", [4])]},
 }
 
 
@@ -71,6 +73,7 @@ def audit() -> dict:
 
 def feedback(text: str = TEXT_A, score: int = 3) -> dict:
     parts = PARTS[text]
+    process = [{"sentence": sentence, "steps": steps} for sentence, steps in parts["process"]]
     return copy.deepcopy({
         "score": score, "feedback": text, "note": "",
         "results": [{"sentence": "--segment 0 会打印 error 并以退出码 2 结束" if text == TEXT_A else "--segment 0 被拒绝，返回码是 2",
@@ -90,16 +93,27 @@ def feedback(text: str = TEXT_A, score: int = 3) -> dict:
             {"sentence": parts["claim"], "trigger": "模型收尾时的回答", "behavior": "声称新增了并不存在的文档",
              "impact": "照着回答去找用法说明会扑空", "anchors": [{"type": "missing", "path": "docs/usage.md"}]},
         ],
-        "process": [{"sentence": sentence, "steps": steps} for sentence, steps in parts["process"]],
+        "process": process,
+        "process_audit": [{"sentence": item["sentence"], "subject": "model", "verdict": "supported",
+                           "checks": {"full_trace": True, "baseline": True, "timeline": True,
+                                      "source_boundary": True, "scope": True},
+                           "note": "已回查对应轨迹步骤、基线行为及后续最终状态"} for item in process],
     })
 
 
-def mock_claim_reviews(doc):
+def mock_claim_reviews(doc, trace_source: str | None = None, trace_excerpt: str | None = None):
     """仅模拟模型协议，不代表夹具正文已经过真实语义审核。"""
-    return [{"sentence": sentence, "assertions": ["离线模拟事实断言"], "verdict": "supported",
-             "reason": "离线模拟模型独立复核的具体依据", "later_check": "离线模拟后续修正与最终状态检查",
-             "sources": [{"path": "task.json", "excerpt": '"task_id"'}]}
-            for sentence in fbr_quality.public_units(doc["feedback"])]
+    process = {item["sentence"] for item in doc.get("process", []) if isinstance(item, dict)}
+    trace_source = trace_source or f"trace/projects/-workspace/{SID}.jsonl"
+    trace_excerpt = trace_excerpt or '"type": "tool_use"'
+    rows = []
+    for sentence in fbr_quality.public_units(doc["feedback"]):
+        source = ({"path": trace_source, "excerpt": trace_excerpt}
+                  if sentence in process else {"path": "task.json", "excerpt": '"task_id"'})
+        rows.append({"sentence": sentence, "assertions": ["离线模拟事实断言"], "verdict": "supported",
+                     "reason": "离线模拟模型独立复核的具体依据", "later_check": "离线模拟后续修正与最终状态检查",
+                     "sources": [source]})
+    return rows
 
 
 def run_main(module, *argv: str) -> tuple[int, str, str]:
@@ -177,8 +191,12 @@ class FlowCase(FactsCase):
             "policy_sha": fbr_quality.policy_sha(),
         }
         lib.save_json(task_dir / "review/model-review.json", receipt)
+        trace_source = paths[0].relative_to(task_dir).as_posix()
+        trace_excerpt = paths[0].read_text().splitlines()[0]
         lib.save_json(task_dir / "review/quality.json", {**receipt, "version": fbr_quality.VERSION,
-            "state": "accepted", "claim_reviews": mock_claim_reviews(lib.load_json(task_dir / "review/feedback.json")), "checks": [{"id": name, "passed": True,
+            "state": "accepted", "claim_reviews": mock_claim_reviews(
+                lib.load_json(task_dir / "review/feedback.json"), trace_source, trace_excerpt
+            ), "checks": [{"id": name, "passed": True,
                 "reason": "离线夹具已核对当前证据及评价结构"} for name in fbr_quality.CHECKS]})
 
     def written(self, number: int = 1, text: str = TEXT_A, score: int = 3) -> Path:

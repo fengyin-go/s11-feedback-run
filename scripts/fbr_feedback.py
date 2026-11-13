@@ -47,6 +47,10 @@ FEEDBACK_TEMPLATE = {
     "issues": [{"sentence": "正文里的原句", "trigger": "在哪一步、什么条件下出的问题", "behavior": "模型实际做了什么",
                 "impact": "对使用的人意味着什么", "anchors": [{"type": "req", "id": "R2"}, {"type": "step", "step": 31}]}],
     "process": [{"sentence": "正文里讲过程的原句", "steps": [12, 13]}],
+    "process_audit": [{"sentence": "与 process 完全一致的过程句", "subject": "model", "verdict": "supported",
+                       "checks": {"full_trace": True, "baseline": True, "timeline": True,
+                                  "source_boundary": True, "scope": True},
+                       "note": "说明已回查哪些原始步骤、基线及后续最终状态"}],
     "note": "",
 }
 ANCHOR_HELP = """锚点写法（每个都会被核对，对不上就过不了闸门）：

@@ -29,6 +29,7 @@ with patch.object(subprocess,'Popen',side_effect=local_only):
 fbr_record.to_mp4(out/'raw.webm',out/'recording.mp4',40,1280,720)
 video=fbr_record.probe_mp4(out/'recording.mp4')
 assert metadata['startup_ready'] and metadata['page_segment'] and not metadata['page_errors'],metadata
+assert steps[0]['input_recorded'] and metadata['command_input_seconds'] > 0, (steps, metadata)
 assert all(s['rc']==0 for s in steps[1:]),steps
 assert len({s['url'] for s in steps[1:]}) == 3,steps
 assert [s['pause_ms'] for s in steps[1:] if s['cmd'].startswith('expect_text')] == [1500,1500,1500],steps
@@ -44,5 +45,6 @@ terminal_steps=fbr_record.render([{'cmd': "printf '终端录制验证\\n'", 'sho
 fbr_record.to_mp4(terminal/'raw.webm',terminal/'recording.mp4',15,1280,720)
 terminal_video=fbr_record.probe_mp4(terminal/'recording.mp4')
 assert terminal_steps[0]['rc']==0 and not terminal_steps[0]['cut']
+assert terminal_steps[0]['input_recorded'] and terminal_steps[0]['input_seconds'] > 0, terminal_steps
 assert terminal_video['width']==1280 and terminal_video['height']==720 and terminal_video['duration']>0
 print(json.dumps({'terminal_directory':str(terminal),'video':terminal_video},ensure_ascii=False))

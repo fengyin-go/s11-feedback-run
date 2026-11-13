@@ -11,8 +11,8 @@ import fbrlib as lib
 import fbr_gate as gate
 
 GATE = copy.deepcopy(lib.DEFAULTS["feedback_gate"])
-S1 = ("模型先读了 src/clipcut/packer.py 和现有测试，再把切分逻辑拆到 src/clipcut/segment.py，"
-      "第 4 步跑 make test 时有一条用例没过，改完索引计算后第 6 步重跑，14 条全部通过。")
+S1 = ("模型先读了 src/clipcut/packer.py 和现有测试，再把切分逻辑拆到 src/clipcut/segment.py。"
+      "第 4 步跑 make test 时有一条用例没过。改完索引计算后第 6 步重跑，14 条全部通过。")
 S1_PASS = "模型先读现有实现和测试，再写分片逻辑，随后运行完整测试，14 条全部通过。"
 S2 = ("实际执行 pack fixtures/short.mp4 --segment 10，输出目录里有 3 个分片和 index.json，清单里的条目数和分片数一致；"
       "拿 3700 秒的长输入跑了一遍，生成 370 个分片，没有报错。")
@@ -113,10 +113,10 @@ def audit(score: int = 4) -> dict:
 
 def feedback(score: int = 4) -> dict:
     doc = {"score": score, "feedback": TEXT4 if score < 5 else TEXT5, "issues": [], "note": "",
-           "process": [{"sentence": "模型先读现有实现和测试，再写分片逻辑，随后运行完整测试，14 条全部通过。",
+           "process": [{"sentence": "模型先读现有实现和测试，再写分片逻辑，随后运行完整测试，14 条全部通过",
                         "steps": [1, 2, 3, 6]}] if score == 5 else
                       [{"sentence": "第 4 步跑 make test 时有一条用例没过", "steps": [4]},
-                       {"sentence": "改完索引计算后第 6 步重跑", "steps": [5, 6]}]}
+                       {"sentence": "改完索引计算后第 6 步重跑，14 条全部通过", "steps": [5, 6]}]}
     if score < 5:
         doc["issues"] = [{
             "sentence": "--segment abc 这种非数字参数直接抛出 ValueError 的调用栈",
@@ -424,6 +424,12 @@ class Text(Case):
         ):
             self.has(self.check(TEXT4 + extra)[0], label)
 
+    def test_empty_completeness_phrase_is_rejected(self):
+        self.has(
+            self.check(TEXT4 + "未发现其他明确未完成功能。")[0],
+            "空泛完成度句",
+        )
+
     def test_requires_model_process(self):
         self.has(self.check(S2 + S3 + S4)[0], "正文缺少模型实现或验证过程的具体行为句")
 
@@ -520,6 +526,10 @@ class Feedback(Case):
         doc = feedback(4)
         doc["process"][0]["sentence"] = "跑测试时有用例没过"
         self.has(self.check(doc)[0], "第 1 个过程句：sentence 要是正文里的原句")
+        doc = feedback(4)
+        doc["process"][0]["sentence"] = "第 4 步跑 make test 时有一条用例没过；改完索引计算后第 6 步重跑"
+        doc["feedback"] = TEXT4 + doc["process"][0]["sentence"] + "。"
+        self.has(self.check(doc)[0], "不能跨分号、句号或换行")
         doc = feedback(4)
         doc["process"][1]["steps"] = []
         self.has(self.check(doc)[0], "第 2 个过程句：要写它对应轨迹里的哪几步（steps）")

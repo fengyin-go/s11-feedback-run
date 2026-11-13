@@ -316,7 +316,7 @@ def prepare_task_agent(task: Path, *, allow_platform_repair: bool = False) -> di
 
 @lib.task_locked
 def finalize(task: Path, candidate: dict, verification: dict, *, publish=True,
-             allow_platform_repair: bool = False) -> dict:
+             allow_platform_repair: bool = False, defer_delivery: bool = False) -> dict:
     """Deterministic validation only: never load credentials or call an external model."""
     lib.require_stage(task, 'facts')
     work = lib.load_json(task/'review/task-agent-work.json', default={})
@@ -371,13 +371,22 @@ def finalize(task: Path, candidate: dict, verification: dict, *, publish=True,
     (task/'review/probe-requests.json').unlink(missing_ok=True)
     # A successful candidate is immediately gated and persisted to the local workbook.
     import fbr_feedback
-    import fbr_sheet
     root = lib.find_root(str(task.parents[2]))
     cfg = lib.settings(root)
     rows, _ = fbr_feedback.gate_batch(root, task.parent.name, cfg, task.name)
-    fbr_sheet.write_sheet(root, task.parent.name, cfg)
     row = next(r for r in rows if r['task_id'] == task.name)
     if row['state'] == 'ok':
+        if defer_delivery:
+            history_path = task/'review/delivery-repair.json'
+            history = lib.load_json(history_path, default={'attempts': []})
+            history['state'] = 'passed'
+            lib.save_json(history_path, history)
+            lib.set_stage(task, 'feedback', 'ok', score=feedback.get('score'),
+                          feedback_sha=file_sha(task/'review/feedback.json'))
+            return {'task_id': task.name, 'state': 'ok',
+                    'detail': '已复核并过闸门；交付表和导出延后统一生成'}
+        import fbr_sheet
+        fbr_sheet.write_sheet(root, task.parent.name, cfg)
         import argparse, threading, fbr_flow
         options = argparse.Namespace(batch=task.parent.name, publish=publish, auto_submit=False, delivery_lock=threading.Lock())
         return fbr_flow.finish_review(task, root, cfg, options)
@@ -399,6 +408,7 @@ def main() -> int:
     subs.choices['finalize'].add_argument('--candidate', required=True)
     subs.choices['finalize'].add_argument('--verification', required=True)
     subs.choices['finalize'].add_argument('--no-publish', action='store_true')
+    subs.choices['finalize'].add_argument('--defer-delivery', action='store_true')
     subs.choices['prepare'].add_argument('--platform-repair', action='store_true')
     subs.choices['review'].add_argument('--platform-repair', action='store_true')
     subs.choices['finalize'].add_argument('--platform-repair', action='store_true')
@@ -427,7 +437,8 @@ def main() -> int:
             else:
                 result = finalize(task, lib.load_json(Path(args.candidate)), lib.load_json(Path(args.verification)),
                                   publish=not args.no_publish,
-                                  allow_platform_repair=args.platform_repair)
+                                  allow_platform_repair=args.platform_repair,
+                                  defer_delivery=args.defer_delivery)
         print(json.dumps(result, ensure_ascii=False))
         return 0 if result['state'] != 'repairing' else 2
     except (lib.FbrError, OSError) as exc:

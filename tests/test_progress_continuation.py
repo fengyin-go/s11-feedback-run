@@ -56,10 +56,39 @@ class ProgressContinuation(unittest.TestCase):
   with TemporaryDirectory() as d:
    task=Path(d);(task/'run').mkdir()
    lib.save_json(task/'run/current.json',{'state':'running','request_id':'same-original-request'})
-   cfg=copy.deepcopy(lib.DEFAULTS);cfg['_deadline']=time.time()-1
+   cfg=copy.deepcopy(lib.DEFAULTS);cfg['_deadline']=time.time()-1;cfg['image_id']='sha256:'+'a'*64
    with patch.object(lib,'load_task',return_value={'task_id':task.name}),patch.object(fbr_run,'bound_key',return_value='fake'),patch.object(fbr_run,'recover_one',return_value={'state':'running','detail':'same worker'}) as recover:
     self.assertEqual(fbr_run.run_one(task,cfg)['state'],'running')
     recover.assert_called_once_with(task,cfg)
+
+ def test_prepared_container_can_resume_after_admission_deadline(self):
+  import fbr_run
+  with TemporaryDirectory() as d:
+   task=Path(d);(task/'run').mkdir()
+   (task/'run/prompt.txt').write_text('test prompt',encoding='utf-8')
+   lib.save_json(task/'run/current.json',{'state':'starting','attempt':2,'container_id':'same-container'})
+   cfg=copy.deepcopy(lib.DEFAULTS);cfg['_deadline']=time.time()-1;cfg['image_id']='sha256:'+'a'*64
+   record={'task_id':task.name,'prompt':'test prompt','initial_commit':'a'*40,'task_repo_full':'owner/repo','image':'test-image'}
+   def timed_stream(command, *, stdin_text, stdout_path, stderr_path, timeout):
+    Path(stdout_path).write_text('',encoding='utf-8')
+    Path(stderr_path).write_text('',encoding='utf-8')
+    return 124,True
+   with patch.object(lib,'load_task',return_value=record),patch.object(fbr_run,'bound_key',return_value='fake'),patch.object(fbr_run,'recover_one',return_value={'state':'prepared','detail':'same container'}),patch.object(fbr_run,'ready_problems',return_value=[]),patch.object(fbr_run,'use_legacy_progress_recovery',return_value=True),patch.object(fbr_run,'run_command') as create:
+    create.return_value=Mock(returncode=0,stdout='cid')
+    with patch.object(lib,'save_git_config'),patch.object(lib,'open_permissions'),patch.object(lib,'run_stream',side_effect=timed_stream),patch.object(fbr_run,'code_changes',return_value=[]),patch.object(fbr_run,'archive_attempt'):
+     row=fbr_run.run_one(task,cfg)
+   self.assertIn(row['state'],('running','deferred'))
+
+ def test_only_resumable_tasks_bypass_batch_deadline(self):
+  import fbr_run
+  with TemporaryDirectory() as d:
+   resumable=Path(d)/'resumable';(resumable/'run').mkdir(parents=True)
+   lib.save_json(resumable/'run/current.json',{'state':'starting'})
+   fresh=Path(d)/'fresh';(fresh/'run').mkdir(parents=True)
+   self.assertTrue(fbr_run.all_tasks_resumable([resumable]))
+   self.assertFalse(fbr_run.all_tasks_resumable([resumable,fresh]))
+   self.assertFalse(fbr_run.all_tasks_resumable([]))
+
  def test_legacy_explicit_fixed_guard_still_enforced(self):
   with TemporaryDirectory() as d:
    p=Path(d);q=self.request(p,'import time;time.sleep(10)');q['progress_policy']=None

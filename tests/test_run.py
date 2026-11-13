@@ -286,7 +286,8 @@ class CommandLine(DockerCase):
         out, err = io.StringIO(), io.StringIO()
         argv = ["fbr_run.py", "--root", str(self.root), *args]
         with mock.patch.object(sys, "argv", argv), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err), \
-                mock.patch.object(fbr_run.importlib.util, "find_spec", lambda name: object()):
+                mock.patch.object(fbr_run.importlib.util, "find_spec", lambda name: object()), \
+                mock.patch.object(fbr_run.lib, "active_github_account", return_value="selftest"):
             code = fbr_run.main()
         return code, out.getvalue(), err.getvalue()
 

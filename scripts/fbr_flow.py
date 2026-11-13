@@ -143,7 +143,7 @@ def finish_review(task, root, cfg, options):
         import fbr_snapshot
         for attempt in range(1,4):
             try:
-                checked(fbr_snapshot.push_one(fbr_snapshot.Hub(cfg['github_owner']),task,cfg))
+                checked(fbr_snapshot.push_one(fbr_snapshot.Hub(),task,cfg))
                 break
             except (lib.FbrError,OSError) as exc:
                 history['attempts'].append({'at':lib.now_iso(),'stage':'publish','attempt':attempt,'error':str(exc)})
@@ -370,6 +370,8 @@ def main():
     args = parser.parse_args()
     try:
         root = lib.find_root(args.root)
+        if args.execute:
+            lib.active_github_account()
         directory = home(root, args.batch)
         if args.command == 'status' or not args.execute:
             result = {'state': 'dry' if args.command != 'status' else 'status',

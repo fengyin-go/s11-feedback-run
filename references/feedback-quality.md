@@ -4,7 +4,7 @@ fbr_reviewer.py review 仅通过 reviewer.env 分析轨迹并返回 needs_task_a
 
 ## feedback.json 的内部字段
 
-现有 score、feedback、issues、process、note 保留；新增三项仅供核对，不进入平台或结果表正文。
+现有 score、feedback、issues、process、note 保留；新增三项及 `process_audit` 仅供核对，不进入平台或结果表正文。
 
 - results：至少一条 {sentence, requirement_ids, anchors}。sentence 是正文中说明最终行为的连续原文，requirement_ids 指向真实需求；anchors 至少含产物文件、缺失文件、运行日志、probe、演示或失败用例证据。不能只填需求编号或过程步骤。
 - score_basis：{category, delivered, remaining, why_this_score, lowest_supported_score, lower_score_rejected, anchors}。category 为 delivery_issue、verification_gap、process_issue 或 complete；process_issue 只用于 4 分，表示最终交付没有已证实功能缺口，但模型过程出现真实错误验证、错判、实现返工或关键竞争未正确复核，因此不满足 5 分的一次性完美跑通。其余字段分别解释实际完成部分、真实残余问题或验证边界、为何处于该档。lowest_supported_score 必须等于 score；lower_score_rejected 至少 8 字，解释为什么不能更低（1 分说明已最低）；anchors 必须真实有效。确证前提下选择最低合理档位。
@@ -18,13 +18,15 @@ source 仅用以下一种：{"kind":"trace","step":6}、{"kind":"probe","id":"P1
 
 process 的 steps 仍指向真实工具步骤。没有任何工具步骤的特殊会话，允许 {sentence, steps:[], source:"conversation"}，独立复核须回查原始对话；有步骤时不得使用此例外。issues 只写真实功能/交付问题，不用未验证冒充缺陷。唯一限制是验证不足的 4 分可留空 issues，但须通过 verification_gap 条件及独立复核。
 
+process_audit 必须与 process 等长、同序、同句，每项为 {sentence, subject:"model", verdict:"supported", checks:{full_trace:true, baseline:true, timeline:true, source_boundary:true, scope:true}, note}。五项分别核对完整会话、初始基线、后续时间线、模型轨迹与验收证据的边界，以及“只/仅/从未/没有”等范围表述。过程句出现 probe/验收侧、没有浏览器轨迹却写模型点击页面、或把基线已有行为归给模型时，闸门拒绝。
+
 ## 独立语义复核输出
 
 复核返回 {checks:[{id,passed,reason}], claim_reviews:[...]}，七个 id 必须各出现一次，passed 是布尔值，reason 给出本题具体证据或需修正的原句，不接受只有符合要求。
 
 | id | 核对内容 |
 | --- | --- |
-| result_and_process | 结果段先对照提示词说明哪些明示功能已完成、哪些未完成或仍有缺口；全部做到时要明确写未发现明确未完成功能。过程选择能说明结果或验证可信度，最多 3 句，只保留最有解释力的真实事件。存在首测失败、错误断言、并发校验写错、报错、返工或实现被推翻时，必须写清模型最初做了什么、问题为何出现、后来如何修正以及最终结果；只写未覆盖、未验证或末轮通过不算过程分析。全文“模型”最多出现一次，第一次点明主体后，后续动作改用“它”或直接省略主语。5 分正文不得出现上述真实过程问题；出现时最高 4 分，并用 process_issue 说明最终交付可用但过程不是一次性完美跑通 |
+| result_and_process | 结果段先对照提示词说明哪些明示功能已完成、哪些未完成或仍有缺口；全部做到时直接陈述实际完成的能力，不写“未发现其他明确未完成功能”这类空泛完成度句。过程选择能说明结果或验证可信度，最多 3 句，只保留最有解释力的真实事件。存在首测失败、错误断言、并发校验写错、报错、返工或实现被推翻时，必须写清模型最初做了什么、问题为何出现、后来如何修正以及最终结果；只写未覆盖、未验证或末轮通过不算过程分析。全文“模型”最多出现一次，第一次点明主体后，后续动作改用“它”或直接省略主语。5 分正文不得出现上述真实过程问题；出现时最高 4 分，并用 process_issue 说明最终交付可用但过程不是一次性完美跑通 |
 | task_specific_voice | 事实决定句序，读起来是具体判断，没有空泛赞美、装饰细节或机械褒贬配额 |
 | test_relevance | 每处测试描述对应本题行为，执行来源、成功状态、计数及结论范围一致 |
 | score_alignment | 分数、问题严重度、剩余工作一致，既拦无证据压分，也拦有证据却给高；纠正的过程失误不自动扣分；验证不足不伪装成缺陷 |
