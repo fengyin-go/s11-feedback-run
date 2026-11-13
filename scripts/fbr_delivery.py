@@ -66,8 +66,6 @@ def safe_file(base: Path, path: Path) -> bool:
 
 def current_feedback(task_dir: Path) -> tuple[bool, str]:
     states = lib.load_state(task_dir)["stages"]
-    if any(info.get("key_leak") for info in states.values()):
-        return False, "已检测到网关 key 泄露"
     info = states.get("feedback", {})
     if info.get("state") != "ok":
         return False, "Feedback 还没过闸门"
@@ -203,6 +201,7 @@ def export_batch(root: Path, batch_id: str, cfg: dict | None = None) -> dict:
                 dest.mkdir()
                 files = _source_files(source, feedback_sha)
                 inputs = {str(p.relative_to(source)): digest(p) for p in files}
+                gateway_key_files = []
                 for name in ("state.json", "task.json", "review/snapshot.json", "run/attempts.json"):
                     path = source / name
                     if safe_file(source, path):
@@ -210,7 +209,7 @@ def export_batch(root: Path, batch_id: str, cfg: dict | None = None) -> dict:
                 entries = []
                 for path in files:
                     if secret and lib.key_occurrences(path, secret):
-                        raise lib.KeyLeakError("交付白名单文件含网关 key，原件保留，停止导出")
+                        gateway_key_files.append(path.relative_to(source).as_posix())
                     relative = path.relative_to(source)
                     copied = dest / relative
                     copied.parent.mkdir(parents=True, exist_ok=True)
@@ -222,12 +221,11 @@ def export_batch(root: Path, batch_id: str, cfg: dict | None = None) -> dict:
                                       if k in ("state", "repo_url", "initial_snapshot")}
                 summary_path = dest / "task-summary.json"
                 lib.save_json(summary_path, summary)
-                if secret and lib.key_occurrences(summary_path, secret):
-                    raise lib.KeyLeakError("交付任务摘要含网关 key，原件保留，停止导出")
                 entries.append({"path": (target / source.name / "task-summary.json").relative_to(root).as_posix(),
                                 "bytes": summary_path.stat().st_size, "sha256": digest(summary_path)})
                 tasks.append({"task_id": source.name, "feedback_sha": feedback_sha,
                               "source_digest": hashlib.sha256(json.dumps(inputs, sort_keys=True).encode()).hexdigest(),
+                              "api_key_files": gateway_key_files,
                               "files": entries})
             except (lib.FbrError, OSError) as exc:
                 if isinstance(exc, (lib.KeyLeakError, DeliveryBlocked)):

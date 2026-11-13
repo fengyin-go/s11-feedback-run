@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""逐题滚动生产、录屏、取证、独立评价和落表；默认演练；执行包含验收后发布，平台提交单独授权。"""
+"""逐题滚动生产到平台提交前；pre-submit 默认真跑并包含验收后发布，平台提交始终单独授权。"""
 from __future__ import annotations
 import argparse
 import concurrent.futures as futures
@@ -22,8 +22,6 @@ def home(root, batch):
 
 def phase(task):
     import fbr_delivery
-    if fbr_run.key_hold(task):
-        return 'blocked_key'
     current = lib.load_json(task / 'run/current.json', default={})
     if current.get('state') in ('starting', 'running', 'exited', 'continue_ready') and not lib.stage_ok(task, 'run'):
         return 'recover'
@@ -353,7 +351,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--root')
     subs = parser.add_subparsers(dest='command', required=True)
-    for command in ('run', 'resume', 'status', 'recover', 'pause', 'drain', 'watchdog'):
+    for command in ('run', 'pre-submit', 'resume', 'status', 'recover', 'pause', 'drain', 'watchdog'):
         p = subs.add_parser(command)
         p.add_argument('--batch', required=True)
         p.add_argument('--tasks')
@@ -369,6 +367,12 @@ def main():
         p.add_argument('--no-watchdog', action='store_true')
     args = parser.parse_args()
     try:
+        if args.command == 'pre-submit':
+            if args.auto_submit or args.confirm_submit:
+                raise lib.FbrError('pre-submit 只做到平台提交前，不自动提交平台')
+            args.execute = True
+            if args.publish is None:
+                args.publish = True
         root = lib.find_root(args.root)
         if args.execute:
             lib.active_github_account()
@@ -384,6 +388,8 @@ def main():
             result = [fbr_run.recover_one(t, lib.settings(root)) for t in lib.task_dirs(root, args.batch, args.tasks)]
         elif args.command == 'watchdog':
             result = watchdog(root, args)
+        elif args.command == 'pre-submit':
+            result = spawn(root, args) if args.detach else run_flow(root, args)
         else:
             if args.confirm != 'FLOW' or (args.auto_submit and args.confirm_submit != 'SUBMIT'):
                 raise lib.FbrError('执行含验收后快照发布，需 --confirm FLOW；平台提交另需 --confirm-submit SUBMIT')

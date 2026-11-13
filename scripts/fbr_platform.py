@@ -78,7 +78,7 @@ def _credentials_file(path: Path) -> dict:
     return {"username": username, "password": password}
 
 
-def load_credentials(account: str = "gonghao") -> dict:
+def load_credentials(account: str = "zouyonghong") -> dict:
     if not isinstance(account, str) or not re.fullmatch(r"[A-Za-z0-9_.-]+", account) or account in (".", ".."):
         raise PlatformError("平台账号名称格式不正确")
     directory = Path.home() / ".codex" / "coding-agent-satisfaction"
@@ -158,7 +158,7 @@ class _Multipart:
 
 
 class Client:
-    def __init__(self, account: str = "gonghao", *, timeout: float = 120):
+    def __init__(self, account: str = "zouyonghong", *, timeout: float = 120):
         if not isinstance(timeout, (int, float)) or isinstance(timeout, bool) or timeout <= 0:
             raise PlatformError("平台请求 timeout 必须是正数")
         self.account = account

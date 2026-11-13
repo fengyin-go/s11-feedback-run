@@ -141,7 +141,12 @@ def plan_from_row(root: Path, task_dir: Path, row: dict, manifest: dict) -> dict
         if actual["problems"] or any(actual.get(k) != ids.get(k) for k in
                                       ("session_id", "prompt_id", "user_turns", "continuations")):
             raise lib.FbrError("中断续写记录与原始轨迹不一致")
-    data["other_issues"] = fbr_trace.interruption_note(ids)
+    cfg = lib.settings(root)
+    api_key_read = fbr_trace.detect_api_key_read(task_dir, cfg)
+    expected_note = fbr_trace.run_note(ids, api_key_read=api_key_read)
+    data["other_issues"] = expected_note
+    if str(row.get("备注") or "") != expected_note:
+        raise lib.FbrError("备注与当前轨迹事实不一致，先重新生成结果表")
     if (not fbr_trace.valid_turn_count(ids) or data["session_id"] != ids.get("session_id")
             or data["turn_id"] != ids.get("prompt_id")):
         raise lib.FbrError("平台提交必须有真实单轮会话及匹配的 SessionID、PromptID")

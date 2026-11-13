@@ -8,7 +8,7 @@
 
 边界：
 - 一题一个新容器，容器名就是任务编号；不加 --rm，轨迹导出并核对通过后才 docker rm（不带 -f）。
-- key 只通过 --env-file 传入；输出或轨迹出现 key 时保留原件、保留容器并立即停止，不重跑。
+- key 只通过 --env-file 传入；输出或轨迹出现 key 时保留原始材料并记为“读取了 apikey”，允许交付。
 - 模型中断可在同一会话累计最多继续两次；工程异常和零代码改动归档重跑，含首次最多 max_attempts 次。
 - 重跑前把这次的轨迹和改动归档到 run/attempt-N/，导出失败就停下，不删容器。
 """
@@ -99,16 +99,6 @@ def container_exists(name: str) -> bool:
     return lib.run(["docker", "container", "inspect", "--format", "{{.State.Status}}", name], timeout=30).returncode == 0
 
 
-def key_hold(task_dir: Path) -> bool:
-    return any(info.get("key_leak") for info in lib.load_state(task_dir)["stages"].values())
-
-
-def halt_for_key(task_dir: Path, stage: str) -> dict:
-    detail = "检测到网关 key 泄露：保留原始输出、轨迹和容器，停止重跑与后续步骤，等待人工处理"
-    lib.set_stage(task_dir, stage, "failed", key_leak=True, problems=[detail])
-    return {"task_id": task_dir.name, "state": "failed", "detail": detail}
-
-
 def evidence_has_key(paths, secret: str) -> bool:
     return any(lib.key_occurrences(path, secret) for path in paths)
 
@@ -193,8 +183,6 @@ def bound_key(task_dir: Path, cfg: dict, *, start: bool = False) -> str:
 def ready_problems(task_dir: Path, record: dict, cfg: dict, *, prepared: bool = False) -> list[str]:
     workspace = task_dir / "workspace"
     problems = []
-    if key_hold(task_dir):
-        return ["已检测到网关 key 泄露，保留证据与容器，等待人工处理"]
     current = lib.load_json(task_dir / "run/current.json", default={})
     if current.get("state") in ("running", "starting") and not prepared:
         return ["存在未收口运行，先执行 recover；不在活跃工作区执行宿主机 Git"]
@@ -273,8 +261,6 @@ def archive_attempt(task_dir: Path, record: dict, number: int, secret: str = "")
         copied = lib.run(["docker", "cp", f"{name}:{lib.TRACE_SRC}", str(target / "projects")], timeout=300)
         if copied.returncode != 0:
             raise lib.FbrError(f"{name}：第 {number} 次运行的轨迹导出失败，容器先留着：{copied.stderr.strip()[:200]}")
-        if evidence_has_key(target.rglob("*"), secret):
-            raise lib.KeyLeakError("不算数的运行轨迹含网关 key，保留证据与容器，停止重跑")
         lib.run(["docker", "stop", name], timeout=60)
         removed = lib.run(["docker", "rm", name], timeout=60)
         if removed.returncode != 0:
@@ -343,8 +329,6 @@ def recover_one(task_dir: Path, cfg: dict) -> dict:
     current_path = task_dir / 'run/current.json'
     current = lib.load_json(current_path, default={})
     row = {'task_id': task_dir.name}
-    if key_hold(task_dir):
-        return {**row, 'state': 'blocked', 'detail': 'key 泄露任务不能自动恢复'}
     if lib.stage_ok(task_dir, 'run'):
         return {**row, 'state': 'ok', 'detail': '运行已收口，可继续 collect'}
     if current.get('state') not in ('running', 'exited', 'starting', 'continue_ready'):
@@ -402,8 +386,6 @@ def recover_one(task_dir: Path, cfg: dict) -> dict:
     if done.get('id') != current.get('request_id') or 'rc' not in done:
         return {**row, 'state': 'blocked', 'detail': 'worker 已退出但无匹配回执，保留容器和全部证据'}
     secret = bound_key(task_dir, cfg)
-    if evidence_has_key((p for p in (task_dir / 'run').rglob('*') if p.is_file()), secret):
-        return halt_for_key(task_dir, 'run')
     stdout, stderr = Path(current['stdout']), Path(current['stderr'])
     segment = fbr_trace.read_stream(stdout)
     tail = stderr.read_text(errors='replace')[-4000:]
@@ -476,8 +458,6 @@ def recover_one(task_dir: Path, cfg: dict) -> dict:
 def run_one(task_dir: Path, cfg: dict) -> dict:
     record = lib.load_task(task_dir)
     name = record["task_id"]
-    if key_hold(task_dir):
-        return {"task_id": name, "state": "blocked", "detail": "已检测到网关 key 泄露，等待人工处理"}
     if lib.stage_ok(task_dir, "run"):
         return {"task_id": name, "state": "skip", "detail": "已经跑过"}
     current = lib.load_json(task_dir / 'run/current.json', default={})
@@ -593,12 +573,6 @@ def run_one(task_dir: Path, cfg: dict) -> dict:
             lib.save_json(budget_path, budget)
             if timed_out:
                 lib.run(["docker", "kill", name], timeout=60)
-            if evidence_has_key((stdout, stderr), secret):
-                attempts.append({"n": number, "started_at": started, "ended_at": lib.now_iso(),
-                                 "rc": rc, "timed_out": timed_out, "continuations": continuations,
-                                 "verdict": "stop", "reason": "检测到网关 key 泄露"})
-                lib.save_json(run_dir / "attempts.json", attempts)
-                return halt_for_key(task_dir, "run")
             segment = fbr_trace.read_stream(stdout)
             tail = "\n".join(stderr.read_text(encoding="utf-8", errors="replace").splitlines()[-20:])
             import fbr_completion
@@ -627,14 +601,12 @@ def run_one(task_dir: Path, cfg: dict) -> dict:
                 lib.set_stage(task_dir, "run", "failed", problems=["模型中断，已达“继续”次数上限"],
                               continuations=continuations)
                 return {"task_id": name, "state": "failed", "detail": "模型中断，已达“继续”次数上限；保留容器与全部内容，不重跑刷结果"}
-            # 续写前先保存、扫描原始轨迹；不可带着已泄露的 key 继续。
+            # 续写前先保存原始轨迹；key 命中由收集阶段生成对外备注。
             exported = run_dir / f"interruption-{number}-{index}"
             exported.mkdir(exist_ok=True)
             copied = lib.run(["docker", "cp", f"{name}:{lib.TRACE_SRC}", str(exported / "projects")], timeout=300)
             if copied.returncode != 0:
                 raise lib.FbrError("中断轨迹导出失败，容器先留着，不发送继续")
-            if evidence_has_key(exported.rglob("*"), secret):
-                return halt_for_key(task_dir, "run")
             session_id = segment["session_id"]
             try:
                 uuid.UUID(session_id)
@@ -646,11 +618,6 @@ def run_one(task_dir: Path, cfg: dict) -> dict:
             current = lib.load_json(run_dir / "current.json")
             current['continuations'] = continuations
             lib.save_json(run_dir / "current.json", current)
-        if evidence_has_key((run_dir / item for item in ("stream.jsonl", "stderr.log")), secret):
-            attempts.append({"n": number, "started_at": started, "ended_at": lib.now_iso(), "rc": rc,
-                             "timed_out": timed_out, "verdict": "stop", "reason": "检测到网关 key 泄露"})
-            lib.save_json(run_dir / "attempts.json", attempts)
-            return halt_for_key(task_dir, "run")
         stream = fbr_trace.read_stream(run_dir / "stream.jsonl")
         verdict = decision  # 以最后一次执行判定，合并日志保留首轮和全部续写
         if verdict['verdict'] == 'accept':
@@ -700,10 +667,7 @@ def run_one(task_dir: Path, cfg: dict) -> dict:
                 gateway.event('auth')
             lib.set_stage(task_dir, "run", "failed", reason=verdict["reason"], problems=[verdict["detail"]])
             return {"task_id": name, "state": "failed", "detail": verdict["detail"] + "（容器没删）"}
-        try:
-            archive_attempt(task_dir, record, number, secret)
-        except lib.KeyLeakError:
-            return halt_for_key(task_dir, "run")
+        archive_attempt(task_dir, record, number, secret)
         assessment = fbr_retry.classify_attempt(attempts[-1])
         if gateway and assessment['category'] in ('throttle', 'infra'):
             gateway.event('limit' if runtime.LIMIT.search(tail) else 'soft' if runtime.SOFT.search(tail) else 'network')
@@ -725,8 +689,6 @@ def run_one(task_dir: Path, cfg: dict) -> dict:
 def collect_one(task_dir: Path, cfg: dict, keep_container: bool = False) -> dict:
     record = lib.load_task(task_dir)
     name = record["task_id"]
-    if key_hold(task_dir):
-        return {"task_id": name, "state": "blocked", "detail": "已检测到网关 key 泄露，等待人工处理"}
     if lib.stage_ok(task_dir, "collect"):
         return {"task_id": name, "state": "skip", "detail": "已经收集过"}
     run_info = lib.require_stage(task_dir, "run")
@@ -740,8 +702,7 @@ def collect_one(task_dir: Path, cfg: dict, keep_container: bool = False) -> dict
     trace_dir.mkdir(exist_ok=True)
     existing = list(target.rglob("*")) if target.is_dir() else []
     existing.extend(task_dir / "run" / item for item in ("stream.jsonl", "stderr.log"))
-    if evidence_has_key(existing, secret):
-        return halt_for_key(task_dir, "collect")
+    api_key_read = evidence_has_key(existing, secret)
     if container_exists(name):
         if target.exists():
             shutil.rmtree(target)   # 上次导出的半成品；原件还在容器里
@@ -753,8 +714,7 @@ def collect_one(task_dir: Path, cfg: dict, keep_container: bool = False) -> dict
     elif not target.is_dir():
         lib.set_stage(task_dir, "collect", "failed", problems=["容器不在了，本地也没有导出的轨迹"])
         return {"task_id": name, "state": "failed", "detail": "容器不在了，本地也没有导出的轨迹"}
-    if evidence_has_key(target.rglob("*"), secret):
-        return halt_for_key(task_dir, "collect")
+    api_key_read = api_key_read or evidence_has_key(target.rglob("*"), secret)
     ids = fbr_trace.read_ids(target, record["prompt"], run_info.get("continuations", []))
     problems = list(ids["problems"])
     if run_info.get("session_id") and ids["session_id"] and run_info["session_id"] != ids["session_id"]:
@@ -767,14 +727,15 @@ def collect_one(task_dir: Path, cfg: dict, keep_container: bool = False) -> dict
     lib.save_json(trace_dir / "ids.json", {
         "session_id": ids["session_id"], "prompt_id": ids["prompt_id"], "session_file": ids["session_file"],
         "user_turns": ids["user_turns"], "rows": ids["rows"], "cli_version": ids["cli_version"],
-        "continuations": ids["continuations"], "key_detected": False, "exported_at": lib.now_iso()})
+        "continuations": ids["continuations"], "api_key_read": api_key_read,
+        "key_detected": api_key_read, "exported_at": lib.now_iso()})
     removed = False
     if not keep_container and container_exists(name):
         lib.run(["docker", "stop", name], timeout=60)
         result = lib.run(["docker", "rm", name], timeout=60)
         removed = result.returncode == 0
     lib.set_stage(task_dir, "collect", "ok", session_id=ids["session_id"], prompt_id=ids["prompt_id"],
-                  container_removed=removed)
+                  container_removed=removed, api_key_read=api_key_read)
     return {"task_id": name, "state": "ok", "detail": f"SessionID {ids['session_id']}"}
 
 

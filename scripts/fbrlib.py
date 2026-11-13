@@ -434,8 +434,6 @@ def stage_ok(task_dir: Path, stage: str) -> bool:
 
 def require_stage(task_dir: Path, stage: str) -> dict:
     stages = load_state(task_dir)["stages"]
-    if any(info.get("key_leak") for info in stages.values()):
-        raise FbrError(f"{Path(task_dir).name}：已检测到网关 key 泄露，保留证据与容器，等待人工处理")
     info = stages.get(stage, {})
     if info.get("state") != "ok":
         raise FbrError(f"{Path(task_dir).name}：{stage} 阶段还没通过，不能往下做")

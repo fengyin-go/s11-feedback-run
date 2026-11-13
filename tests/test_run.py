@@ -14,6 +14,7 @@ from fixtures import (BATCH, IMAGE, KEY, PROMPT, TOOLS, FakeDocker, Sandbox, sh,
 
 import fbrlib as lib
 import fbr_run
+import fbr_trace
 
 SID = "aaaaaaaa-0000-4000-8000-000000000001"
 
@@ -260,12 +261,14 @@ class Collect(DockerCase):
                 self.assertIn("s11-000001", self.docker.containers)
                 self.assertFalse((task_dir / "trace" / "ids.json").exists())
 
-    def test_key_in_trace_stops_and_keeps_original(self):
+    def test_key_in_trace_marks_api_key_read_and_allows_delivery(self):
         task_dir = self.ran(answer=f"完成了，顺便打印了环境变量 {KEY}")
-        self.assertEqual(fbr_run.collect_one(task_dir, self.cfg)["state"], "failed")
-        self.assertFalse((task_dir / "trace" / "ids.json").exists())
+        self.assertEqual(fbr_run.collect_one(task_dir, self.cfg)["state"], "ok")
+        ids = lib.load_json(task_dir / "trace" / "ids.json")
+        self.assertTrue(ids["api_key_read"])
+        self.assertEqual(fbr_trace.run_note(ids), fbr_trace.API_KEY_NOTE)
         self.assertIn(KEY, next((task_dir / "trace/projects").rglob("*.jsonl")).read_text())
-        self.assertIn("s11-000001", self.docker.containers)
+        self.assertNotIn("s11-000001", self.docker.containers)
 
     def test_container_gone(self):
         task_dir = self.ran()

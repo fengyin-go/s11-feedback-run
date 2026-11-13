@@ -19,9 +19,12 @@ description: solo11（26.11 领域专项，单轮 pointwise）的运行侧：把
 
 ## 流程
 
-默认使用 [滚动调度与恢复](references/runtime-flow.md) 和 [缓存与并发](references/performance.md)：跑完一题就进入录屏、取证和独立评价，不等待整批跑题结束。下列命令均须加 `python3 <skill>/scripts/` 前缀。先演练；获得相应授权后才真跑、发布或提交。
+默认使用 [滚动调度与恢复](references/runtime-flow.md) 和 [缓存与并发](references/performance.md)：跑完一题就进入录屏、取证和独立评价，不等待整批跑题结束。下列命令均须加 `python3 <skill>/scripts/` 前缀。
+
+当用户说“运行所有提示词”“跑完这批任务”或同义指令时，默认模式是完成平台提交前的全部操作，不把“运行”理解成只做 R1。直接使用 `fbr_flow.py pre-submit --batch … --detach`，继续处理运行、收集、快照、录屏、取证、Feedback、闸门、导出、本地表和字段核查；该命令默认发布验收通过的 GitHub 产物快照，但不提交 SOLO2 平台。平台提交仍需用户另行明确授权。
 
 ```bash
+fbr_flow.py pre-submit --batch b1110-01 --detach
 fbr_flow.py run --batch b1110-01
 fbr_flow.py run --batch b1110-01 --execute --confirm FLOW --detach
 fbr_flow.py status --batch b1110-01
@@ -55,7 +58,7 @@ fbr_sheet.py --batch …                   回执有效时回填远端媒体、�
 
 数据调表、Feedback 或交付闸门未通过时，默认继续修复到能够通过，不以标记“不通过/blocked”结束可处理的问题。先按 [失败修复与复验](references/remediation.md) 定位来源，再修复字段、补齐实跑材料或由当前任务 AI 修改评价，重新跑相关闸门并立即刷新本地表。只有缺少必要授权、证据确实无法补齐、服务持续不可用或既有预算耗尽时才保留明确阻塞及下一步；其他题继续处理。通过来自事实与材料完整，不能降低标准、改被测代码、伪造证据或修改失败标记来实现。
 
-脚本默认演练。用户授权执行完整流水线后，默认包含验收通过后的 GitHub 产物快照推送；明确只做本地时使用 `--no-publish`。单独 `push` 仍使用 `--execute --confirm PUBLISH`；平台提交仍需单独授权并使用 `--execute --confirm SUBMIT`。平台演练会登录并读取账号、字段和历史记录；不上传附件、不建单。
+底层单阶段命令和 `run` 仍默认演练；`pre-submit` 是“运行所有任务”的默认入口，明确执行到平台提交前，不需要再次逐步确认。它默认包含验收通过后的 GitHub 产物快照推送；明确只做本地时使用 `--no-publish`。单独 `push` 仍使用 `--execute --confirm PUBLISH`；平台提交仍需单独授权并使用 `--execute --confirm SUBMIT`。平台演练会登录并读取账号、字段和历史记录；不上传附件、不建单。
 
 ## 1. 运行与收集
 
@@ -72,7 +75,7 @@ fbr_sheet.py --batch …                   回执有效时回填远端媒体、�
 - 模型自行中断优先用上述“继续”处理，达到上限仍中断就保留全部内容并停止，不靠重跑刷结果。有效模型责任尝试最多 3 次；网关限流、5xx 与基础设施故障单独计数，不消耗模型机会，基础设施最多 3 次、网关压力最多 8 次，另受已授权物理派发次数和预算约束。没有可恢复会话的无故中断归模型责任。正常结束且最终树有代码改动才算有效；改错仍是有效数据。零代码改动必须归档、恢复基线、重建容器重跑，连首次最多 3 次；仅文档、日志、缓存或改后还原不充数。跑得慢本身不是重跑理由。
 - 不算数的那次运行整份归档在 `run/attempt-N/`，工作区恢复到初始提交后再跑。
 - 轨迹导出并确认完整之后才停止、删除容器，不强删。有效轨迹为首轮题面加最多 2 次有中断记录的“继续”；其他追加输入、跨会话续写或 SessionID 对不上均判失败。评价综合首轮和所有续写的过程、回答及最终产物；填表题面、SessionID 与 TurnID/PromptID 仍取第一轮。
-- key 文件路径由 `_config/settings.json` 的 `key_file` 配置，默认 `/Users/fengyin/.codex/solo11/gateway.env`（其他机器为 `~/.codex/solo11/gateway.env`），权限 600、内容一行 `apikey=你的API_KEY`；只通过 `--env-file` 进容器。不要把它写进命令行、仓库、轨迹或任何输出；它只用于跑题，不用于写 Feedback。
+- key 文件路径由 `_config/settings.json` 的 `key_file` 配置，默认 `/Users/fengyin/.codex/solo11/gateway.env`（其他机器为 `~/.codex/solo11/gateway.env`），权限 600、内容一行 `apikey=你的API_KEY`；只通过 `--env-file` 进容器。不要主动把它写进命令行、settings、仓库或 Feedback。模型运行时如果在轨迹中读取或打印了网关 key，保留原始轨迹和证据，不脱敏、不阻断交付；`trace/ids.json` 记录 `api_key_read`，备注自动写“模型运行时读取了 apikey”。
 
 ```bash
 fbr_run.py preflight
@@ -124,7 +127,7 @@ fbr_record.py --batch b1110-01                       # --redo 重录
 1. `fbr_feedback.py card` 汇集题面、需求点、测试对比、演示结果、改动与轨迹索引。
 2. `fbr_reviewer.py review` 只分析全量主/子轨迹及获准续写，保存带原文出处、完整后续状态和调用回执的 `review/trace-analysis.json`，随后返回 `needs_task_agent` 检查点。轨迹配置未填写 `model` / `reasoning_effort` 时沿用 `gpt-6.1-sol` / `high`；不可用时只暂停这一阶段，不伪造分析。
 3. 当前任务 AI 读取分析报告、最终代码与真实实跑材料，判需求完成情况、评分并写 `audit` 和 `feedback`。代码已能确证的问题不重复跑服务；缺证据则用既有 probe 补齐后刷新 card 和检查点。5 分仍须至少两个不同的、题面未明说的有效边界 probe。
-4. 当前任务 AI 另做产物与文字复核轮，按 `public_units` 逐句拆出断言，核对原始连续摘录、后续修正、最终影响，以及七项语义要求，保存绑定候选和检查点的 verification。过程句还必须按 [模型过程归因审计](references/process-attribution-audit.md) 完成 `process_audit`：逐句确认主体是模型、基线行为没有被误归给模型、时间线覆盖后续修改、验收 probe/录屏没有混入模型动作，并对“只、仅、从未、收尾”等范围或时序表述扫描完整轨迹。不得将自报“通过”代替逐句证据，不得冒称另一个模型或独立审核人完成。细节见 [reviewer.md](references/reviewer.md) 和 [feedback-quality.md](references/feedback-quality.md)。
+4. 当前任务 AI 另做产物与文字复核轮，按 `public_units` 逐句拆出断言，核对原始连续摘录、后续修正、最终影响，以及七项语义要求，保存绑定候选和检查点的 verification。每个 `process` 句除真实 `steps` 外还必须写 `evidence`，逐条指定 `kind=tool`、step、`target/output/error/tool` 字段和原始连续摘录；没有工具步骤时用 `kind=assistant` 绑定真实助手文本。独立复核轮必须逐条引用同一摘录，不能只凭 step 号或生成侧摘要。过程句还必须按 [模型过程归因审计](references/process-attribution-audit.md) 完成 `process_audit`：逐句确认主体是模型、基线行为没有被误归给模型、时间线覆盖后续修改、验收 probe/录屏没有混入模型动作，并对“只、仅、从未、收尾”等范围或时序表述扫描完整轨迹。不得将自报“通过”代替逐句证据，不得冒称另一个模型或独立审核人完成。细节见 [reviewer.md](references/reviewer.md) 和 [feedback-quality.md](references/feedback-quality.md)。
 5. `fbr_reviewer.py finalize` 只做确定性校验，不读取 `reviewer.env` 或调用外部模型；通过后保存 `audit.json`、`feedback.json`、`model-review.json` 与 `quality.json`，执行门闸、刷新本地表并主动推送快照，再核查交付字段；明确本地模式时使用 `--no-publish`。失败返回具体错误，由当前任务 AI 继续修复、补证和复验；材料、规则或正文变化须重新核实，不给旧记录补盖新回执。
 
 ```bash
@@ -144,7 +147,7 @@ Feedback 正文提及被测 AI 时统一称为“模型”，不使用“助手�
 
 两条底线：
 
-- 每个问题句的锚点必须真实存在于证据里。文件要在产物或改动清单里，步骤号要在轨迹里，报错要是日志里的原文。
+- 每个问题句的锚点必须真实存在于证据里。文件要在产物或改动清单里，步骤号要在轨迹里，报错要是日志里的原文；过程句的每条 evidence 还必须落在所指定步骤的真实工具输入或输出中。
 - 不写没有发生过的事。没实跑过就不说跑过，没打开看过就不说看过；正文里不写验收人自己的动作。
 
 打分先看最终交付，再解释过程与结果的联系。在确凿证据支持的档位中尽可能取最低合理分；逐项说明为何不能再低，独立复核同时拦截无证据压分和有证据却偏高。不得以目标分布替代事实。已修正且无残余影响的过程失误不自动扣分；验证不足不等于功能失败。正文必须同时有结果和过程事实，实际存在的过程问题和产物问题都要覆盖，写清触发节点、实际行为、业务影响及具体文件、报错或未实现需求；不凭空补问题。
@@ -183,7 +186,7 @@ fbr_sheet.py --batch b1110-01                       # 确认回执后回填媒�
 - 交付前生成「必填字段核查」页和 `field-audit.json`，另有「字段修订核对」页展示全部题目的相关字段和来源，明确验收状态；逐题检查平台 18 个必填输入字段，缺失或未验收的字段阻止交付，不得猜值、填占位值或把本地提交链接当作已发布快照。平台 19 字段中仅备注可空；提交人/时间由平台自动产生，未提交保持空白，不以评价时间或 Git 身份替代。有效回执回读后采用实际账号和平台提交时间。
 - 操作系统使用平台枚举 `MacOS/Linux`；`Linux arm64` 等原始架构事实留在运行证据。子方向明确别名 `数据采集、爬虫与RPA` 映射为平台实际 `数据采集、爬虫与 RPA`，只处理已核实的等价值，未知枚举停止并核对实时 schema。
 
-本地“备注”和平台“其他问题”（`other_issues`）都只填写中断续写说明，由首轮及续写轨迹核对后自动生成。除此之外一律提交空字符串 `""`，返修也相同；重跑、历史改写、录屏和验收说明仅留内部证据，不能进入本地备注或平台其他问题。当前脚本不自动返修，另行获准返修时也必须遵守此字段规则。
+本地“备注”和平台“其他问题”（`other_issues`）只允许两类由原始轨迹自动生成的事实：中断续写说明，以及 `模型运行时读取了 apikey`。两类同时存在时用中文分号连接；其余时候一律提交空字符串 `""`，返修也相同。备注不从 `feedback.note`、重跑、历史改写、录屏或验收说明复制；当前脚本不自动返修，另行获准返修时也必须遵守此字段规则。
 
 提交前必须读 [references/platform-api.md](references/platform-api.md)。平台固定为 `https://solo2.jzxhnh.com`，默认使用本机保存的 `zouyonghong` 凭据，可用 `SOLO11_PLATFORM_ACCOUNT` 覆盖，忽略旧凭据文件中的平台地址。每次读取当前表单和指纹，按最新字段校验；遇到新增字段或类型变化就停止。账号以首次提交锁定领域，同账号不能跨领域提交。
 

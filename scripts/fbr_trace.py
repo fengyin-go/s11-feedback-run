@@ -156,6 +156,44 @@ def interruption_note(ids: dict) -> str:
             "评价综合首轮及所有续写内容，SessionID、TurnID/PromptID和题面仍取第一轮数据")
 
 
+API_KEY_NOTE = "模型运行时读取了 apikey"
+
+
+def run_note(ids: dict, *, api_key_read: bool = False) -> str:
+    """Only evidence-backed interruption and gateway-key facts may enter other_issues."""
+    notes = []
+    interruption = interruption_note(ids)
+    if interruption:
+        notes.append(interruption)
+    if api_key_read or ids.get("api_key_read") is True or ids.get("key_detected") is True:
+        notes.append(API_KEY_NOTE)
+    return "；".join(notes)
+
+
+def api_key_evidence_paths(task_dir: Path) -> list[Path]:
+    """Current delivered run streams plus all exported main/sub-agent traces."""
+    task_dir = Path(task_dir)
+    paths = []
+    run_dir = task_dir / "run"
+    if run_dir.is_dir():
+        for path in run_dir.glob("*.jsonl"):
+            if path.is_file():
+                paths.append(path)
+        for path in run_dir.glob("*.stderr.log"):
+            if path.is_file():
+                paths.append(path)
+    projects = task_dir / "trace/projects"
+    if projects.is_dir():
+        paths.extend(path for path in projects.rglob("*.jsonl") if path.is_file())
+    return sorted(set(paths))
+
+
+def detect_api_key_read(task_dir: Path, cfg: dict) -> bool:
+    secret = lib.read_key(cfg)
+    return bool(secret and any(lib.key_occurrences(path, secret)
+                               for path in api_key_evidence_paths(task_dir)))
+
+
 def _target(tool: str, payload: dict) -> str:
     if tool == "Bash":
         return str(payload.get("command", ""))
@@ -246,10 +284,16 @@ def summarize(projects_dir: Path, session_file: str) -> dict:
     rows = lib.read_jsonl(Path(projects_dir).parent / session_file)
     steps = tool_steps(rows)
     stamps = sorted(str(r["timestamp"]) for r in rows if r.get("timestamp"))
+    assistant_answers = []
+    for row in main_rows(rows):
+        if row.get("type") != "assistant" or row.get("isApiErrorMessage"):
+            continue
+        text = _text_of((row.get("message") or {}).get("content")).strip()
+        if text:
+            assistant_answers.append(text)
     return {
         "steps": steps, "verification": verification(steps), "final_answer": final_answer(rows),
-        "assistant_answers": [_text_of((r.get("message") or {}).get("content"))
-                              for r in main_rows(rows) if r.get("type") == "assistant" and not r.get("isApiErrorMessage")],
+        "assistant_answers": assistant_answers,
         "api_errors": api_errors(rows), "started_at": stamps[0] if stamps else "",
         "ended_at": stamps[-1] if stamps else "",
         "counts": {"tools": len(steps), "errors": sum(1 for s in steps if s["is_error"]),

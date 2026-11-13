@@ -26,6 +26,24 @@ Feedback 的过程句只描述被测模型在这次轨迹中做了什么、为�
 
 ## 强制记录
 
+`feedback.json.process` 每项必须先用 `evidence` 绑定真实工具步骤或助手文本：
+
+```json
+{
+  "sentence": "正文里的完整过程句",
+  "steps": [4, 6],
+  "evidence": [
+    {"kind": "tool", "step": 4, "field": "output", "excerpt": "FAILED (failures=1)"},
+    {"kind": "tool", "step": 6, "field": "output", "excerpt": "Ran 14 tests in 0.52s OK"}
+  ]
+}
+```
+
+- `steps` 必须覆盖全部工具 evidence 的步骤；每个声明的步骤都至少有一条 evidence，不能只列一个无关 step 号。
+- `field` 只能是 `tool`、`target`、`output`、`error`，摘录必须逐字落在该步骤对应的真实工具名、输入目标、输出尾部或错误文本中。
+- 没有工具步骤的特殊会话才允许 `steps: []`，并必须使用 `{"kind":"assistant","index":1,"excerpt":"真实助手文本摘录"}`。
+- 独立逐句复核时，过程句的 `claim_reviews.sources` 必须引用原始 `trace/projects/*.jsonl`，并逐条包含上述 evidence 的同一段摘录。只写一个存在的 step 号、引用另一段无关日志，不能通过。
+
 `feedback.json.process_audit` 必须与 `process` 等长、同序、同句，并逐项记录：
 
 ```json
@@ -44,13 +62,17 @@ Feedback 的过程句只描述被测模型在这次轨迹中做了什么、为�
 }
 ```
 
-五项检查含义：
+五项检查是语义判断，不能替代上面的逐句原文 evidence：
 
 - `full_trace`：检查全量主轨迹和获准续写，而不是只看一条错误片段。
 - `baseline`：需要因果或“谁引入”判断时，对照初始提交和最终 diff。
 - `timeline`：需要“最初/随后/收尾/最终”判断时，回查前后步骤及后续修改。
 - `source_boundary`：确认句子只写模型轨迹，不混入 probe、录屏或验收侧动作。
 - `scope`：出现“只、仅、从未、没有”时，已扫描完整轨迹验证范围。
+
+## 为什么这样绑定
+
+旧方案只检查 step 号是否存在，文字含义仍可能借另一段日志绕过去。现在每个过程句至少有一条可定位到指定步骤输入/输出的连续摘录，并由复核轮再次引用同一摘录；这样能机械拦截 step 张冠李戴、把验收 probe 混入模型过程和只凭摘要写过程句。它仍不能自动证明因果或“从未”等语义，所以 `process_audit`、`claim_reviews.later_check` 和完整后续回查继续保留。
 
 ## 写作改正示例
 

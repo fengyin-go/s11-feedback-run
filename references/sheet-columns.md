@@ -33,7 +33,7 @@
 | 16 | 运行录屏 | 交付层 `record/recording.mp4` 的路径 | 同第 14 列 |
 | 17 | 交付完整性 | `review/feedback.json` 的 `score` | 1 到 5 的整数 |
 | 18 | Feedback | `review/feedback.json` 的 `feedback` | |
-| 19 | 备注 | `trace/ids.json` 对应的已核实中断续写说明 | 只有容器任务中断后实际发送“继续”才填写；除此之外一律空字符串，工程说明保留内部证据 |
+| 19 | 备注 | `trace/ids.json` 及当前运行/轨迹对起跑 key 的实际检测 | 只允许已核实的中断续写说明和“模型运行时读取了 apikey”；两者可同时存在，除此之外空字符串，工程说明保留内部证据 |
 | 20 | 提交人 | 未提交为空；有效回执用实际平台账号 | 平台接口不把本地 submitter 当输入 |
 | 21 | 提交时间 | 未提交为空；有效回执用平台 `created_at` | `YYYY-MM-DD HH:MM` |
 

@@ -16,9 +16,9 @@ source 仅用以下一种：{"kind":"trace","step":6}、{"kind":"probe","id":"P1
 
 正文提到数量时 count 为整数，count_quote 是同一次输出的计数原行；不报数量时 count 为 null，count_quote 为空。脚本检查摘录存在和数字出处，独立复核再检查该数字的含义、执行是否成功、测试与题目的关系，不能把日志里任意相同数字当测试数。
 
-process 的 steps 仍指向真实工具步骤。没有任何工具步骤的特殊会话，允许 {sentence, steps:[], source:"conversation"}，独立复核须回查原始对话；有步骤时不得使用此例外。issues 只写真实功能/交付问题，不用未验证冒充缺陷。唯一限制是验证不足的 4 分可留空 issues，但须通过 verification_gap 条件及独立复核。
+process 每项必须包含真实 steps 和至少一条 evidence。工具证据为 {kind:"tool", step, field:"tool|target|output|error", excerpt}，摘录必须落在该步骤对应字段；没有任何工具步骤的特殊会话才允许 {sentence, steps:[], source:"conversation", evidence:[{kind:"assistant", index, excerpt}]}。有步骤时不得使用对话例外。issues 只写真实功能/交付问题，不用未验证冒充缺陷。唯一限制是验证不足的 4 分可留空 issues，但须通过 verification_gap 条件及独立复核。
 
-process_audit 必须与 process 等长、同序、同句，每项为 {sentence, subject:"model", verdict:"supported", checks:{full_trace:true, baseline:true, timeline:true, source_boundary:true, scope:true}, note}。五项分别核对完整会话、初始基线、后续时间线、模型轨迹与验收证据的边界，以及“只/仅/从未/没有”等范围表述。过程句出现 probe/验收侧、没有浏览器轨迹却写模型点击页面、或把基线已有行为归给模型时，闸门拒绝。
+process_audit 必须与 process 等长、同序、同句，每项为 {sentence, subject:"model", verdict:"supported", checks:{full_trace:true, baseline:true, timeline:true, source_boundary:true, scope:true}, note}。五项分别核对完整会话、初始基线、后续时间线、模型轨迹与验收证据的边界，以及“只/仅/从未/没有”等范围表述。过程句出现 probe/验收侧、没有浏览器轨迹却写模型点击页面、或把基线已有行为归给模型时，闸门拒绝。每条 evidence 还必须由 claim_reviews 中同一原始轨迹摘录再次引用；布尔 check 不能替代原文。
 
 ## 独立语义复核输出
 
@@ -43,6 +43,8 @@ process_audit 必须与 process 等长、同序、同句，每项为 {sentence, 
 ## 逐句回查，防止分析结论幻觉
 
 claim_reviews 按脚本给出的 public_units 顺序覆盖全部正文，不能只登记有锚点的句子。每项为 {sentence, assertions, verdict, reason, later_check, sources:[{path,excerpt}]}。assertions 拆出该句每个可核实的事实和因果断言；reason 解释原文如何支持全部断言；later_check 说明后续是否修正及最终状态，不能只看首次报错。verdict 为 supported、contradicted 或 insufficient，只有全部 supported 才通过。复核者独立阅读原文，不采信生成侧自报的分析结论。每个过程不满意断言必须在这第二轮重新配对工具输入与返回，检查完整相关后续的重试、修正和最终影响；不只核查错误首次出现的片段。先用覆盖全部会话的索引定位，再定向读取原文，避免两轮重复通读无关大文件。索引不作为 sources；结果静态证据充分时无需为同一结论启动服务。
+
+过程句的 sources 必须包含原始轨迹 JSONL，并逐条包含 process.evidence 的同一摘录。若正文写“测试失败后修正”，而 evidence 只引了无关的 typecheck、复核摘录只引了其他日志，闸门会拒绝。存在多轮续写时，仍按首轮加全部获准“继续”的完整会话回查。
 
 sources 引用本题原始会话、工具返回、命令日志、probe、题面、diff、录屏元数据或产物代码，保存相对路径与连续原文。脚本拒绝生成摘要、越界路径、符号链接和原文不存在的摘录；引用存在只能证明出处，不自动证明语义正确。语义复核必须检查所有断言是否被支持，以及正文是否漏掉已确证的重要过程/产物问题。
 

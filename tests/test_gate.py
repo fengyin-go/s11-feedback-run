@@ -112,11 +112,30 @@ def audit(score: int = 4) -> dict:
 
 
 def feedback(score: int = 4) -> dict:
+    if score == 5:
+        process = [{
+            "sentence": "模型先读现有实现和测试，再写分片逻辑，随后运行完整测试，14 条全部通过",
+            "steps": [1, 2, 3, 6],
+            "evidence": [
+                {"kind": "tool", "step": 1, "field": "target", "excerpt": "src/clipcut/packer.py"},
+                {"kind": "tool", "step": 2, "field": "target", "excerpt": "src/clipcut/packer.py"},
+                {"kind": "tool", "step": 3, "field": "target", "excerpt": "src/clipcut/segment.py"},
+                {"kind": "tool", "step": 6, "field": "output", "excerpt": "Ran 14 tests in 0.52s OK"},
+            ],
+        }]
+    else:
+        process = [
+            {"sentence": "第 4 步跑 make test 时有一条用例没过", "steps": [4],
+             "evidence": [{"kind": "tool", "step": 4, "field": "output",
+                           "excerpt": "FAILED (failures=1)"}]},
+            {"sentence": "改完索引计算后第 6 步重跑，14 条全部通过", "steps": [5, 6],
+             "evidence": [
+                 {"kind": "tool", "step": 5, "field": "target", "excerpt": "src/clipcut/segment.py"},
+                 {"kind": "tool", "step": 6, "field": "output", "excerpt": "Ran 14 tests in 0.52s OK"},
+             ]},
+        ]
     doc = {"score": score, "feedback": TEXT4 if score < 5 else TEXT5, "issues": [], "note": "",
-           "process": [{"sentence": "模型先读现有实现和测试，再写分片逻辑，随后运行完整测试，14 条全部通过",
-                        "steps": [1, 2, 3, 6]}] if score == 5 else
-                      [{"sentence": "第 4 步跑 make test 时有一条用例没过", "steps": [4]},
-                       {"sentence": "改完索引计算后第 6 步重跑，14 条全部通过", "steps": [5, 6]}]}
+           "process": process}
     if score < 5:
         doc["issues"] = [{
             "sentence": "--segment abc 这种非数字参数直接抛出 ValueError 的调用栈",
@@ -497,9 +516,12 @@ class Feedback(Case):
     def test_process_without_tools_must_reference_conversation(self):
         f, doc = facts(), feedback(4)
         f["trace"]["steps"] = []
+        f["trace"]["assistant_answers"] = ["回答里只解释了修改思路，随后就结束了对话"]
         sentence = "回答里只解释了修改思路，随后就结束了对话"
         doc["feedback"] += sentence + "。"
-        doc["process"] = [{"sentence": sentence, "steps": [], "source": "conversation"}]
+        doc["process"] = [{"sentence": sentence, "steps": [], "source": "conversation",
+                           "evidence": [{"kind": "assistant", "index": 1,
+                                         "excerpt": "只解释了修改思路，随后就结束了对话"}]}]
         self.hasnt(self.check(doc, f=f)[0], "哪几步")
         self.has(self.check(doc)[0], "哪几步")
 

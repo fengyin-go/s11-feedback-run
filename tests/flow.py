@@ -73,7 +73,18 @@ def audit() -> dict:
 
 def feedback(text: str = TEXT_A, score: int = 3) -> dict:
     parts = PARTS[text]
-    process = [{"sentence": sentence, "steps": steps} for sentence, steps in parts["process"]]
+    evidence = {
+        TEXT_A: [
+            {"kind": "tool", "step": 3, "field": "output", "excerpt": "Ran 1 test in 0.01s"},
+            {"kind": "tool", "step": 4, "field": "target", "excerpt": "src/clipcut/packer.py"},
+        ],
+        TEXT_B: [
+            {"kind": "tool", "step": 3, "field": "output", "excerpt": "Ran 1 test in 0.01s"},
+            {"kind": "tool", "step": 4, "field": "target", "excerpt": "src/clipcut/packer.py"},
+        ],
+    }[text]
+    process = [{"sentence": sentence, "steps": steps, "evidence": [evidence[index]]}
+               for index, (sentence, steps) in enumerate(parts["process"])]
     return copy.deepcopy({
         "score": score, "feedback": text, "note": "",
         "results": [{"sentence": "--segment 0 会打印 error 并以退出码 2 结束" if text == TEXT_A else "--segment 0 被拒绝，返回码是 2",
@@ -103,12 +114,15 @@ def feedback(text: str = TEXT_A, score: int = 3) -> dict:
 
 def mock_claim_reviews(doc, trace_source: str | None = None, trace_excerpt: str | None = None):
     """仅模拟模型协议，不代表夹具正文已经过真实语义审核。"""
-    process = {item["sentence"] for item in doc.get("process", []) if isinstance(item, dict)}
+    process = {
+        item["sentence"]: item.get("evidence", [{}])[0].get("excerpt")
+        for item in doc.get("process", []) if isinstance(item, dict)
+    }
     trace_source = trace_source or f"trace/projects/-workspace/{SID}.jsonl"
     trace_excerpt = trace_excerpt or '"type": "tool_use"'
     rows = []
     for sentence in fbr_quality.public_units(doc["feedback"]):
-        source = ({"path": trace_source, "excerpt": trace_excerpt}
+        source = ({"path": trace_source, "excerpt": process.get(sentence) or trace_excerpt}
                   if sentence in process else {"path": "task.json", "excerpt": '"task_id"'})
         rows.append({"sentence": sentence, "assertions": ["离线模拟事实断言"], "verdict": "supported",
                      "reason": "离线模拟模型独立复核的具体依据", "later_check": "离线模拟后续修正与最终状态检查",

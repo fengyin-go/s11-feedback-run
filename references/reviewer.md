@@ -38,13 +38,13 @@ candidate 是 `{"audit": ..., "feedback": ..., "needs_probes": []}`，结构见�
 - `binding`：检查点中的 binding 原样引用；它绑定证据、规则及轨迹分析摘要。
 - `candidate_sha`：`fbrlib.content_hash(candidate)`，不是文件原始字节摘要。
 - `checks`：feedback-quality.md 的七项语义判断，每项具体事实依据。
-- `claim_reviews`：按 `fbr_quality.public_units(feedback.feedback)` 顺序逐句列出 sentence、assertions、verdict、reason、later_check、sources(path/excerpt)。逐句复核必须真的回查原始来源、后续修正和最终影响，摘录必须逐字存在。
+- `claim_reviews`：按 `fbr_quality.public_units(feedback.feedback)` 顺序逐句列出 sentence、assertions、verdict、reason、later_check、sources(path/excerpt)。逐句复核必须真的回查原始来源、后续修正和最终影响，摘录必须逐字存在。过程句的来源必须包含原始轨迹 JSONL，并逐条包含 `process[].evidence` 的同一摘录；另找一段存在的日志不能替代该句证据。
 
 当前 AI 写完候选后另做复核轮，发现矛盾或证据不足先修候选、补证，不把它标成 supported。正文每句必须覆盖。过程断言结合轨迹报告与原始来源，产物断言检查代码、实际日志及基线，不用生成报告代替原始出处。评分标准和证据要求保持不变。
 
 正文先对照提示词说明功能完成度，已完成什么、未完成或仍有问题什么；全部做到时直接陈述实际完成的能力，不写“未发现其他明确未完成功能”这类空泛完成度句。之后再用最多 3 句写真实过程，只保留影响结论的一到三个事件。叙述要从证据提炼行为和结果，不把取证过程写进交付评价。不要写“轨迹显示”“录屏中”“素材卡里”“原始会话表明”或“证据显示”；改写成模型实际执行了什么、产物表现如何、哪些范围尚未覆盖。过程段至少一句必须是明确的模型行为句，但全文只在第一次点明主体时写一次“模型”，后续用“它”承接或直接省略主语，不能反复写“模型随后”“模型最后”。原始过程里出现首测失败、错误断言、验证器写错或返工时，先写模型当时的做法、失败结果、修正动作和最终影响；例如“模型先用并发 curl 校验重复提交，却把多段响应拼在一起解析，报出 JSONDecodeError；改成五个独立线程分别读取后，才确认五次提交共用同一批次”。不能只列脚本通过、构建完成和未覆盖边界，也不能用“额外边界没有问题”代替过程分析。
 
-每个 `process` 句还要在同序的 `process_audit` 中完成五项归因检查：`full_trace`、`baseline`、`timeline`、`source_boundary`、`scope`。验收 probe、录屏和当前 AI 的页面点击只能支撑结果或问题，不能接到模型主语链上；若轨迹中没有浏览器动作，过程句也不能写模型“点击”或“页面操作”。基线已有行为、后续修改造成的回归、绝对化范围表述和“收尾”等时序表述分别按 [process-attribution-audit.md](process-attribution-audit.md) 回查。
+每个 `process` 句先写真实 `steps` 和 `evidence`：工具 evidence 的 step 必须属于该句 steps，field 只能是 tool/target/output/error，excerpt 必须落在该步骤的真实字段中；没有工具的特殊会话使用 assistant evidence。之后还要在同序的 `process_audit` 中完成五项归因检查：`full_trace`、`baseline`、`timeline`、`source_boundary`、`scope`。验收 probe、录屏和当前 AI 的页面点击只能支撑结果或问题，不能接到模型主语链上；若轨迹中没有浏览器动作，过程句也不能写模型“点击”或“页面操作”。基线已有行为、后续修改造成的回归、绝对化范围表述和“收尾”等时序表述分别按 [process-attribution-audit.md](process-attribution-audit.md) 回查。
 
 评分与过程描述必须同向。5 分要求正文也呈现出接近一次性完美跑通；如果正文如实写了错误验证、错判、核心实现返工，或关键竞争没有真正复核，即使最后修好，也最高 4 分，并用 process_issue 说明最终交付可用但过程不完美。不要为了保 5 分删除这些真实经历。
 

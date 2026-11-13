@@ -23,7 +23,7 @@ import fbrlib as lib
 import fbr_platform as platform
 
 
-USERNAME = "gonghao"
+USERNAME = "zouyonghong"
 PASSWORD = "offline-test-password-123456"
 FINGERPRINT = "a" * 64
 
@@ -90,7 +90,7 @@ class CredentialCase(unittest.TestCase):
         self.addCleanup(patch.stopall)
         patch.dict(os.environ, {"HOME": str(self.home)}).start()
         self.directory = self.home / ".codex/coding-agent-satisfaction"
-        self.account_path = self.directory / "solo-qa-accounts/gonghao.json"
+        self.account_path = self.directory / "solo-qa-accounts/zouyonghong.json"
         self.fallback_path = self.directory / "solo-qa.json"
 
     def credential(self, *, path=None, mode=0o600, **changes):

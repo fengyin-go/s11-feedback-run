@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import copy
 import unittest
-from fixtures import PROMPT, trace_rows, stream_text, write_projects
+from fixtures import PROMPT, TOOLS, trace_rows, stream_text, write_projects
 from test_run import DockerCase, SID
 from test_submit import SubmitCase, SCHEMA
 import fbrlib as lib
@@ -17,9 +17,10 @@ def entries(count=1):
 
 
 def rows_with_continuations(count=1, text="继续"):
-    rows = trace_rows(SID, answer="首轮尚未完成")
+    rows = trace_rows(SID, tools=TOOLS, answer="首轮尚未完成")
     for n in range(count):
-        extra = trace_rows(SID, prompt=text, prompt_id=f"prm-continue-{n}", answer=f"续写{n}完成")
+        extra = trace_rows(SID, prompt=text, prompt_id=f"prm-continue-{n}", tools=TOOLS,
+                           answer=f"续写{n}完成")
         for row in extra:
             row["uuid"] += f"-continue-{n}"
         rows.extend(extra)
@@ -110,10 +111,11 @@ class Platform(SubmitCase):
         item = submit.prepare(self.root, task.parent.name, SCHEMA)[0]
         self.assertEqual(item["data"]["other_issues"], "")
 
-    def test_continuation_submission_binds_first_id_and_only_interruption_note(self):
+    def test_continuation_submission_binds_first_id_and_both_allowed_notes(self):
         task = self.ready()
         ids = lib.load_json(task / "trace/ids.json")
-        ids.update(session_id=SID, prompt_id="prm-0001", user_turns=2, continuations=entries())
+        ids.update(session_id=SID, prompt_id="prm-0001", user_turns=2, continuations=entries(),
+                   api_key_read=True)
         lib.save_json(task / "trace/ids.json", ids)
         record = lib.load_task(task)
         rows = rows_with_continuations()
@@ -132,8 +134,9 @@ class Platform(SubmitCase):
         item = submit.prepare(self.root, task.parent.name, SCHEMA)[0]
         data = item["data"]
         self.assertEqual((data["session_id"], data["turn_id"]), (SID, "prm-0001"))
-        self.assertEqual(data["other_issues"], fbr_trace.interruption_note(ids))
+        self.assertEqual(data["other_issues"], fbr_trace.run_note(ids))
         self.assertIn("1次", data["other_issues"])
+        self.assertIn(fbr_trace.API_KEY_NOTE, data["other_issues"])
 
     def test_scalar_payload_never_forwards_arbitrary_notes(self):
         self.assertEqual(submit.scalar_payload({"备注": "任何返修或运行备注"})["other_issues"], "")

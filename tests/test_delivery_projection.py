@@ -99,6 +99,33 @@ class DeliveryProjection(SheetCase):
         saved = lib.load_json(self.root / "results" / BATCH / "delivery-manifest.json")
         self.assertEqual(saved, manifest)
 
+    def test_gateway_key_in_raw_trace_is_deliverable_only_with_required_note(self):
+        task = self.gated()
+        self.complete(task)
+        ids_path = task / "trace/ids.json"
+        ids = lib.load_json(ids_path)
+        ids["api_key_read"] = True
+        lib.save_json(ids_path, ids)
+        session = task / "trace" / ids["session_file"]
+        with session.open("a", encoding="utf-8") as stream:
+            stream.write('{"type":"debug","note":"模型读取了 selftest-key-0123456789abcdef"}\n')
+        self.refresh_source_fixture(task)
+        self.review_receipt(task)
+        manifest = self.export()
+        row = self.listed(manifest)[task.name]
+        self.assertEqual(row["api_key_files"], ["trace/" + ids["session_file"]])
+        self.assertEqual(fbr_sheet.build_row(self.root, task, self.cfg)[0]["备注"],
+                         "模型运行时读取了 apikey")
+
+        ids["api_key_read"] = False
+        ids["key_detected"] = False
+        lib.save_json(ids_path, ids)
+        self.refresh_source_fixture(task)
+        self.review_receipt(task)
+        self.assertEqual(fbr_sheet.build_row(self.root, task, self.cfg)[0]["备注"],
+                         "模型运行时读取了 apikey")
+        self.assertIn(task.name, self.listed(self.export()))
+
     def test_modified_export_is_rebuilt_from_original_whitelist(self):
         task = self.gated()
         self.complete(task)
@@ -276,4 +303,3 @@ class DeliveryProjection(SheetCase):
         self.assertEqual(manifest["tasks"], [])
         self.assert_excluded(manifest, pending)
         self.assertTrue((self.root / "results" / BATCH / "delivery-manifest.json").is_file())
-

@@ -1,4 +1,4 @@
-"""回归：泄露证据不能改写，失败时不删容器、不继续重跑。只使用假 key 和假 Docker。"""
+"""回归：轨迹中的网关 key 保留原文、记录为备注，不阻断有效数据交付。"""
 
 from __future__ import annotations
 
@@ -16,49 +16,44 @@ import fbr_trace
 
 
 class EvidenceSafety(DockerCase):
-    def test_stream_key_stops_without_rewrite_or_retry(self):
+    def test_stream_key_is_preserved_and_marked_without_retry(self):
         task_dir = self.make_task()
         raw = stream_text(SID) + f'{{"type":"debug","note":"{KEY}"}}\n'
         self.docker.outcomes = [self.good(stdout=raw), self.good()]
         row = fbr_run.run_one(task_dir, self.cfg)
-        self.assertEqual(row["state"], "failed")
+        self.assertEqual(row["state"], "ok")
         self.assertNotIn(KEY, str(row))
         self.assertEqual((task_dir / "run/stream.jsonl").read_text(), raw)
-        self.assertIn("s11-000001", self.docker.containers)
-        self.assertEqual(self.docker.docker_calls("rm"), [])
         self.assertEqual(len(self.docker.outcomes), 1)
-        self.assertTrue(lib.load_state(task_dir)["stages"]["run"]["key_leak"])
         self.assertNotIn(KEY, (task_dir / "run/attempts.json").read_text())
-        self.assertEqual(fbr_run.run_one(task_dir, self.cfg)["state"], "blocked")
+        self.assertEqual(fbr_run.run_one(task_dir, self.cfg)["state"], "skip")
         self.assertEqual(len(self.docker.outcomes), 1)
 
-    def test_stderr_key_stops_retryable_attempt(self):
+    def test_stderr_key_does_not_replace_real_gateway_retry_decision(self):
         task_dir = self.make_task()
         raw = f"API Error: 529 {KEY}\n"
         self.docker.outcomes = [{"stdout": stream_text(SID, with_result=False), "stderr": raw,
                                  "projects": self.projects()}, self.good()]
         row = fbr_run.run_one(task_dir, self.cfg)
-        self.assertEqual(row["state"], "failed")
-        self.assertEqual((task_dir / "run/stderr.log").read_text(), raw)
-        self.assertEqual(self.docker.docker_calls("rm"), [])
-        self.assertEqual(len(self.docker.outcomes), 1)
+        self.assertEqual(row["state"], "ok")
+        self.assertIn("529", (task_dir / "run/attempt-1/stderr.log").read_text())
+        self.assertEqual(len(self.docker.docker_calls("exec")), 2)
         self.assertNotIn(KEY, str(row))
 
-    def test_failed_attempt_trace_key_stops_before_reset_or_removal(self):
+    def test_failed_attempt_trace_key_is_archived_before_clean_retry(self):
         task_dir = self.make_task()
         projects = self.projects("leaked-trace", answer=f"debug {KEY}")
         self.docker.outcomes = [{"stdout": stream_text(SID, with_result=False), "rc": 1, "projects": projects,
                                  "effect": lambda ws: write(ws / "evidence.txt", "keep me\n")}, self.good()]
         row = fbr_run.run_one(task_dir, self.cfg)
-        self.assertEqual(row["state"], "failed")
-        self.assertTrue((task_dir / "workspace/evidence.txt").is_file())
+        self.assertEqual(row["state"], "ok")
+        self.assertFalse((task_dir / "workspace/evidence.txt").exists())
         exported = list((task_dir / "run/attempt-1/projects").rglob("*.jsonl"))
         self.assertEqual(len(exported), 1)
         self.assertIn(KEY, exported[0].read_text())
-        self.assertEqual(self.docker.docker_calls("rm"), [])
-        self.assertEqual(len(self.docker.outcomes), 1)
+        self.assertEqual(len(self.docker.docker_calls("exec")), 2)
 
-    def test_collect_key_preserves_original_and_container(self):
+    def test_collect_key_preserves_original_and_records_platform_note(self):
         task_dir = self.make_task()
         fbr_run.bound_key(task_dir, self.cfg, start=True)
         lib.set_stage(task_dir, "run", "ok", attempts=1, session_id=SID)
@@ -67,16 +62,17 @@ class EvidenceSafety(DockerCase):
         self.docker.projects["s11-000001"] = source
         original = next(source.rglob("*.jsonl")).read_bytes()
         row = fbr_run.collect_one(task_dir, self.cfg)
-        self.assertEqual(row["state"], "failed")
+        self.assertEqual(row["state"], "ok")
         target = next((task_dir / "trace/projects").rglob("*.jsonl"))
         self.assertEqual(target.read_bytes(), original)
-        self.assertFalse((task_dir / "trace/ids.json").exists())
-        self.assertEqual(self.docker.docker_calls("rm"), [])
+        ids = lib.load_json(task_dir / "trace/ids.json")
+        self.assertTrue(ids["api_key_read"])
+        self.assertEqual(fbr_trace.run_note(ids), fbr_trace.API_KEY_NOTE)
+        self.assertNotIn("s11-000001", self.docker.containers)
         self.assertNotIn(KEY, str(row))
-        self.assertEqual(fbr_run.collect_one(task_dir, self.cfg)["state"], "blocked")
+        self.assertEqual(fbr_run.collect_one(task_dir, self.cfg)["state"], "skip")
         self.assertEqual(target.read_bytes(), original)
-        with self.assertRaisesRegex(lib.FbrError, "key 泄露"):
-            lib.require_stage(task_dir, "run")
+        self.assertEqual(lib.require_stage(task_dir, "run")["session_id"], SID)
 
     def test_single_turn_rejects_repeated_user_rows_with_same_prompt_id(self):
         rows = trace_rows(SID)
@@ -149,4 +145,3 @@ class EvidenceSafety(DockerCase):
                 stages = lib.load_state(task_dir)["stages"]
                 self.assertNotIn("facts", stages)
                 self.assertNotIn("feedback", stages)
-

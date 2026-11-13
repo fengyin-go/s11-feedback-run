@@ -127,7 +127,7 @@ def build_row(root: Path, task_dir: Path, cfg: dict, *, delivery_manifest: dict 
         "产物快照": snapshot.get("artifact_snapshot", "") if snapshot.get("pushed") else "",
         "运行录屏": str(video) if (root / video).is_file() else "",
         "交付完整性": doc.get("score"), "Feedback": text,
-        "备注": fbr_trace.interruption_note(ids),
+        "备注": fbr_trace.run_note(ids, api_key_read=fbr_trace.detect_api_key_read(task_dir, cfg)),
         "提交人": "", "提交时间": "",
         "任务编号": record["task_id"], "批次": record.get("batch") or task_dir.parent.name,
         "底座仓库": record.get("repo_id", ""), "任务仓库": record.get("task_repo_full") or record.get("task_repo", ""),
@@ -173,7 +173,7 @@ def prepared_fields(root: Path, task_dir: Path, cfg: dict) -> dict:
             "轨迹文件": str(session.relative_to(root)) if trace_ok else "",
             "产物快照": snapshot.get("artifact_snapshot", "") if snapshot.get("pushed") else "",
             "运行录屏": str(video.relative_to(root)) if lib.stage_ok(task_dir, "record") and video.is_file() else "",
-            "备注": fbr_trace.interruption_note(ids)}
+            "备注": fbr_trace.run_note(ids, api_key_read=fbr_trace.detect_api_key_read(task_dir, cfg))}
 
 
 def row_problems(row: dict, ids: dict, snapshot: dict) -> list[str]:
@@ -387,7 +387,7 @@ def write_sheet(root: Path, batch_id: str, cfg: dict) -> dict:
             task.get("repro_level", ""),
             snapshot.get("artifact_snapshot", "") if snapshot.get("pushed") else "",
             str(video.relative_to(root)) if meta and video.is_file() else "",
-            fbr_trace.interruption_note(ids), status,
+            fbr_trace.run_note(ids, api_key_read=fbr_trace.detect_api_key_read(task_dir, cfg)), status,
             "冻结 task.json；存在时核验 field-revisions.json 绑定的实时 schema 和实际环境证据；snapshot.json 推送回读；record/recording.json；trace/ids.json。"])
     corrections.freeze_panes = "B2"
     for index, column in enumerate(correction_columns, 1):

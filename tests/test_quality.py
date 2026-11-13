@@ -144,11 +144,20 @@ class ClaimReview(unittest.TestCase):
         self.assertTrue(self.errors())
 
     def test_process_sentence_requires_trace_source(self):
-        self.doc['process'] = [{'sentence': self.doc['feedback'].split('。')[0], 'steps': [1]}]
+        self.doc['process'] = [{
+            'sentence': self.doc['feedback'].split('。')[0], 'steps': [1],
+            'evidence': [{'kind': 'tool', 'step': 1, 'field': 'output',
+                          'excerpt': 'command failed'}],
+        }]
         self.report['claim_reviews'][0]['sources'] = [
             {'path': 'evidence/probes.jsonl', 'excerpt': 'first: command failed'}
         ]
         self.assertTrue(any('原始轨迹 JSONL' in error for error in self.errors()))
+        trace_source = {'path': 'trace/projects/session.jsonl', 'excerpt': 'later: fixed and passed'}
+        self.report['claim_reviews'][0]['sources'] = [trace_source]
+        self.assertTrue(any('evidence 对应的原始轨迹摘录' in error for error in self.errors()))
+        trace_source['excerpt'] = 'command failed'
+        self.assertNotIn('evidence 对应的原始轨迹摘录', '；'.join(self.errors()))
 
 
 class ProcessAudit(unittest.TestCase):
@@ -159,9 +168,11 @@ class ProcessAudit(unittest.TestCase):
             steps.append({"step": 3, "tool": "Playwright", "target": "page.click('权限编排')"})
         return {"trace": {"steps": steps}}
 
-    def doc(self, sentence="模型修复请求体后重新运行 HTTP 检查"):
+    def doc(self, sentence="模型先运行 typecheck 检查"):
         return {
-            "process": [{"sentence": sentence, "steps": [1]}],
+            "process": [{"sentence": sentence, "steps": [1],
+                         "evidence": [{"kind": "tool", "step": 1, "field": "target",
+                                       "excerpt": "npm run typecheck"}]}],
             "process_audit": [{
                 "sentence": sentence, "subject": "model", "verdict": "supported",
                 "checks": {name: True for name in quality.PROCESS_AUDIT_CHECKS},
@@ -189,4 +200,17 @@ class ProcessAudit(unittest.TestCase):
         doc = self.doc()
         doc["process_audit"] = []
         self.assertTrue(any("按顺序覆盖" in error for error in
+                            quality.process_audit_errors(doc, self.facts())))
+
+    def test_each_process_step_needs_matching_tool_evidence(self):
+        doc = self.doc("模型运行 typecheck 检查")
+        doc["process_audit"][0]["sentence"] = doc["process"][0]["sentence"]
+        self.assertEqual(quality.process_audit_errors(doc, self.facts()), [])
+        doc["process"][0].pop("evidence")
+        self.assertTrue(any("缺少逐句轨迹证据" in error for error in
+                            quality.process_audit_errors(doc, self.facts())))
+        doc = self.doc("模型运行 typecheck 检查")
+        doc["process_audit"][0]["sentence"] = doc["process"][0]["sentence"]
+        doc["process"][0]["evidence"][0]["excerpt"] = "make test"
+        self.assertTrue(any("摘录不在第 1 步" in error for error in
                             quality.process_audit_errors(doc, self.facts())))

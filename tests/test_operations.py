@@ -281,6 +281,31 @@ class SharedRuntime(Sandbox):
 
 
 class Flow(Sandbox):
+    def test_pre_submit_command_runs_full_pre_submit_mode_without_platform_submit(self):
+        from flow import run_main
+        batch = self.make_task().parent.name
+        seen = {}
+        def run_flow(root, options):
+            seen.update(vars(options))
+            return {'state': 'ok'}
+        with mock.patch.object(lib, 'active_github_account'), \
+             mock.patch.object(fbr_flow, 'run_flow', side_effect=run_flow):
+            code, _, err = run_main(fbr_flow, '--root', str(self.root), 'pre-submit', '--batch', batch)
+        self.assertEqual((code, err), (0, ''))
+        self.assertTrue(seen['execute'])
+        self.assertTrue(seen['publish'])
+        self.assertFalse(seen['auto_submit'])
+
+    def test_pre_submit_refuses_platform_submission(self):
+        from flow import run_main
+        batch = self.make_task().parent.name
+        with mock.patch.object(fbr_flow, 'run_flow') as run:
+            code, _, err = run_main(fbr_flow, '--root', str(self.root), 'pre-submit',
+                                    '--batch', batch, '--auto-submit', '--confirm-submit', 'SUBMIT')
+        self.assertEqual(code, 2)
+        self.assertIn('不自动提交平台', err)
+        run.assert_not_called()
+
     def test_downstream_starts_before_last_producer_finishes(self):
         first, second = self.make_task(1), self.make_task(2)
         events = {}

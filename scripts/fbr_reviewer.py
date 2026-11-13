@@ -303,6 +303,7 @@ def prepare_task_agent(task: Path, *, allow_platform_repair: bool = False) -> di
                                        'needs_probes': []},
                   'verification_contract': {'task_agent': 'current_task_agent', 'binding': binding,
                       'candidate_sha': 'lib.content_hash(candidate)', 'checks': list(quality.CHECKS),
+                      'process_evidence': '每个 process 句绑定真实 steps 及 tool/assistant evidence；复核引用同一原始摘录',
                       'claim_reviews': '按 public_units 完整逐句回查原文、断言与后续最终状态'},
                   'detail': '当前任务 AI 检查产物、评分、撰写及复核 Feedback；本阶段不调用 reviewer.env'}
     gate = lib.load_json(task/'review/gate.json', default={})

@@ -9,7 +9,7 @@ import re
 import fbr_gate as gate
 import fbrlib as lib
 
-VERSION = 10
+VERSION = 11
 CHECKS = ("result_and_process", "task_specific_voice", "test_relevance", "score_alignment",
           "evidence_fidelity", "scope_discipline", "non_template")
 RULE_FILES = ("references/scoring.md", "references/feedback-writing.md", "references/feedback-calibration.md",
@@ -38,6 +38,12 @@ PROCESS_BROWSER_TRACE = re.compile(r"playwright|puppeteer|browser|chromium|page\
 PROCESS_TIMELINE = re.compile(r"最初|起初|最初|收尾|最后|随后|后来|最终")
 PROCESS_CAUSAL = re.compile(r"让|使|造成|导致|引入|归因")
 PROCESS_SCOPE = re.compile(r"只|仅|从未|没有|未实际|唯一")
+PROCESS_EVIDENCE_FIELDS = {
+    "tool": "tool",
+    "target": "target",
+    "output": "output_tail",
+    "error": "error",
+}
 
 
 def policy_sha() -> str:
@@ -111,11 +117,66 @@ def process_audit_errors(doc: dict, facts: dict) -> list[str]:
     if not isinstance(audit, list) or len(audit) != len(process):
         return ["process_audit 必须按顺序覆盖全部过程句"]
     browser_seen = trace_has_browser_action(facts)
+    steps = {step.get("step"): step for step in facts.get("trace", {}).get("steps", [])
+             if isinstance(step, dict) and type(step.get("step")) is int}
+    answers = facts.get("trace", {}).get("assistant_answers") or []
     errors = []
     for index, (item, checked) in enumerate(zip(process, audit), 1):
         label = f"第 {index} 个过程句归因"
         raw_sentence = str(item.get("sentence") or "") if isinstance(item, dict) else ""
         sentence = gate.squash(raw_sentence)
+        evidence = item.get("evidence") if isinstance(item, dict) else None
+        declared_steps = item.get("steps") if isinstance(item, dict) else None
+        evidenced_steps = set()
+        evidence_quotes = []
+        if not isinstance(evidence, list) or not evidence:
+            errors.append(label + "缺少逐句轨迹证据 evidence")
+        else:
+            for evidence_index, source in enumerate(evidence, 1):
+                source_label = f"{label}第 {evidence_index} 条证据"
+                if not isinstance(source, dict):
+                    errors.append(source_label + "格式不对")
+                    continue
+                quote = str(source.get("excerpt") or "").strip()
+                if len(quote) < 4:
+                    errors.append(source_label + "摘录太短")
+                    continue
+                kind = source.get("kind")
+                if kind == "assistant":
+                    answer_index = source.get("index")
+                    if type(answer_index) is not int or not 1 <= answer_index <= len(answers):
+                        errors.append(source_label + "没有对应的助手文本")
+                    elif gate.squash(quote) not in gate.squash(str(answers[answer_index - 1])):
+                        errors.append(source_label + "摘录不在对应助手文本中")
+                    else:
+                        evidence_quotes.append(gate.squash(quote))
+                    continue
+                step_no, field = source.get("step"), source.get("field")
+                if kind != "tool" or type(step_no) is not int or field not in PROCESS_EVIDENCE_FIELDS:
+                    errors.append(source_label + "必须使用 kind=tool 并给出 step 与合法 field")
+                    continue
+                row = steps.get(step_no)
+                if not row:
+                    errors.append(source_label + f"指向不存在的第 {step_no} 步")
+                    continue
+                actual = str(row.get(PROCESS_EVIDENCE_FIELDS[field]) or "")
+                if gate.squash(quote) not in gate.squash(actual):
+                    errors.append(source_label + f"摘录不在第 {step_no} 步的 {field} 中")
+                    continue
+                evidenced_steps.add(step_no)
+                evidence_quotes.append(gate.squash(quote))
+        if isinstance(declared_steps, list) and declared_steps:
+            missing = {s for s in declared_steps if type(s) is int and s in steps} - evidenced_steps
+            if missing:
+                errors.append(label + "列出的轨迹步骤缺少对应 evidence：" + "、".join(map(str, sorted(missing))))
+            extra = evidenced_steps - {s for s in declared_steps if type(s) is int}
+            if extra:
+                errors.append(label + "evidence 引用了未列入 steps 的步骤：" + "、".join(map(str, sorted(extra))))
+        else:
+            if evidenced_steps:
+                errors.append(label + "有工具证据但没有登记 steps")
+            elif not evidence_quotes:
+                errors.append(label + "没有可核对的过程证据")
         if not isinstance(checked, dict):
             errors.append(label + "格式不对")
             continue
@@ -263,9 +324,12 @@ def claim_report_errors(report: dict, doc: dict, task: Path) -> list[str]:
     rows = report.get('claim_reviews')
     units = public_units(doc.get('feedback', ''))
     process_sentences = {
-        gate.squash(str(item.get('sentence') or ''))
-        for item in doc.get('process', [])
-        if isinstance(item, dict)
+        gate.squash(str(item.get('sentence') or '')): {
+            gate.squash(str(source.get('excerpt') or ''))
+            for source in item.get('evidence', [])
+            if isinstance(source, dict) and str(source.get('excerpt') or '').strip()
+        }
+        for item in doc.get('process', []) if isinstance(item, dict)
     }
     if not isinstance(rows, list) or len(rows) != len(units):
         return ['逐句复查缺失：claim_reviews 必须按顺序覆盖全部正文句段']
@@ -294,6 +358,18 @@ def claim_report_errors(report: dict, doc: dict, task: Path) -> list[str]:
                 and str(source.get('path', '')).endswith('.jsonl')
                 for source in sources):
             errors.append(label + '是模型过程句，来源中必须包含原始轨迹 JSONL，不能只靠 probe、录屏或最终源码')
+        if gate.squash(unit) in process_sentences:
+            required_quotes = process_sentences[gate.squash(unit)]
+            trace_quotes = {
+                gate.squash(str(source.get('excerpt') or ''))
+                for source in sources
+                if isinstance(source, dict)
+                and str(source.get('path', '')).startswith('trace/projects/')
+                and str(source.get('path', '')).endswith('.jsonl')
+            }
+            missing_quotes = required_quotes - trace_quotes
+            if missing_quotes:
+                errors.append(label + '没有逐条引用过程句 evidence 对应的原始轨迹摘录')
         for source in sources:
             if not isinstance(source, dict):
                 errors.append(label + '原文来源格式错误')

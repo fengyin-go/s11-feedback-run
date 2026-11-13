@@ -25,7 +25,7 @@ import fbr_delivery as delivery  # noqa: E402
 
 SCRIPTS = Path(__file__).resolve().parent
 NEXT = {
-    "run": "fbr_run.py run --batch {b} --execute",
+    "run": "fbr_flow.py pre-submit --batch {b} --detach",
     "collect": "fbr_run.py collect --batch {b}",
     "commit": "fbr_snapshot.py commit --batch {b}",
     "record": "fbr_record.py --batch {b}",
