@@ -27,12 +27,34 @@ def revision(task):
     return doc,proof
 
 
+def subdirection_revision(task):
+    task = Path(task)
+    directory = task / 'evidence/field-revisions'
+    directory.mkdir(parents=True, exist_ok=True)
+    schema = directory / 'platform-subdirection.json'
+    proof = directory / 'platform-review.json'
+    lib.save_json(schema, {'platform':'https://solo2.jzxhnh.com', 'checked_at':'2026-11-13',
+        'fingerprint':'offline-subdirection', 'fields':[{'field_key':'sub_direction',
+        'field_type':'select','options':['数据分析与数据应用','其他']}]})
+    lib.save_json(proof, {'kind':'platform classification rejection fixture'})
+    ref = lambda p: {'path':p.relative_to(task).as_posix(),'sha256':fields.sha(p)}
+    doc = {'version':1,'task_sha256':fields.sha(task/'task.json'), 'fields':{'sub_direction':{
+        'old_value':lib.load_task(task).get('subdirection'), 'value':'其他',
+        'verified_at':'2026-11-13','reason':'Offline platform classification correction',
+        'schema':ref(schema),'sources':[ref(proof)]}}}
+    lib.save_json(task/fields.REVISIONS,doc)
+
+
 class FieldRevisions(Sandbox):
     def test_valid_revision_leaves_frozen_file_unchanged(self):
         task=self.make_task();before=(task/'task.json').read_bytes()
         revision(task)
         self.assertEqual(fields.effective_record(task)['repro_level'],'已容器化，可一键起环境')
         self.assertEqual((task/'task.json').read_bytes(),before)
+
+    def test_sub_direction_can_be_corrected_from_verified_schema(self):
+        task=self.make_task();subdirection_revision(task)
+        self.assertEqual(fields.effective_record(task)['sub_direction'],'其他')
 
     def test_missing_or_changed_evidence_cannot_apply(self):
         for remove in (False,True):

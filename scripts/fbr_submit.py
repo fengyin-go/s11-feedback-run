@@ -35,7 +35,15 @@ MEDIA_TYPES = {"trace_file": "attachment", "screencast": "video"}
 DENSE_REPORT_TOKEN_RE = re.compile(
     r"(?<![A-Za-z0-9_])(?:[A-Z]{2,}-[0-9]+|[0-9]{2}:[0-9]{2}(?::[0-9]{2})?|[0-9]{3,})(?![A-Za-z0-9_])")
 MACHINE_STYLE_RE = re.compile(r"\bTS\d+\b|python\s+-I|_enable\b|JSONDecodeError|Traceback")
-BARE_TEST_COUNT_RE = re.compile(r"(?:\d+\s*项(?:后端)?测试|Ran\s+\d+\s+tests)", re.I)
+BARE_TEST_COUNT_RE = re.compile(
+    r"(?:\d+\s*/\s*\d+|Ran\s+\d+\s+tests|"
+    r"\d+\s*项(?:后端|服务|回归|验收|边界|场景)?(?:测试|断言|回归|验收|场景)?\s*(?:通过|全过)?)",
+    re.I,
+)
+AI_STYLE_COUNT_RE = re.compile(r"[一二两三四五六七八九十百0-9]+\s*(?:条|次|项|个|段|份|轮)")
+ABSTRACT_REPORT_RE = re.compile(r"复用已有版本锁定|没有依赖临时状态|抽象名词串")
+VAGUE_FAILURE_RE = re.compile(r"(?:验证中还出现过|在并发场景里|测试中|验证中)[^。；]{0,40}(?:问题|错误|失败|异常)")
+CONCRETE_FAILURE_RE = re.compile(r"(?:[A-Za-z_][\w./-]+\.[A-Za-z]{2,5}|第\s*\d+\s*步|\d+\s*步)")
 FIELD_TYPES = dict.fromkeys(FIELD_MAP, "text") | {
     **dict.fromkeys(("domain", "sub_direction", "question_type", "difficulty", "harness", "os_platform", "repro_level"), "select"),
     **dict.fromkeys(("user_prompt", "feedback", "other_issues"), "textarea"),
@@ -232,7 +240,7 @@ def validate_uploaded(key: str, info: dict, local: dict) -> dict:
     return {k: info[k] for k in ("url", "name")}
 
 
-def platform_style_problems(text: str) -> list[str]:
+def platform_style_problems(text: str, score: int | None = None) -> list[str]:
     dense = list(dict.fromkeys(DENSE_REPORT_TOKEN_RE.findall(text or "")))
     machine = list(dict.fromkeys(MACHINE_STYLE_RE.findall(text or "")))
     errors = []
@@ -242,6 +250,17 @@ def platform_style_problems(text: str) -> list[str]:
         errors.append("Feedback 原样堆叠了过多工具字段，改写成失败后果和处理经过")
     if BARE_TEST_COUNT_RE.search(text or ""):
         errors.append("Feedback 不要只报测试总数，要说明测试覆盖了哪些需求行为")
+    style_counts = AI_STYLE_COUNT_RE.findall(text or "")
+    if len(style_counts) >= 4:
+        errors.append("Feedback 的条数、次数和项数密度过高，改写成关键动作与用户可见后果")
+    if ABSTRACT_REPORT_RE.search(text or ""):
+        errors.append("Feedback 出现机器摘要式抽象串，改成具体动作和业务后果")
+    for sentence in re.split(r"[。；\n]", text or ""):
+        if VAGUE_FAILURE_RE.search(sentence) and not CONCRETE_FAILURE_RE.search(sentence):
+            errors.append("过程问题只写了并发场景、验证中等泛称，必须指出具体文件、步骤或动作")
+            break
+    if score is not None and score <= 2 and not re.search(r"(?:问题|缺口|未实现|无法|不可用|失败)", text or ""):
+        errors.append("2 分及以下的 Feedback 必须明确写出具体问题、缺口或不可用后果")
     return errors
 
 
@@ -492,7 +511,8 @@ def submit_one(root: Path, plan: dict, client, schema: dict, records: list[dict]
     same = (receipt.get("content_digest") == plan["content_digest"] and receipt.get("account") == ACCOUNT
             and receipt.get("platform") == BASE_URL)
     if not (same and valid_id(receipt.get("submission_id"))):
-        style_errors = platform_style_problems(str(plan["data"].get("feedback", "")))
+        style_errors = platform_style_problems(str(plan["data"].get("feedback", "")),
+                                               plan["data"].get("score_delivery"))
         if style_errors:
             raise lib.FbrError("；".join(style_errors))
     if same:
@@ -595,12 +615,13 @@ def repair_one(root: Path, plan: dict, client, schema: dict, *, execute: bool, c
                for key in desired if current.get(key) != desired.get(key)}
 
     def save_receipt(updated: dict, actual: dict) -> dict:
+        expected = payload_with_media(plan, receipt.get("uploads", {}))
         receipt.update({
             "content_digest": plan["content_digest"],
             "binding": plan["binding"],
             "schema_fingerprint": schema["fingerprint"],
             "state": "confirmed",
-            "remote_data": actual,
+            "remote_data": expected,
             "remote_response_data": actual,
             "remote_status": updated.get("status"),
             "verified_at": lib.now_iso(),

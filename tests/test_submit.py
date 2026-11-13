@@ -339,6 +339,15 @@ class PlatformStyle(unittest.TestCase):
         text = "TS7053、_enable、python -I、JSONDecodeError 同时出现。"
         self.assertTrue(any("工具字段" in item for item in submit.platform_style_problems(text)))
         self.assertTrue(any("测试总数" in item for item in submit.platform_style_problems("16 项后端测试通过。")))
+        self.assertTrue(any("测试总数" in item for item in submit.platform_style_problems("32/32 通过。")))
+        self.assertTrue(any("条数、次数和项数密度过高" in item for item in
+                            submit.platform_style_problems("保留两条、三条，重复两次，再跑两轮。")))
+        self.assertTrue(any("抽象串" in item for item in
+                            submit.platform_style_problems("复用已有版本锁定，清单同步没有依赖临时状态。")))
+        self.assertTrue(any("具体文件、步骤或动作" in item for item in
+                            submit.platform_style_problems("验证中还出现过并发场景问题。")))
+        self.assertTrue(any("必须明确写出具体问题" in item for item in
+                            submit.platform_style_problems("页面显示状态不一致。", 2)))
         self.assertEqual(submit.platform_style_problems("争用发生时旧计划没有被覆盖，任务时间随后更新。"), [])
 
 
@@ -680,6 +689,31 @@ class ReceiptValidity(SubmitCase):
         receipt=self.receipt(task)
         self.assertEqual(receipt['state'],'confirmed')
         self.assertEqual(receipt['remote_trace']['url'],'https://media.example/trace')
+
+
+class RepairReceipt(SubmitCase):
+    def test_noop_repair_keeps_expected_and_remote_payloads_separate(self):
+        task, client = self.ready(), FakeClient()
+        self.execute(client)
+        plan = submit.prepare(self.root, BATCH, client.schema())[0]
+        client.records[0].update(status="PENDING_FIX", stage="PENDING_FIX", editable=True,
+                                 locked_fields=[], current_version=1,
+                                 session_id=plan["data"]["session_id"])
+        trace = client.records[0]["data"]["trace_file"][0]
+        client.records[0]["data"]["trace_file"] = [
+            {"name": trace["name"], "size": trace["size"], "url": "https://media.example/trace.jsonl"}
+        ]
+        result = submit.repair_one(self.root, plan, client, client.schema(), execute=True,
+                                   comment="verify receipt refresh")
+        self.assertEqual(result["state"], "confirmed")
+        receipt = self.receipt(task)
+        self.assertNotEqual(receipt["remote_data"]["trace_file"],
+                            receipt["remote_response_data"]["trace_file"])
+        row, _ = self.row(task)
+        status = submit.receipt_status(self.root, task, row,
+                                       lib.load_json(self.root / "results" / BATCH / "delivery-manifest.json"))
+        self.assertTrue(status["valid"])
+        self.assertIn("已提交", status["state"])
 
 
 if __name__ == "__main__":

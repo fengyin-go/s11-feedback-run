@@ -5,7 +5,7 @@ from pathlib import Path, PurePosixPath
 import fbrlib as lib
 
 REVISIONS = 'review/field-revisions.json'
-SUPPORTED = {'repro_level'}
+SUPPORTED = {'repro_level', 'sub_direction'}
 
 
 def sha(path):
@@ -47,8 +47,9 @@ def effective_record(task):
         raise lib.FbrError('字段修订包含未支持字段；不得覆盖题面、评分、会话或产物')
     record = dict(record)
     for key, entry in fields.items():
-        if (not isinstance(entry, dict) or entry.get('old_value') != record.get(key)
-                or not str(entry.get('reason', '')).strip() or not entry.get('verified_at')):
+        source_key = 'subdirection' if key == 'sub_direction' else key
+        if (not isinstance(entry, dict) or entry.get('old_value') != record.get(source_key)
+            or not str(entry.get('reason', '')).strip() or not entry.get('verified_at')):
             raise lib.FbrError('字段修订缺少原值、原因或核实时间')
         schema = lib.load_json(source(task, entry.get('schema')))
         if (not isinstance(schema, dict) or not schema.get('fingerprint')
@@ -65,4 +66,6 @@ def effective_record(task):
         for item in evidence:
             source(task, item)
         record[key] = entry['value']
+        if key == 'sub_direction':
+            record['subdirection'] = entry['value']
     return record

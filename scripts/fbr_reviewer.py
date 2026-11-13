@@ -382,7 +382,7 @@ def finalize(task: Path, candidate: dict, verification: dict, *, publish=True,
             history['state'] = 'passed'
             lib.save_json(history_path, history)
             lib.set_stage(task, 'feedback', 'ok', score=feedback.get('score'),
-                          feedback_sha=file_sha(task/'review/feedback.json'))
+                          feedback_sha=fbr_feedback.sha(str(feedback.get('feedback', ''))))
             return {'task_id': task.name, 'state': 'ok',
                     'detail': '已复核并过闸门；交付表和导出延后统一生成'}
         import fbr_sheet
