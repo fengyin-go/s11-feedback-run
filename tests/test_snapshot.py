@@ -413,19 +413,19 @@ class HubClass(SnapshotCase):
         def page(status, body):
             return done(0, f"HTTP/2.0 {status} OK\r\ncontent-type: application/json\r\n\r\n{body}")
         responses = {"auth token": done(0, HUB_TOKEN + "\n"),
-                     "api --include": page(200, '{"visibility": "public", "private": false, "login": "demo-owner"}')}
+                     "api --include": page(200, '{"visibility": "public", "private": false, "login": "fengyin-go"}')}
         hub = self.hub(responses)
-        self.assertTrue(hub.is_public("demo-owner/x"))
+        self.assertTrue(hub.is_public("fengyin-go/x"))
         self.assertEqual(hub.login(), OWNER)
         self.assertEqual(self.seen[-1][1]["GH_TOKEN"], HUB_TOKEN)
         self.assertFalse(any(HUB_TOKEN in part for command, _ in self.seen for part in command))
         responses["api --include"] = page(200, '{"visibility": "private", "private": true}')
-        self.assertFalse(hub.is_public("demo-owner/x"))
+        self.assertFalse(hub.is_public("fengyin-go/x"))
         responses["api --include"] = page(404, '{"message": "Not Found"}')
-        self.assertFalse(hub.is_public("demo-owner/x"))
+        self.assertFalse(hub.is_public("fengyin-go/x"))
         responses["api --include"] = done(1, "", f"error connecting, token {HUB_TOKEN}")
         with self.assertRaises(lib.FbrError) as caught:
-            hub.is_public("demo-owner/x")
+            hub.is_public("fengyin-go/x")
         self.assertNotIn(HUB_TOKEN, str(caught.exception))
 
 
