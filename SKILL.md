@@ -173,6 +173,8 @@ fbr_record.py --batch b1110-01                       # --redo 重录
 
 先读 [references/reviewer.md](references/reviewer.md)、`references/scoring.md` 和 `references/feedback-writing.md`。**只有轨迹分析使用 `reviewer.env`（默认 `gpt-6.1-sol`）**。过程证据核查、需求完成判断、产物验收、交付完整性评分、Feedback 撰写、产物断言逐句复核、门闸修复均由推进任务的当前 AI 完成，不通过该配置调用其他模型，也不固定另一个产物验收模型。人工 spotcheck 仍由实际审核人完成。
 
+提交或平台返修前还要通过 [references/feedback-platform-style.md](references/feedback-platform-style.md) 的本地风格检查。4 分正文必须明确写出扣分对应的失败或返工后果，并留下至少一个真实文件、命令、对象或返回值；测试层级和总数不能代替具体行为验证。系统会拦截已知的业务速记、终端成功输出和过密精确数值。
+
 1. `fbr_feedback.py card` 汇集题面、需求点、测试对比、演示结果、改动与轨迹索引。
 2. `fbr_reviewer.py review` 自动先对全部主/子轨迹及获准续写做一次全量摄取，建立事件图和精确偏移；reviewer 只读事件包，并按行号/block 回查候选原文，保存带精确出处、完整后续状态和调用回执的 `review/trace-analysis.json`，随后返回 `needs_task_agent` 检查点。轨迹配置未填写 `model` / `reasoning_effort` 时沿用 `gpt-6.1-sol` / `high`；不可用时只暂停这一阶段，不伪造分析。
 3. 当前任务 AI 默认读取 `review/task-agent-brief.md`、当前阶段 brief、相关代码 hunk 和真实实跑材料，判需求完成情况与评分。先写 `review/decision-input.json`，再运行 `fbr_reviewer.py build` 展开并 lint；只有排错或迁移时才手写完整 candidate。代码已能确证的问题不重复跑服务；缺证据则用既有 probe 补齐后刷新 card 和检查点。5 分仍须至少两个不同的、题面未明说的有效边界 probe。

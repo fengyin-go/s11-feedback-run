@@ -41,9 +41,26 @@ BARE_TEST_COUNT_RE = re.compile(
     re.I,
 )
 AI_STYLE_COUNT_RE = re.compile(r"[一二两三四五六七八九十百0-9]+\s*(?:条|次|项|个|段|份|轮)")
+GENERIC_TEST_LAYER_RE = re.compile(
+    r"(?:领域测试|服务层测试|后端测试|前端测试|回归测试)"
+    r"[、，和与及]*(?:领域测试|服务层测试|后端测试|前端测试|回归测试)"
+    r"[^。；\n]{0,30}(?:全部)?通过",
+    re.I,
+)
+OPERATIONAL_METRIC_RE = re.compile(r"\d+(?:\.\d+)?\s*(?:小时|天|GB|MB|毫秒|ms|秒)", re.I)
+TOOL_OUTPUT_LITERAL_RE = re.compile(r"\bALL CHECKS PASSED\b|✓\s*built in", re.I)
 ABSTRACT_REPORT_RE = re.compile(r"复用已有版本锁定|没有依赖临时状态|抽象名词串")
 VAGUE_FAILURE_RE = re.compile(r"(?:验证中还出现过|在并发场景里|测试中|验证中)[^。；]{0,40}(?:问题|错误|失败|异常)")
 CONCRETE_FAILURE_RE = re.compile(r"(?:[A-Za-z_][\w./-]+\.[A-Za-z]{2,5}|第\s*\d+\s*步|\d+\s*步)")
+TELEGRAPH_PHRASES = (
+    "同笔落印",
+    "不重刷",
+    "封单会同笔提交",
+    "覆盖带、重叠去重窗",
+    "回执只推进序号",
+    "只推进序号而不",
+    "改查 failureText",
+)
 FIELD_TYPES = dict.fromkeys(FIELD_MAP, "text") | {
     **dict.fromkeys(("domain", "sub_direction", "question_type", "difficulty", "harness", "os_platform", "repro_level"), "select"),
     **dict.fromkeys(("user_prompt", "feedback", "other_issues"), "textarea"),
@@ -424,9 +441,17 @@ def platform_style_problems(text: str, score: int | None = None) -> list[str]:
         errors.append("Feedback 原样堆叠了过多工具字段，改写成失败后果和处理经过")
     if BARE_TEST_COUNT_RE.search(text or ""):
         errors.append("Feedback 不要只报测试总数，要说明测试覆盖了哪些需求行为")
+    if GENERIC_TEST_LAYER_RE.search(text or ""):
+        errors.append("Feedback 不要只罗列测试层级后说全部通过，要写清测试验证的具体业务行为")
     style_counts = AI_STYLE_COUNT_RE.findall(text or "")
     if len(style_counts) >= 4:
         errors.append("Feedback 的条数、次数和项数密度过高，改写成关键动作与用户可见后果")
+    if len(set(OPERATIONAL_METRIC_RE.findall(text or ""))) >= 3:
+        errors.append("Feedback 的时长、容量或耗时等精确数值过密，删除不影响理解的程序量")
+    if TOOL_OUTPUT_LITERAL_RE.search(text or ""):
+        errors.append("Feedback 不要照搬终端成功输出，改成自然语言说明验证结果")
+    if sum(phrase in (text or "") for phrase in TELEGRAPH_PHRASES) >= 2:
+        errors.append("Feedback 出现多处业务术语速记，展开成主谓完整、有因果关系的表达")
     if ABSTRACT_REPORT_RE.search(text or ""):
         errors.append("Feedback 出现机器摘要式抽象串，改成具体动作和业务后果")
     for sentence in re.split(r"[。；\n]", text or ""):

@@ -340,8 +340,16 @@ class PlatformStyle(unittest.TestCase):
         self.assertTrue(any("工具字段" in item for item in submit.platform_style_problems(text)))
         self.assertTrue(any("测试总数" in item for item in submit.platform_style_problems("16 项后端测试通过。")))
         self.assertTrue(any("测试总数" in item for item in submit.platform_style_problems("32/32 通过。")))
+        self.assertTrue(any("测试层级" in item for item in
+                            submit.platform_style_problems("领域测试、服务层测试和生产构建全部通过。")))
         self.assertTrue(any("条数、次数和项数密度过高" in item for item in
                             submit.platform_style_problems("保留两条、三条，重复两次，再跑两轮。")))
+        self.assertTrue(any("精确数值过密" in item for item in
+                            submit.platform_style_problems("等待 48 小时，保留 90 天，释放 280GB。")))
+        self.assertTrue(any("终端成功输出" in item for item in
+                            submit.platform_style_problems("脚本输出 ALL CHECKS PASSED。")))
+        self.assertTrue(any("业务术语速记" in item for item in
+                            submit.platform_style_problems("完成水位与失败区间同笔落印，重复回执不重刷。")))
         self.assertTrue(any("抽象串" in item for item in
                             submit.platform_style_problems("复用已有版本锁定，清单同步没有依赖临时状态。")))
         self.assertTrue(any("具体文件、步骤或动作" in item for item in
@@ -349,6 +357,8 @@ class PlatformStyle(unittest.TestCase):
         self.assertTrue(any("必须明确写出具体问题" in item for item in
                             submit.platform_style_problems("页面显示状态不一致。", 2)))
         self.assertEqual(submit.platform_style_problems("争用发生时旧计划没有被覆盖，任务时间随后更新。"), [])
+        self.assertEqual(submit.platform_style_problems(
+            "模型首次运行失败，随后修正 CAND-0001 的状态判断，最终完成任务。", 4), [])
 
 
 class FakeClient:
