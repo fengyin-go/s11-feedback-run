@@ -70,14 +70,77 @@ def batch_deadline(root, batch, cfg):
     directory = lib.batch_dir(root, batch)
     path = directory / 'runtime-budget.json'
     with lib.file_lock(directory / '.runtime-budget.lock'):
-        candidates = [time.time() + cfg['run']['batch_budget']]
+        limit = cfg['run'].get('batch_budget')
+        if limit is None:
+            # Explicitly unlimited supersedes deadlines persisted by older runs.
+            lib.save_json(path, {'deadline': None, 'batch_budget': None})
+            return float('inf')
+        candidates = [time.time() + limit]
         for source in (path, directory / 'flow/plan.json', directory / 'runner/budget.json'):
             value = lib.load_json(source, default={}).get('deadline')
             if value is not None:
                 candidates.append(float(value))
         deadline = min(candidates)
-        lib.save_json(path, {'deadline': deadline})
+        lib.save_json(path, {'deadline': deadline, 'batch_budget': limit})
         return deadline
+
+
+def tail_remaining(tasks, cfg=None):
+    """Return tasks that can still consume a model run, excluding terminal failures."""
+    remaining = []
+    for task in tasks:
+        info = lib.load_state(Path(task))['stages'].get('run', {})
+        if lib.stage_ok(Path(task), 'run') or info.get('state') in ('failed', 'abandoned'):
+            continue
+        current = lib.load_json(Path(task) / 'run/current.json', default={})
+        if cfg and info.get('state') == 'deferred' and current.get('state') not in (
+                'starting', 'running', 'exited', 'continue_ready'):
+            import fbr_retry
+            attempts = lib.load_json(Path(task) / 'run/attempts.json', default=[])
+            if not fbr_retry.admission(attempts, cfg)['allowed']:
+                continue
+        remaining.append(Path(task))
+    return remaining
+
+
+def write_tail_policy(root, batch, tasks, cfg, source):
+    """Persist the shared tail-mode decision for live workers and recovery."""
+    directory = lib.batch_dir(root, batch) / source
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / 'tail-policy.json'
+    remaining = tail_remaining(tasks, cfg)
+    previous = lib.load_json(path, default={})
+    limit = int(cfg['run']['tail_max_tasks'])
+    active = 0 < len(remaining) <= limit
+    if active:
+        same = previous.get('active') is True and previous.get('task_ids') == [task.name for task in remaining]
+        value = {
+            'active': True,
+            'task_ids': [task.name for task in remaining],
+            'remaining': len(remaining),
+            'max_active_seconds': float(cfg['run']['tail_max_active_seconds']),
+            'max_wall_seconds': float(cfg['run']['tail_hard_wall_seconds']),
+            'activated_at': previous.get('activated_at') if same else lib.now_iso(),
+            'updated_at': lib.now_iso(),
+        }
+    else:
+        value = {'active': False, 'task_ids': [], 'remaining': len(remaining),
+                 'updated_at': lib.now_iso()}
+    if value != previous:
+        lib.save_json(path, value)
+    return value
+
+
+def tail_policy(task):
+    """Read the newest active tail policy that includes this task."""
+    batch = Path(task).parent
+    candidates = []
+    for source in ('runner', 'flow'):
+        path = batch / source / 'tail-policy.json'
+        value = lib.load_json(path, default={})
+        if value.get('active') and Path(task).name in value.get('task_ids', []):
+            candidates.append((path.stat().st_mtime, value))
+    return max(candidates, key=lambda item: item[0])[1] if candidates else {}
 
 
 def pressure_update(state, event, options, now):
@@ -482,21 +545,24 @@ def monitor_process(process, request, base, context, *, started=None, adopted=Fa
         spent_wait = waiting_total + (now - waiting_started if waiting_started else 0)
         save_budget(now, spent_wait)
         reason = ''
-        if waiting_started:
+        active = base_budget['active_seconds'] + now - started - spent_wait
+        tail = tail_policy(task)
+        if tail and (active >= tail['max_active_seconds'] or now - started >= tail['max_wall_seconds']):
+            reason = 'tail_timeout'
+        if not reason and waiting_started:
             if (now - waiting_started >= cfg['gateway_wait_limit']
                     or base_budget.get('waiting_seconds', 0) + spent_wait - request.get('attempt_waiting_base', base_budget.get('waiting_seconds', 0)) >= cfg['gateway_wait_total']
                     or (cfg.get('gateway_wait_task_total') is not None and base_budget.get('waiting_seconds', 0) + spent_wait >= cfg['gateway_wait_task_total'])):
                 reason = 'gateway_wait_exhausted'
-        elif now >= deadline and not progress_alive(watcher, now, cfg):
+        elif not reason and now >= deadline and not progress_alive(watcher, now, cfg):
             if not extended and now - watcher.progress <= 180:
                 deadline += cfg['grace_seconds']
                 extended = True
             else:
                 reason = 'timeout'
         # 无输出且无近期网关信号才判卡住；长工具等待仍有绝对预算限制。
-        elif now - max(watcher.progress, watcher.output) >= cfg['stall_seconds'] and not protected and not watcher.active_tools:
+        elif not reason and now - max(watcher.progress, watcher.output) >= cfg['stall_seconds'] and not protected and not watcher.active_tools:
             reason = 'stalled'
-        active = base_budget['active_seconds'] + now - started - spent_wait
         if not reason and active >= cfg['task_budget'] and not progress_alive(watcher, now, cfg):
             reason = 'task_budget'
         if not reason and now >= context['cfg'].get('_deadline', float('inf')) and not progress_alive(watcher, now, cfg):
@@ -518,6 +584,7 @@ def monitor_process(process, request, base, context, *, started=None, adopted=Fa
                          'waiting_seconds': base_budget.get('waiting_seconds', 0) + spent_wait,
                          'heartbeat': heartbeat,
                          'limits': {k: cfg.get(k) for k in ('gateway_wait_limit', 'gateway_wait_total', 'task_budget', 'timeout', 'stall_seconds')},
+                         'tail_policy': tail,
                          'batch_deadline': context['cfg'].get('_deadline'),
                          'worker_exit': lib.load_json(Path(base.get('result', '/nonexistent')), default={})}
             lib.save_json(task / 'run' / ('termination-' + str(base.get('request_id', 'unknown')) + '.json'), diagnosis)

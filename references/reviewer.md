@@ -23,22 +23,40 @@ reasoning_effort=high
 
 ```bash
 fbr_feedback.py card --batch b1110-01
+fbr_evidence.py ingest --task /绝对路径/batches/b1110-01/s11-000123
 fbr_reviewer.py review --batch b1110-01 --task s11-000123 --execute
 # 返回 needs_task_agent：当前任务 AI 开始产物验收、评分、写作和复核
 fbr_reviewer.py finalize --batch b1110-01 --task s11-000123 --candidate /绝对路径/candidate.json --verification /绝对路径/verification.json --execute
 ```
 
-`review` 读取全量主/子会话及获准续写索引，定向核对原始工具输入/返回、相关完整后续、末次改动后的验证及最终回答。报告必须覆盖每份原始轨迹，含连续原文出处；索引、facts 和模型自述只作导航。分析不负责产物评分或写 Feedback。保存 `review/trace-analysis.json` 后，生成 `review/task-agent-work.json`，返回 `needs_task_agent`。滚动调度保留此待办，当前任务 AI 必须主动处理，不能把这个返回视为完成。
+`review` 先由 `fbr_evidence.py` 对每份原始轨迹做一次全量流式摄取，建立 SHA、行偏移、事件图和 `trace-check.json`；reviewer 读取 `trace/review-pack.json`，不直接整读 `trace/projects/*.jsonl`。模型需要写入结论的原文，只能通过精确行号和 block 定向获取。报告必须覆盖每份原始轨迹，含连续原文出处；事件包、facts 和模型自述只作导航。分析不负责产物评分或写 Feedback。保存 `review/trace-analysis.json` 后，生成 `review/task-agent-work.json`，返回 `needs_task_agent`。滚动调度保留此待办，当前任务 AI 必须主动处理，不能把这个返回视为完成。
 
-当前任务 AI 先检查题面、diff、最终代码及相关调用链，再复用已有录屏和实跑证据。静态证据充分时无需重复启动；缺证据时按既有 probe 入口在任务镜像中补跑，不能直接在宿主机运行被审项目。补证后刷新 card；若轨迹报告仍有效，可用 `prepare --batch … --task … --execute` 仅刷新检查点，不调用外部模型。
+当前任务 AI 先读 `review/task-agent-brief.md`，再按需求查询相关 diff hunk、最终代码及调用链，复用已有录屏和实跑证据。不要整份读取 `facts.json`、`diff.patch`、原始轨迹或 `task-agent-history.json`。静态证据充分时无需重复启动；缺证据时按既有 probe 入口在任务镜像中补跑，不能直接在宿主机运行被审项目。补证后刷新 card/brief；若轨迹报告仍有效，可用 `prepare --batch … --task … --execute` 仅刷新检查点，不调用外部模型。
 
-candidate 是 `{"audit": ..., "feedback": ..., "needs_probes": []}`，结构见检查点中的 candidate_schema。verification 须包含：
+默认作者输入是 compact `review/decision-input.json`，完整结构见 `review/candidate-schema.json`。当前 AI 只写需求语义、正文、claims、score_basis 和 quality_checks；`fbr_reviewer.py build` 展开为正式 candidate/verification。唯一轨迹摘录可自动补 locator，歧义位置必须失败。手工完整 candidate 仍可兼容，verification 须包含：
+
+```json
+{
+  "requirements": [{"id": "R1", "verdict": "做到", "user_text": "用户可见结果", "anchors": []}],
+  "score": 4,
+  "feedback": "完整正文",
+  "claims": [{"sentence": "正文原句", "assertions": [], "verdict": "supported",
+              "reason": "原文依据", "later_check": "后续和最终状态",
+              "sources": [{"path": "trace/projects/x.jsonl", "excerpt": "连续原文"}]}],
+  "quality_checks": {"result_and_process": {"passed": true, "reason": "具体理由"}},
+  "process": [{"sentence": "过程句", "evidence": [], "audit": {"checks": {}, "note": ""}}],
+  "results": [], "issues": [], "test_claims": [], "score_basis": {},
+  "needs_probes": []
+}
+```
+
+脚本只补齐唯一来源 locator、需求状态、claim_reviews/process_audit 和 verification；不会填需求结论、分数、正文或语义理由。
 
 - `task_agent: "current_task_agent"`，如实表明复核者。
 - `binding`：检查点中的 binding 原样引用；它绑定证据、规则及轨迹分析摘要。
 - `candidate_sha`：`fbrlib.content_hash(candidate)`，不是文件原始字节摘要。
 - `checks`：feedback-quality.md 的七项语义判断，每项具体事实依据。
-- `claim_reviews`：按 `fbr_quality.public_units(feedback.feedback)` 顺序逐句列出 sentence、assertions、verdict、reason、later_check、sources(path/excerpt)。逐句复核必须真的回查原始来源、后续修正和最终影响，摘录必须逐字存在。过程句的来源必须包含原始轨迹 JSONL，并逐条包含 `process[].evidence` 的同一摘录；另找一段存在的日志不能替代该句证据。
+- `claim_reviews`：按 `fbr_quality.public_units(feedback.feedback)` 顺序逐句列出 sentence、assertions、verdict、reason、later_check、sources。原始轨迹 source 必须为 `{path,start_line,end_line,block,excerpt}`；脚本按精确区间校验，不得只写文件路径或 step。逐句复核必须真的回查原始来源、后续修正和最终影响，摘录必须逐字存在。过程句的来源必须包含原始轨迹 JSONL，并逐条包含 `process[].evidence` 的同一摘录；另找一段存在的日志不能替代该句证据。
 
 当前 AI 写完候选后另做复核轮，发现矛盾或证据不足先修候选、补证，不把它标成 supported。正文每句必须覆盖。过程断言结合轨迹报告与原始来源，产物断言检查代码、实际日志及基线，不用生成报告代替原始出处。评分标准和证据要求保持不变。
 
@@ -51,3 +69,5 @@ candidate 是 `{"audit": ..., "feedback": ..., "needs_probes": []}`，结构见�
 
 
 `finalize` 不加载配置、不调用模型；默认在通过后主动推送快照并回读，明确本地模式加 `--no-publish`。它核对绑定、证据契约、评分上限、查重、七项语义记录和逐句原文。失败保存候选、复核和错误到 task-agent-history.json，返回 repairing，由当前 AI 继续修复；不会采用失败候选。通过后保存 task-agent-v1 回执、归档旧版、执行门闸并立即刷新本地表。文件来源变化或规则变化会使回执失效，必须重新核实；不自动改稿或提交平台；发布失败保留验收结果，修复后补发布即可。人工 spotcheck 由真实审核人完成。
+
+`task-agent-history.json` 只保存每次尝试的摘要和内容寻址引用，完整 candidate/verification 在 `review/task-agent-history/objects/` 中各存一份；相同内容不会重复追加。`review/metrics.json` 记录 reviewer 的 token usage、prompt/response 字节、轨迹包大小和证据访问统计。

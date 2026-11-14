@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""SOLO2 单轮数据：计划、上传、建单、回读；默认不写平台。"""
+"""SOLO2 单轮数据：单题预检、计划、上传、建单、回读；默认不写平台。"""
 from __future__ import annotations
 
 import argparse
@@ -49,6 +49,8 @@ FIELD_TYPES = dict.fromkeys(FIELD_MAP, "text") | {
     **dict.fromkeys(("user_prompt", "feedback", "other_issues"), "textarea"),
     "env_snapshot": "url", "artifact_snapshot": "url", "score_delivery": "number", **MEDIA_TYPES,
 }
+PREFLIGHT_VERSION = 1
+PREFLIGHT_FILE = "review/submit-preflight.json"
 
 
 def digest(value) -> str:
@@ -211,6 +213,173 @@ def validate_plan(plan: dict, schema: dict) -> list[str]:
     if len(snapshots[0]) < 5 or snapshots[0][1:3] != snapshots[1][1:3]:
         errors.append("初始与产物快照必须属于同一GitHub仓库")
     return list(dict.fromkeys(errors))
+
+
+def preflight_path(task_dir: Path) -> Path:
+    return Path(task_dir) / PREFLIGHT_FILE
+
+
+def load_preflight(task_dir: Path) -> dict:
+    path = preflight_path(task_dir)
+    if not path.is_file() or path.is_symlink():
+        return {}
+    value = lib.load_json(path, default={})
+    return value if isinstance(value, dict) else {}
+
+
+def _known_session_ids(root: Path, batch_id: str, task_id: str) -> dict[str, set[str]]:
+    """Index current batch sessions so a one-item preflight still catches collisions."""
+    result: dict[str, set[str]] = {}
+    for task_dir in lib.task_dirs(root, batch_id):
+        ids = lib.load_json(task_dir / "trace/ids.json", default={})
+        session_id = str(ids.get("session_id") or "").strip()
+        if session_id and task_dir.name != task_id:
+            result.setdefault(session_id, set()).add(task_dir.name)
+    return result
+
+
+def preflight_one(root: Path, batch_id: str, task_id: str, *, client=None,
+                  schema: dict | None = None, records: list[dict] | None = None) -> dict:
+    """Run the complete local and read-only platform gate for one task.
+
+    The result is persisted even when blocked. ``plan`` is returned in memory but
+    is not written to the preflight file, so credentials and transient client
+    state never enter the evidence tree.
+    """
+    import fbr_feedback
+    import fbr_sheet
+
+    cfg = lib.settings(root)
+    task_dir = lib.task_dirs(root, batch_id, task_id)[0]
+    result = {
+        "schema_version": PREFLIGHT_VERSION,
+        "task_id": task_id,
+        "batch": batch_id,
+        "state": "blocked",
+        "ready": False,
+        "errors": [],
+        "warnings": [],
+        "feedback_sha": "",
+        "source_digest": "",
+        "content_digest": "",
+        "artifact_snapshot": "",
+        "schema_fingerprint": "",
+        "account": ACCOUNT,
+        "checked_at": lib.now_iso(),
+    }
+    plan = None
+    online_started = False
+    try:
+        rows, _ = fbr_feedback.gate_batch(root, batch_id, cfg, task_id)
+        match = next((row for row in rows if row.get("task_id") == task_id), None)
+        if not match:
+            result["errors"].append("单题 Feedback 门闸没有返回结果")
+        elif match.get("state") != "ok":
+            result["errors"].extend(match.get("errors") or [f"Feedback 门闸状态为 {match.get('state')}"])
+            result["warnings"].extend(match.get("warnings") or [])
+        valid, reason = delivery.current_feedback(task_dir)
+        if not valid:
+            result["errors"].append(reason)
+
+        manifest = delivery.export_batch(root, batch_id, cfg)
+        entry = next((row for row in manifest.get("tasks", []) if row.get("task_id") == task_id), None)
+        if not entry:
+            excluded = next((row for row in manifest.get("excluded", [])
+                             if row.get("task_id") == task_id), None)
+            raise lib.FbrError((excluded or {}).get("reason") or "任务未进入当前交付清单")
+        result["feedback_sha"] = str(entry.get("feedback_sha") or "")
+        result["source_digest"] = str(entry.get("source_digest") or "")
+        row, build_reason = fbr_sheet.build_row(root, task_dir, cfg, delivery_manifest=manifest)
+        if row is None:
+            raise lib.FbrError(build_reason or "无法生成提交行")
+        ids = lib.load_json(task_dir / "trace/ids.json", default={})
+        snapshot = lib.load_json(task_dir / "review/snapshot.json", default={})
+        result["artifact_snapshot"] = str(snapshot.get("artifact_snapshot") or "")
+        problems = fbr_sheet.row_problems(row, ids, snapshot)
+        plan = plan_from_row(root, task_dir, row, manifest)
+        result["content_digest"] = plan["content_digest"]
+        result["errors"].extend(platform_style_problems(
+            str(plan["data"].get("feedback", "")), plan["data"].get("score_delivery")))
+
+        if client is None:
+            from fbr_platform import Client
+            client = Client(account=ACCOUNT)
+        online_started = True
+        client.login()
+        me = client.me()
+        user = me.get("user", me)
+        if user.get("username") != ACCOUNT or user.get("must_change_password"):
+            raise lib.FbrError("登录账号不符或需要人工修改初始密码")
+        schema = schema or client.schema()
+        records = records if records is not None else own_records(client)
+        result["schema_fingerprint"] = str(schema.get("fingerprint") or "")
+        online_options = {f"{FIELD_MAP[f['field_key']]}的取值不在选项里："
+                          for f in schema_fields(schema) if f.get("field_type") == "select"}
+        result["errors"].extend(
+            problem for problem in problems
+            if problem not in ("缺提交人", "缺提交时间")
+            and not any(problem.startswith(prefix) for prefix in online_options)
+        )
+        result["errors"].extend(validate_plan(plan, schema))
+
+        domain = locked_domain(user, records)
+        if domain and plan["data"]["domain"] != domain:
+            result["errors"].append(f"账号已锁定领域 {domain}，本条领域不符")
+        duplicates = _known_session_ids(root, batch_id, task_id)
+        if plan["data"]["session_id"] in duplicates:
+            result["errors"].append(
+                f"同批 SessionID 与 {','.join(sorted(duplicates[plan['data']['session_id']]))} 重复")
+        matches = [record for record in records
+                   if record_session(record) == plan["data"]["session_id"]]
+        if len(matches) > 1:
+            result["errors"].append("平台存在多个相同 SessionID 记录，停止自动提交")
+        receipt = lib.load_json(task_dir / "review/upload.json", default={})
+        if not isinstance(receipt, dict):
+            result["errors"].append("提交回执必须为 JSON 对象，旧格式需先核对")
+            receipt = {}
+        same_receipt = (
+            receipt.get("content_digest") == plan["content_digest"]
+            and receipt.get("account") == ACCOUNT
+            and receipt.get("platform") == BASE_URL
+        )
+        if same_receipt:
+            uploads = receipt.get("uploads")
+            if not isinstance(uploads, dict) or set(uploads) - set(MEDIA_TYPES):
+                result["errors"].append("回执中的附件清单格式无效，先核对再继续")
+            elif receipt.get("submission_id") and set(uploads) != set(MEDIA_TYPES):
+                result["errors"].append("已有记录 ID 但附件回执不完整，停止自动提交")
+        if receipt.get("state") in ("creating", "verifying", "uncertain") and not valid_id(
+                receipt.get("submission_id")):
+            result["errors"].append("已有提交回执但平台结果待核对，禁止自动重复建单")
+        if receipt.get("submission_id") and not same_receipt:
+            result["errors"].append("已有平台单与当前交付摘要不一致，需先核对")
+        if matches and not (same_receipt and receipt.get("submission_id")):
+            result["errors"].append(
+                f"SessionID 已存在于平台记录 {matches[0]['id']}，不能重复建单")
+    except (lib.FbrError, OSError, ValueError) as exc:
+        result["errors"].append(str(exc))
+        if online_started:
+            from fbr_platform import PlatformError
+            if isinstance(exc, PlatformError):
+                result["state"] = "retry"
+                lib.save_json(preflight_path(task_dir), result)
+                raise
+    result["errors"] = list(dict.fromkeys(item for item in result["errors"] if item))
+    result["ready"] = not result["errors"]
+    result["state"] = "ready" if result["ready"] else "blocked"
+    result["checked_at"] = lib.now_iso()
+    if plan is not None:
+        lib.save_json(task_dir/'review/upload-plan.json', {
+            'version': 1, 'task_id': task_id, 'batch': batch_id,
+            'content_digest': plan.get('content_digest'),
+            'data': plan.get('data'), 'files': plan.get('files'),
+            'binding': plan.get('binding'), 'at': lib.now_iso(),
+        })
+    lib.save_json(preflight_path(task_dir), result)
+    output = dict(result)
+    if plan is not None:
+        output["plan"] = plan
+    return output
 
 
 def media_url(value: str) -> str:
@@ -592,6 +761,46 @@ def submit_one(root: Path, plan: dict, client, schema: dict, records: list[dict]
         raise
 
 
+def submit_ready(root: Path, batch_id: str, task_id: str, *, execute: bool = False,
+                 confirm: str = "", client=None) -> dict:
+    """Preflight and submit one task under the account-level write lock.
+
+    A blocked preflight returns without any upload or create request. Once the
+    preflight is ready, the existing ``submit_one`` path still rechecks the
+    source binding and schema immediately around those mutations.
+    """
+    if execute and confirm != "SUBMIT":
+        raise lib.FbrError("真实平台提交需要 --execute --confirm SUBMIT")
+    if client is None:
+        from fbr_platform import Client
+        client = Client(account=ACCOUNT)
+    with submit_lock(root):
+        client.login()
+        me = client.me()
+        user = me.get("user", me)
+        if user.get("username") != ACCOUNT or user.get("must_change_password"):
+            raise lib.FbrError("登录账号不符或需要人工修改初始密码")
+        schema, records = client.schema(), own_records(client)
+        preflight = preflight_one(root, batch_id, task_id, client=client,
+                                  schema=schema, records=records)
+        output = {key: value for key, value in preflight.items() if key != "plan"}
+        if preflight.get("state") == "retry":
+            raise lib.FbrError("；".join(preflight.get("errors") or ["平台预检暂时失败"]))
+        if not preflight.get("ready"):
+            return output
+        plan = preflight["plan"]
+        preview = submit_one(root, plan, client, schema, records, execute=False)
+        if preview.get("state") == "confirmed":
+            output.update(task_result=preview, state="confirmed")
+            return output
+        if not execute:
+            output.update(task_result=preview, state="ready")
+            return output
+        submitted = submit_one(root, plan, client, schema, records, execute=True)
+        output.update(task_result=submitted, state="confirmed")
+        return output
+
+
 def repair_one(root: Path, plan: dict, client, schema: dict, *, execute: bool, comment: str) -> dict:
     task_dir = root / "batches" / plan["batch"] / plan["task_id"]
     path = task_dir / "review/upload.json"
@@ -724,7 +933,9 @@ def run_batch(root: Path, batch_id: str, *, tasks: str | None = None, limit: int
                 "locked_domain": domain or "尚未锁定；首次提交后锁定", "tasks": rows}
 
 
-def probe(client=None) -> dict:
+def probe(root: Path | None = None, client=None) -> dict:
+    if client is None and root is not None and not isinstance(root, (str, Path)):
+        client, root = root, None
     if client is None:
         from fbr_platform import Client
         client = Client(account=ACCOUNT)
@@ -736,17 +947,75 @@ def probe(client=None) -> dict:
     schema = client.schema()
     fields = schema_fields(schema)
     records = own_records(client)
-    return {"platform": BASE_URL, "account": ACCOUNT, "fingerprint": schema["fingerprint"],
+    result = {"platform": BASE_URL, "account": ACCOUNT, "fingerprint": schema["fingerprint"],
             "fields": [{k: f.get(k) for k in ("field_key", "label", "field_type", "is_required", "options")}
                        for f in fields], "existing_records": len(records), "locked_domain": locked_domain(user, records),
             "attachment_max_mb": schema.get("attachment_max_mb"), "video_max_mb": schema.get("video_max_mb", 500)}
+    if root is not None:
+        target = Path(root)/'_registry/platform-schema'/f"{schema['fingerprint']}.json"
+        lib.save_json(target, {'schema': schema, 'probe': {k: v for k, v in result.items() if k != 'fields'},
+                               'at': lib.now_iso()})
+        result['schema_report'] = str(target)
+    return result
+
+
+def compact_result(result: dict, *, full: bool = False) -> str:
+    if full:
+        return json.dumps(result, ensure_ascii=False, indent=2)
+    if 'fields' in result:
+        return (f"平台 {result.get('account')} / {result.get('fingerprint')}："
+                f"{len(result.get('fields') or [])} 字段，已有记录 {result.get('existing_records')}，"
+                f"锁定领域 {result.get('locked_domain')}；完整 schema {result.get('schema_report', '未保存')}")
+    rows = result.get('tasks')
+    if isinstance(rows, list):
+        counts = {}
+        for row in rows:
+            state = row.get('state', 'unknown')
+            counts[state] = counts.get(state, 0)+1
+        lines = [f"{result.get('platform')} {result.get('account')} execute={result.get('execute')}：" +
+                 " / ".join(f"{key} {value}" for key, value in sorted(counts.items()))]
+        for row in rows[:10]:
+            errors = row.get('errors') or []
+            detail = "；".join(str(item) for item in errors[:3]) if errors else row.get('detail', '')
+            lines.append(f"- {row.get('task_id')} {row.get('state')} {lib.clip(detail, 200)}".rstrip())
+        if len(rows) > 10:
+            lines.append(f"- 其余 {len(rows)-10} 条见完整回执")
+        return "\n".join(lines)
+    if 'plan' in result:
+        result = {k: v for k, v in result.items() if k != 'plan'}
+    task = result.get('task_id', '')
+    state = result.get('state', 'ok')
+    errors = result.get('errors') or []
+    detail = result.get('detail') or result.get('submission_id') or result.get('status') or ''
+    lines = [f"{task}\t{state}\t{lib.clip(detail, 200)}".rstrip()]
+    if errors:
+        lines.append(f"错误 {len(errors)} 项")
+        lines.extend(f"- {lib.clip(str(item), 200)}" for item in errors[:5])
+        if len(errors) > 5:
+            lines.append(f"- 其余 {len(errors)-5} 项见 submit-preflight.json")
+    return "\n".join(lines)
+
+
+def schema_field(root: Path, fingerprint: str, name: str) -> dict | None:
+    path = Path(root)/'_registry/platform-schema'/f'{fingerprint}.json'
+    doc = lib.load_json(path)
+    fields = (doc.get('schema') or {}).get('fields') or []
+    return next((row for row in fields if isinstance(row, dict)
+                 and name in (row.get('field_key'), row.get('label'))), None)
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root")
     sub = parser.add_subparsers(dest="command", required=True)
-    sub.add_parser("probe", help="登录并只读核对账号、字段、领域和历史记录")
+    probe_parser = sub.add_parser("probe", help="登录并只读核对账号、字段、领域和历史记录")
+    field_parser = sub.add_parser("schema-field", help="按 fingerprint 查询单个平台字段")
+    field_parser.add_argument("--fingerprint", required=True)
+    field_parser.add_argument("--field", required=True)
+    field_parser.add_argument("--json", action="store_true")
+    pf = sub.add_parser("preflight", help="只读执行单题提交前预检并落本地回执")
+    pf.add_argument("--batch", required=True)
+    pf.add_argument("--task", required=True)
     p = sub.add_parser("submit", help="默认演练；上传附件、建单和回读需明确执行")
     p.add_argument("--batch", required=True)
     p.add_argument("--tasks")
@@ -759,17 +1028,30 @@ def main() -> int:
     r.add_argument("--execute", action="store_true")
     r.add_argument("--confirm", default="")
     r.add_argument("--comment", default="")
+    for item in (probe_parser, pf, p, r):
+        item.add_argument("--json", action="store_true")
     args = parser.parse_args()
     try:
         if args.command == "probe":
-            result = probe()
+            result = probe(lib.find_root(args.root))
+        elif args.command == "schema-field":
+            result = schema_field(lib.find_root(args.root), args.fingerprint, args.field)
+            if result is None:
+                raise lib.FbrError("schema 中没有该字段")
+        elif args.command == "preflight":
+            result = preflight_one(lib.find_root(args.root), args.batch, args.task)
         elif args.command == "repair":
             result = repair_batch(lib.find_root(args.root), args.batch, tasks=args.tasks,
                                   execute=args.execute, confirm=args.confirm, comment=args.comment)
         else:
             result = run_batch(lib.find_root(args.root), args.batch, tasks=args.tasks,
                                limit=args.limit, execute=args.execute, confirm=args.confirm)
-        print(json.dumps(result, ensure_ascii=False, indent=2))
+        if args.command == "schema-field":
+            print(json.dumps(result, ensure_ascii=False, indent=2) if args.json
+                  else f"{result.get('field_key')}\t{result.get('label')}\t"
+                       f"type={result.get('field_type')} required={result.get('is_required')}")
+        else:
+            print(compact_result(result, full=args.json))
         return 0
     except lib.FbrError as exc:
         print(f"错误：{exc}", file=sys.stderr)

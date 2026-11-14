@@ -6,17 +6,20 @@ import json
 from pathlib import Path
 import re
 
+import fbr_evidence
 import fbr_gate as gate
 import fbrlib as lib
 
-VERSION = 11
+VERSION = 13
+SUPPORTED_CERTIFICATE_VERSIONS = {12, 13}
 CHECKS = ("result_and_process", "task_specific_voice", "test_relevance", "score_alignment",
           "evidence_fidelity", "scope_discipline", "non_template")
 RULE_FILES = ("references/scoring.md", "references/feedback-writing.md", "references/feedback-calibration.md",
               "references/feedback-quality.md", "references/process-attribution-audit.md",
               "scripts/fbr_gate.py", "scripts/fbr_quality.py",
-              "scripts/fbr_feedback.py", "scripts/fbr_trace_review.py", "scripts/fbr_sources.py")
-TRACE_RULE_FILES = ("scripts/fbr_trace_review.py", "scripts/fbr_sources.py")
+              "scripts/fbr_feedback.py", "scripts/fbr_reviewer.py",
+              "scripts/fbr_trace_review.py", "scripts/fbr_sources.py", "scripts/fbr_evidence.py")
+TRACE_RULE_FILES = ("scripts/fbr_trace_review.py", "scripts/fbr_sources.py", "scripts/fbr_evidence.py")
 LEGACY_TRACE_POLICIES = {
     "a0eeac329d747bc52e6ee804ac30920511498b22344334cdb94a1910e328ca3c",
     "41e8cc299da551d1c8f22773ec0b0307262ddd13f5eb41cb2903b3bcc68d1e72",
@@ -298,6 +301,61 @@ def check_contract(doc: dict, task: dict, facts: dict, audit: dict, probes: list
     return errors
 
 
+def requirements_status_errors(doc: dict, task: dict, audit: dict, ev: dict) -> list[str]:
+    """Require one structured completion status for every explicit requirement."""
+    statuses = doc.get("requirements_status")
+    if not isinstance(statuses, list) or not statuses:
+        return ["requirements_status 必须逐项列出每个需求已完成、部分完成、未完成或无法验证"]
+    errors = []
+    expected = {}
+    for row in audit.get("requirements", []):
+        if not isinstance(row, dict) or not row.get("id"):
+            continue
+        if row.get("verdict") == "做到":
+            expected[row["id"]] = "completed"
+        elif row.get("verdict") == "有问题" and row.get("level") == "未实现":
+            expected[row["id"]] = "missing"
+        elif row.get("verdict") == "有问题":
+            expected[row["id"]] = "partial"
+        elif row.get("verdict") == "看不出来":
+            expected[row["id"]] = "unverified"
+    seen = []
+    for index, item in enumerate(statuses, 1):
+        label = f"第 {index} 个需求状态"
+        if not isinstance(item, dict):
+            errors.append(label + "格式不对")
+            continue
+        requirement_id = item.get("requirement_id")
+        if requirement_id not in ev.get("req_ids", set()):
+            errors.append(label + "指向不存在的需求点")
+            continue
+        seen.append(requirement_id)
+        if item.get("status") not in ("completed", "partial", "missing", "unverified"):
+            errors.append(label + "status 必须是 completed、partial、missing 或 unverified")
+        elif expected.get(requirement_id) != item.get("status"):
+            errors.append(f"{requirement_id} 的 requirements_status 与 audit 结论不一致")
+        if len(str(item.get("user_text") or "").strip()) < 6:
+            errors.append(label + "必须写用户能理解的完成内容或缺口")
+        anchors = item.get("anchors")
+        if not isinstance(anchors, list) or not anchors:
+            errors.append(label + "缺少证据 anchors")
+        else:
+            errors += gate._anchor_problems(anchors, ev, label)
+    if len(seen) != len(set(seen)):
+        errors.append("requirements_status 存在重复需求点")
+    if set(seen) != set(ev.get("req_ids", set())):
+        missing = sorted(set(ev.get("req_ids", set())) - set(seen))
+        errors.append("requirements_status 没有覆盖全部需求点：" + "、".join(missing))
+    result_ids = set()
+    for item in doc.get("results", []):
+        if isinstance(item, dict):
+            result_ids.update(item.get("requirement_ids") or [])
+    if result_ids != set(ev.get("req_ids", set())):
+        missing = sorted(set(ev.get("req_ids", set())) - result_ids)
+        errors.append("results 没有按需求编号覆盖全部完成度和缺口：" + "、".join(missing))
+    return errors
+
+
 def report_errors(report: object) -> list[str]:
     if not isinstance(report, dict) or not isinstance(report.get("checks"), list):
         return ["语义复核未返回 checks 列表"]
@@ -319,7 +377,7 @@ def public_units(text: str) -> list[str]:
     return [s.strip() for s in re.split(r'[。；！？\n]+', text) if s.strip()]
 
 
-def claim_report_errors(report: dict, doc: dict, task: Path) -> list[str]:
+def claim_report_errors(report: dict, doc: dict, task: Path, *, strict_locators: bool = True) -> list[str]:
     """强制逐句复查及原文摘录；摘录能否支持含义仍由当前任务 AI 逐句复核。"""
     rows = report.get('claim_reviews')
     units = public_units(doc.get('feedback', ''))
@@ -334,6 +392,44 @@ def claim_report_errors(report: dict, doc: dict, task: Path) -> list[str]:
     if not isinstance(rows, list) or len(rows) != len(units):
         return ['逐句复查缺失：claim_reviews 必须按顺序覆盖全部正文句段']
     errors = []
+    trace_rows = []
+    for index, row in enumerate(rows, 1):
+        if not isinstance(row, dict):
+            continue
+        for source in row.get('sources') or []:
+            if (isinstance(source, dict)
+                    and str(source.get('path', '')).startswith('trace/projects/')
+                    and str(source.get('path', '')).endswith('.jsonl')):
+                has_locator = all(source.get(name) is not None
+                                  for name in ('start_line', 'end_line', 'block'))
+                if strict_locators or has_locator:
+                    trace_rows.append((index, source))
+    trace_checked = {}
+    if trace_rows:
+        try:
+            checked = fbr_evidence.verify_refs(
+                Path(task), [source for _, source in trace_rows], operation='claim-review')
+        except lib.FbrError as exc:
+            for _, source in trace_rows:
+                key = (source.get('path'), source.get('start_line'),
+                       source.get('end_line', source.get('start_line')),
+                       source.get('block'), source.get('excerpt'))
+                trace_checked[key] = str(exc)
+        else:
+            if checked.get('errors'):
+                for failure in checked['errors']:
+                    ref = failure.get('ref') or {}
+                    key = (ref.get('path'), ref.get('start_line'),
+                           ref.get('end_line', ref.get('start_line')),
+                           ref.get('block'), ref.get('excerpt'))
+                    trace_checked[key] = failure.get('error', '原始轨迹校验失败')
+        for _, source in trace_rows:
+            key = (source.get('path'), source.get('start_line'),
+                   source.get('end_line', source.get('start_line')),
+                   source.get('block'), source.get('excerpt'))
+            if strict_locators and any(source.get(name) is None for name in
+                                       ('start_line', 'end_line', 'block')):
+                trace_checked[key] = '原始轨迹来源缺少 start_line、end_line 或 block'
     for index, (unit, row) in enumerate(zip(units, rows), 1):
         label = f'第 {index} 句复查'
         if not isinstance(row, dict) or row.get('sentence') != unit:
@@ -390,7 +486,16 @@ def claim_report_errors(report: dict, doc: dict, task: Path) -> list[str]:
                     or not path.is_file()):
                 errors.append(label + '来源不是本题可核对的原始材料')
                 continue
-            if quote not in path.read_text(errors='replace'):
+            if name.startswith('trace/projects/'):
+                key = (name, source.get('start_line'), source.get('end_line', source.get('start_line')),
+                       source.get('block'), quote)
+                if key in trace_checked:
+                    errors.append(label + '：' + trace_checked[key])
+                elif not strict_locators and not all(source.get(field) is not None
+                                                     for field in ('start_line', 'end_line', 'block')):
+                    if quote not in path.read_text(errors='replace'):
+                        errors.append(label + '摘录不在原始文件中')
+            elif quote not in path.read_text(errors='replace'):
                 errors.append(label + '摘录不在原始文件中')
     return errors
 
@@ -400,12 +505,19 @@ def certificate_errors(task: Path, receipt: dict) -> list[str]:
     if path.is_symlink() or not path.is_file():
         return ["缺少当前任务 AI 的 Feedback 语义复核回执"]
     cert = lib.load_json(path, default={})
-    if not isinstance(cert, dict) or cert.get("version") != VERSION or cert.get("state") != "accepted":
+    if (not isinstance(cert, dict) or cert.get("version") not in SUPPORTED_CERTIFICATE_VERSIONS
+            or cert.get("state") != "accepted"):
         return ["Feedback 语义复核尚未通过"]
     allowed = {policy_sha()} | LEGACY_FEEDBACK_POLICIES
     if receipt.get("policy_sha") not in allowed or cert.get("policy_sha") not in allowed:
         return ["Feedback 规则已更新，须按当前规则重新生成并复核"]
-    for key in ("workflow", "trace-analysis_sha", "source_inputs", "model", "reasoning_effort", "provider", "inputs", "audit_sha", "feedback_sha"):
+    keys = ["workflow", "trace-analysis_sha", "source_inputs", "model", "reasoning_effort",
+            "provider", "inputs", "audit_sha", "feedback_sha"]
+    if cert.get("version", 0) >= 13:
+        keys.append("trace_check_sha")
+    for key in keys:
         if cert.get(key) != receipt.get(key):
             return ["Feedback 语义复核与当前模型回执、证据或正文不一致"]
-    return report_errors(cert) + claim_report_errors(cert, lib.load_json(task / 'review/feedback.json'), task)
+    strict = cert.get("version", 0) >= 13
+    return report_errors(cert) + claim_report_errors(
+        cert, lib.load_json(task / 'review/feedback.json'), task, strict_locators=strict)

@@ -6,6 +6,9 @@ fbr_reviewer.py review 仅通过 reviewer.env 分析轨迹并返回 needs_task_a
 
 现有 score、feedback、issues、process、note 保留；新增三项及 `process_audit` 仅供核对，不进入平台或结果表正文。
 
+默认作者格式是 `review/decision-input.json`：需求条目同时保留 `verdict/level/note/user_text/anchors`；`process[]` 可内嵌 `audit`；顶层 `claims[]` 按正文顺序保存逐句断言和原始来源；`quality_checks` 保存七项检查理由。`fbr_reviewer.py build` 只做结构展开：从需求生成 audit/requirements_status，从 claims 生成 claim_reviews，从 process.audit 生成 process_audit，从检查理由生成 verification。脚本不生成或修改评分、需求结论、过程判断和正文。
+
+- requirements_status：逐项 {requirement_id, status, user_text, anchors}。status 为 completed、partial、missing、unverified，必须与 audit 的“做到/有问题/看不出来”及问题级别一致，并覆盖全部需求点。user_text 写用户能看到的完成能力、部分能力或具体缺口；results 的 requirement_ids 合起来也必须覆盖全部需求。
 - results：至少一条 {sentence, requirement_ids, anchors}。sentence 是正文中说明最终行为的连续原文，requirement_ids 指向真实需求；anchors 至少含产物文件、缺失文件、运行日志、probe、演示或失败用例证据。不能只填需求编号或过程步骤。
 - score_basis：{category, delivered, remaining, why_this_score, lowest_supported_score, lower_score_rejected, anchors}。category 为 delivery_issue、verification_gap、process_issue 或 complete；process_issue 只用于 4 分，表示最终交付没有已证实功能缺口，但模型过程出现真实错误验证、错判、实现返工或关键竞争未正确复核，因此不满足 5 分的一次性完美跑通。其余字段分别解释实际完成部分、真实残余问题或验证边界、为何处于该档。lowest_supported_score 必须等于 score；lower_score_rejected 至少 8 字，解释为什么不能更低（1 分说明已最低）；anchors 必须真实有效。确证前提下选择最低合理档位。
 - test_claims：正文有测试描述时逐处登记 {sentence, requirement_ids, behavior, source, output_excerpt, count, count_quote}，没有时为 []。sentence 要覆盖完整相关分句，不能只标出 make test 而漏掉后面的通过结论。behavior 说明检查的本题行为；output_excerpt 是该次执行真实输出中的连续摘录。
@@ -42,11 +45,11 @@ process_audit 必须与 process 等长、同序、同句，每项为 {sentence, 
 
 ## 逐句回查，防止分析结论幻觉
 
-claim_reviews 按脚本给出的 public_units 顺序覆盖全部正文，不能只登记有锚点的句子。每项为 {sentence, assertions, verdict, reason, later_check, sources:[{path,excerpt}]}。assertions 拆出该句每个可核实的事实和因果断言；reason 解释原文如何支持全部断言；later_check 说明后续是否修正及最终状态，不能只看首次报错。verdict 为 supported、contradicted 或 insufficient，只有全部 supported 才通过。复核者独立阅读原文，不采信生成侧自报的分析结论。每个过程不满意断言必须在这第二轮重新配对工具输入与返回，检查完整相关后续的重试、修正和最终影响；不只核查错误首次出现的片段。先用覆盖全部会话的索引定位，再定向读取原文，避免两轮重复通读无关大文件。索引不作为 sources；结果静态证据充分时无需为同一结论启动服务。
+claim_reviews 按脚本给出的 public_units 顺序覆盖全部正文，不能只登记有锚点的句子。每项为 {sentence, assertions, verdict, reason, later_check, sources}。原始轨迹 source 必须是 `{path,start_line,end_line,block,excerpt}`，非轨迹来源仍须是本题原始材料。assertions 拆出该句每个可核实的事实和因果断言；reason 解释原文如何支持全部断言；later_check 说明后续是否修正及最终状态，不能只看首次报错。verdict 为 supported、contradicted 或 insufficient，只有全部 supported 才通过。复核者独立阅读精确原始区间，不采信生成侧自报的分析结论。每个过程不满意断言必须在这第二轮重新配对工具输入与返回，检查完整相关后续的重试、修正和最终影响；不只核查错误首次出现的片段。先读全量事件包定位，再按行号和 block 批量读取原文；禁止把原始轨迹整文件放入上下文。事件包和索引不作为 sources；结果静态证据充分时无需为同一结论启动服务。
 
 过程句的 sources 必须包含原始轨迹 JSONL，并逐条包含 process.evidence 的同一摘录。若正文写“测试失败后修正”，而 evidence 只引了无关的 typecheck、复核摘录只引了其他日志，闸门会拒绝。存在多轮续写时，仍按首轮加全部获准“继续”的完整会话回查。
 
-sources 引用本题原始会话、工具返回、命令日志、probe、题面、diff、录屏元数据或产物代码，保存相对路径与连续原文。脚本拒绝生成摘要、越界路径、符号链接和原文不存在的摘录；引用存在只能证明出处，不自动证明语义正确。语义复核必须检查所有断言是否被支持，以及正文是否漏掉已确证的重要过程/产物问题。
+sources 引用本题原始会话、工具返回、命令日志、probe、题面、diff、录屏元数据或产物代码，保存相对路径与连续原文。脚本对 trace 来源按文件批量打开，只读取指定偏移区间；拒绝生成摘要、越界路径、符号链接、错误行号/block 和区间内不存在的摘录。引用存在只能证明出处，不自动证明语义正确。语义复核必须检查所有断言是否被支持，以及正文是否漏掉已确证的重要过程/产物问题。
 
 重点复查：调用是否真正成功、后面有没有重试并修好、当前文件是否仍有缺陷、基线是否本来如此、失败是否来自验收环境，以及局部输入能否支持所写影响范围。声称“未实现”须核对实际入口和调用链；声称“从未/没有再验证”须查完整相关后续会话；业务影响与因果需有机制或复现支持。找不到证据时删除或缩小断言，需实跑则返回 probe，不以常识或模型推断补齐。
 

@@ -14,9 +14,13 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import os
 import re
+import signal
+import subprocess
 import sys
 import time
+import zipfile
 from datetime import datetime
 from pathlib import Path
 
@@ -94,9 +98,11 @@ def build_row(root: Path, task_dir: Path, cfg: dict, *, delivery_manifest: dict 
         return None, "过闸门之后正文改过，要重新过一遍"
     if doc.get("score") != info.get("score"):
         return None, "过闸门之后分数改过，要重新过一遍"
-    problems = reviewer.provenance_errors(task_dir)
-    if problems:
-        return None, problems[0]
+    cleaned = lib.load_json(task_dir / "cleanup.json", default={}).get("state") == "cleaned"
+    if not cleaned:
+        problems = reviewer.provenance_errors(task_dir)
+        if problems:
+            return None, problems[0]
     artifact_dir = task_dir
     if delivery_manifest is not None:
         artifact_dir = delivery.exported_task(root, task_dir.parent.name, task_dir.name, delivery_manifest)
@@ -147,6 +153,16 @@ def build_row(root: Path, task_dir: Path, cfg: dict, *, delivery_manifest: dict 
     if status.get("valid"):
         row.update({"轨迹文件": status["trace"], "运行录屏": status["video"],
                     "提交人": status["submitter"], "提交时间": show_time(status["submitted_at"])})
+    elif status["state"] == "未提交":
+        preflight = lib.load_json(task_dir / "review/submit-preflight.json", default={})
+        if preflight.get("state") == "ready":
+            row["上传状态"] = "预检通过，待提交"
+        elif preflight.get("state") == "blocked":
+            errors = preflight.get("errors") or ["存在阻断项"]
+            row["上传状态"] = "预检失败 / " + lib.clip("；".join(str(item) for item in errors), 120)
+    cleanup = lib.load_json(task_dir / "cleanup.json", default={})
+    if cleanup.get("state") == "cleaned":
+        row["上传状态"] += " / 已清理"
     row["数据状态"] = "；".join(row_problems(row, ids, snapshot)) or "可提交"
     row["闸门状态"] = "通过" if row["数据状态"] == "可提交" else "未通过：" + row["数据状态"]
     return row, ""
@@ -201,6 +217,9 @@ def run_activity(task_dir: Path) -> str:
     if fbr_runtime.alive(current):
         heartbeat = lib.load_json(task_dir / 'run/heartbeat.json', default={})
         return '网关内部重试中，模型尚未跑完' if heartbeat.get('pid') == current.get('pid') and heartbeat.get('gateway_wait') else '模型运行中，尚未跑完'
+    prewarm = lib.load_json(task_dir.parent / 'dependency-prewarm.json', default={})
+    if prewarm.get('state') == 'running':
+        return '公共依赖预热中，模型尚未启动'
     owner = {'pid': current.get('owner_pid'), 'identity': current.get('owner_identity')}
     for kind in ('runner', 'flow'):
         plan = lib.load_json(task_dir.parent / kind / 'plan.json', default={})
@@ -237,6 +256,8 @@ def run_activity(task_dir: Path) -> str:
 
 def pending_reason(task_dir: Path) -> str:
     stages = lib.load_state(task_dir)['stages']
+    if stages.get('run', {}).get('state') == 'abandoned':
+        return '批次尾部超时，已主动放弃'
     if stages.get('run', {}).get('state') != 'ok':
         active = run_activity(task_dir)
         if active:
@@ -258,6 +279,20 @@ def pending_reason(task_dir: Path) -> str:
         if info.get('state') in ('failed', 'deferred'):
             return STAGE_LABEL[stage] + '：' + lib.clip(detail, 200)
         return ('模型尚未跑完，等待运行' if stage == 'run' else '模型已跑完，待' + STAGE_LABEL[stage])
+    upload = lib.load_json(task_dir / "review/upload.json", default={})
+    cleanup = lib.load_json(task_dir / "cleanup.json", default={})
+    if cleanup.get("state") == "cleaned":
+        return ""
+    if upload.get("state") == "confirmed":
+        return ""
+    if upload.get("submission_id") or upload.get("state") in ("creating", "verifying", "uncertain"):
+        return "平台提交待核对或待质检"
+    preflight = lib.load_json(task_dir / "review/submit-preflight.json", default={})
+    if preflight.get("state") == "blocked":
+        errors = preflight.get("errors") or ["存在阻断项"]
+        return "提交预检未过：" + lib.clip("；".join(str(item) for item in errors), 200)
+    if preflight.get("state") == "ready":
+        return "提交预检通过，待提交"
     return ''
 
 
@@ -266,7 +301,8 @@ def progress_row(task_dir: Path, reason: str) -> list:
     cells = [task_dir.name]
     for stage in lib.STAGES:
         info = stages.get(stage, {})
-        label = {'ok': '✓', 'failed': '✗', 'dry': '待验收', 'deferred': '等待'}.get(info.get('state'), '')
+        label = {'ok': '✓', 'failed': '✗', 'dry': '待验收', 'deferred': '等待',
+                 'abandoned': '放弃'}.get(info.get('state'), '')
         if stage == 'run' and info.get('state') != 'ok':
             active = run_activity(task_dir)
             if active:
@@ -278,12 +314,116 @@ def progress_row(task_dir: Path, reason: str) -> list:
     return cells
 
 
-def write_sheet(root: Path, batch_id: str, cfg: dict) -> dict:
+def _source_values(path: Path) -> list:
+    if not path.is_file() or path.is_symlink():
+        return [False]
+    return [path.stat().st_size, hashlib.sha256(path.read_bytes()).hexdigest()]
+
+
+def progress_fingerprint(root: Path, batch_id: str, cfg: dict) -> str:
+    """Hash only values that can change the visible progress or current result rows."""
+    import fbr_runtime
+    batch = lib.batch_dir(root, batch_id)
+    tasks = []
+    watched = ("state.json", "run/current.json", "run/attempts.json", "trace/ids.json",
+               "review/snapshot.json", "review/feedback.json", "review/gate.json",
+               "review/submit-preflight.json", "review/upload.json", "cleanup.json",
+               "record/recording.json")
+    active_states = {"starting", "running", "continue_ready", "exited"}
+    for task in lib.task_dirs(root, batch_id):
+        current = lib.load_json(task / "run/current.json", default={})
+        record = task / "record/recording.mp4"
+        tasks.append({
+            "task_id": task.name,
+            "files": {name: _source_values(task / name) for name in watched},
+            "video": [record.is_file(), record.stat().st_size if record.is_file() else None],
+            "worker_alive": (fbr_runtime.alive(current)
+                             if current.get("state") in active_states else False),
+        })
+    controllers = {}
+    for kind in ("runner", "flow"):
+        process = lib.load_json(batch / kind / "process.json", default={})
+        controllers[kind] = {
+            "alive": fbr_runtime.alive(process),
+            "plan": _source_values(batch / kind / "plan.json"),
+            "drain": (batch / kind / "drain").exists(),
+            "pause": (batch / kind / "pause").exists(),
+        }
+    manifest = lib.load_json(delivery.delivery_dir(root, batch_id) / "delivery-manifest.json", default={})
+    visible_manifest = [{key: task.get(key) for key in ("task_id", "feedback_sha", "source_digest")}
+                        for task in manifest.get("tasks", [])]
+    prewarm = _source_values(batch / "dependency-prewarm.json")
+    return lib.content_hash({"tasks": tasks, "controllers": controllers,
+                             "manifest": visible_manifest, "prewarm": prewarm})
+
+
+def _sheet_home(root: Path, batch_id: str) -> Path:
+    return lib.batch_dir(root, batch_id) / "sheet"
+
+
+_WATCH_PROCESSES = {}
+
+
+def _sheet_state(root: Path, batch_id: str) -> dict:
+    return lib.load_json(_sheet_home(root, batch_id) / "state.json", default={})
+
+
+def _save_sheet_state(root: Path, batch_id: str, **updates) -> dict:
+    state = _sheet_state(root, batch_id)
+    merged = {**state, **updates}
+    if merged != state:
+        lib.save_json(_sheet_home(root, batch_id) / "state.json", merged)
+    return merged
+
+
+def _atomic_workbook(root: Path, batch_id: str, book, target: Path) -> None:
+    with delivery.staging_file(root, batch_id, ".xlsx") as temporary:
+        book.save(temporary)
+        with zipfile.ZipFile(temporary) as archive:
+            if archive.testzip() is not None:
+                raise lib.FbrError("结果表临时文件校验失败，保留上一版")
+        with temporary.open("rb") as stream:
+            os.fsync(stream.fileno())
+        os.replace(temporary, target)
+    descriptor = os.open(target.parent, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _write_json_if_changed(path: Path, data: dict) -> bool:
+    old = lib.load_json(path, default={}) if path.is_file() else None
+    compared = {key: value for key, value in data.items() if key != "checked_at"}
+    if isinstance(old, dict):
+        old_compared = {key: value for key, value in old.items() if key != "checked_at"}
+        if old_compared == compared:
+            return False
+    payload = {**data, "checked_at": lib.now_iso()}
+    delivery.atomic_save_json(path, payload)
+    return True
+
+
+def _write_sheet_unlocked(root: Path, batch_id: str, cfg: dict, *, force: bool = True,
+                          refresh_delivery: bool = True) -> dict:
     from openpyxl import Workbook
     from openpyxl.styles import Alignment, Font, PatternFill
     from openpyxl.utils import get_column_letter
 
-    manifest = delivery.export_batch(root, batch_id, cfg)
+    root = Path(root).resolve()
+    target = delivery.delivery_dir(root, batch_id) / "result.xlsx"
+    lock = root / "_verification" / "sheet-locks" / f"{batch_id}.lock"
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    fingerprint = progress_fingerprint(root, batch_id, cfg)
+    previous = _sheet_state(root, batch_id)
+    if not force and target.is_file() and previous.get("last_fingerprint") == fingerprint:
+        return previous.get("last_result", {"path": target, "tasks": 0, "rows": 0, "ready": 0, "pending": []})
+
+    if refresh_delivery:
+        manifest = delivery.export_batch(root, batch_id, cfg)
+    else:
+        manifest = lib.load_json(delivery.delivery_dir(root, batch_id) / "delivery-manifest.json",
+                                 default={"tasks": [], "excluded": []})
     rows, progress = [], []
     for task_dir in lib.task_dirs(root, batch_id):
         try:
@@ -292,7 +432,8 @@ def write_sheet(root: Path, batch_id: str, cfg: dict) -> dict:
             row, reason = None, str(exc)
         if row:
             rows.append(row)
-        progress.append(progress_row(task_dir, row["数据状态"] if row and row["数据状态"] != "可提交" else ("" if row else reason)))
+        progress.append(progress_row(task_dir,
+            row["数据状态"] if row and row["数据状态"] != "可提交" else ("" if row else reason)))
 
     book = Workbook()
     sheet = book.active
@@ -313,9 +454,10 @@ def write_sheet(root: Path, batch_id: str, cfg: dict) -> dict:
     sheet.freeze_panes = "B2"
 
     board = book.create_sheet("进度")
-    board.append(["任务编号", *[STAGE_LABEL[s] for s in lib.STAGES], "已推送", "卡在哪"])
+    refreshed_at = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S")
+    board.append(["任务编号", *[STAGE_LABEL[s] for s in lib.STAGES], "已推送", "卡在哪", "最后刷新"])
     for line in progress:
-        board.append(line)
+        board.append([*line, refreshed_at])
     for cell in board[1]:
         cell.font = head_font
     board.column_dimensions["A"].width = 14
@@ -362,10 +504,12 @@ def write_sheet(root: Path, batch_id: str, cfg: dict) -> dict:
     audit.freeze_panes = "C2"
     for column, width in (("A", 18), ("B", 24), ("C", 22), ("D", 90)):
         audit.column_dimensions[column].width = width
-    lib.save_json(delivery.delivery_dir(root, batch_id) / "field-audit.json",
-                  {"batch_id": batch_id, "checked_at": lib.now_iso(), "fields": entries,
-                   "platform_auto_fields": ["提交人", "提交时间"],
-                   "ready": all(r["数据状态"] == "可提交" for r in rows) and len(rows) == len(progress)})
+    audit_path = delivery.delivery_dir(root, batch_id) / "field-audit.json"
+    _write_json_if_changed(audit_path, {
+        "batch_id": batch_id, "fields": entries,
+        "platform_auto_fields": ["提交人", "提交时间"],
+        "ready": all(r["数据状态"] == "可提交" for r in rows) and len(rows) == len(progress),
+    })
 
     corrections = book.create_sheet("字段修订核对")
     correction_columns = ["任务编号", "操作系统", "子方向", "环境可复现等级", "产物快照", "运行录屏", "备注", "验收状态", "依据"]
@@ -398,21 +542,182 @@ def write_sheet(root: Path, batch_id: str, cfg: dict) -> dict:
     for cell in corrections[1]:
         cell.font = head_font
 
-    target = delivery.delivery_dir(root, batch_id) / "result.xlsx"
-    book.save(target)
     ready = sum(1 for row in rows if row["数据状态"] == "可提交")
-    return {"path": target, "tasks": len(progress), "rows": len(rows), "ready": ready,
-            "pending": [(row["任务编号"], row["数据状态"]) for row in rows if row["数据状态"] != "可提交"]}
+    result = {"path": target, "tasks": len(progress), "rows": len(rows), "ready": ready,
+              "pending": [(row["任务编号"], row["数据状态"]) for row in rows if row["数据状态"] != "可提交"]}
+    stored_result = {**result, "path": str(target)}
+    with lib.file_lock(lock):
+        book.active = book.sheetnames.index("进度")
+        _atomic_workbook(root, batch_id, book, target)
+        fingerprint = progress_fingerprint(root, batch_id, cfg)
+        _save_sheet_state(root, batch_id, last_fingerprint=fingerprint,
+                          last_write_epoch=time.time(), last_result=stored_result)
+    return result
+
+
+def write_sheet(root: Path, batch_id: str, cfg: dict, *, force: bool = True,
+                refresh_delivery: bool = True) -> dict:
+    root = Path(root).resolve()
+    lock = root / "_verification" / "sheet-locks" / f"{batch_id}.lock"
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    with lib.file_lock(lock):
+        return _write_sheet_unlocked(root, batch_id, cfg, force=force,
+                                     refresh_delivery=refresh_delivery)
+
+
+def refresh_if_changed(root: Path, batch_id: str, cfg: dict) -> dict:
+    state = _sheet_state(root, batch_id)
+    target = delivery.delivery_dir(root, batch_id) / "result.xlsx"
+    minimum = float(cfg.get("sheet", {}).get("min_write_seconds", 5))
+    fingerprint = progress_fingerprint(root, batch_id, cfg)
+    if target.is_file() and state.get("last_fingerprint") == fingerprint:
+        return {"state": "unchanged", **state.get("last_result", {}), "path": target}
+    if (target.is_file() and time.time() - float(state.get("last_write_epoch", 0))
+            < max(minimum, 0)):
+        return {"state": "throttled", **state.get("last_result", {}), "path": target}
+    out = write_sheet(root, batch_id, cfg, force=False)
+    return {"state": "updated", **out}
+
+
+def _batch_active(root: Path, batch_id: str) -> bool:
+    import fbr_runtime
+    batch = lib.batch_dir(root, batch_id)
+    for kind in ("runner", "flow"):
+        if fbr_runtime.alive(lib.load_json(batch / kind / "process.json", default={})):
+            return True
+    active_states = {"starting", "running", "continue_ready", "exited"}
+    return any(lib.load_json(task / "run/current.json", default={}).get("state") in active_states
+               for task in lib.task_dirs(root, batch_id))
+
+
+def start_watch(root: Path, batch_id: str, cfg: dict) -> dict:
+    """Start at most one detached live-sheet publisher for the batch."""
+    root = Path(root).resolve()
+    directory = _sheet_home(root, batch_id)
+    directory.mkdir(parents=True, exist_ok=True)
+    with lib.file_lock(directory / "start.lock"):
+        current = lib.load_json(directory / "watch.json", default={})
+        import fbr_runtime
+        if fbr_runtime.alive(current):
+            return current
+        (directory / "stop").unlink(missing_ok=True)
+        argv = [sys.executable, str(Path(__file__).resolve()), "--root", str(root),
+                "--batch", batch_id, "--watch"]
+        with (directory / "watch.log").open("ab") as log:
+            process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+                                       start_new_session=True)
+        _WATCH_PROCESSES[process.pid] = process
+        value = {"pid": process.pid, "identity": fbr_runtime.process_identity(process.pid),
+                 "started_at": lib.now_iso(), "argv": argv}
+        lib.save_json(directory / "watch.json", value)
+        return value
+
+
+def stop_watch(root: Path, batch_id: str) -> dict:
+    import fbr_runtime
+    directory = _sheet_home(root, batch_id)
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "stop").touch()
+    current = lib.load_json(directory / "watch.json", default={})
+
+    def reap():
+        process = _WATCH_PROCESSES.pop(int(current.get("pid", 0)), None)
+        if process is not None:
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
+
+    for _ in range(20):
+        if not fbr_runtime.alive(current):
+            reap()
+            (directory / "watch.json").unlink(missing_ok=True)
+            return {"state": "stopped"}
+        time.sleep(.25)
+    if current.get("pid"):
+        try:
+            os.kill(int(current["pid"]), signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    reap()
+    (directory / "watch.json").unlink(missing_ok=True)
+    return {"state": "stopped"}
+
+
+def watch_status(root: Path, batch_id: str) -> dict:
+    import fbr_runtime
+    current = lib.load_json(_sheet_home(root, batch_id) / "watch.json", default={})
+    return {"state": "running" if fbr_runtime.alive(current) else "stopped", "watcher": current,
+            "sheet": _sheet_state(root, batch_id)}
+
+
+def watch_loop(root: Path, batch_id: str, cfg: dict) -> int:
+    import fbr_runtime
+    directory = _sheet_home(root, batch_id)
+    directory.mkdir(parents=True, exist_ok=True)
+    interval = max(.25, float(cfg.get("sheet", {}).get("interval_seconds", 2)))
+    idle_exit = max(5, float(cfg.get("sheet", {}).get("idle_exit_seconds", 60)))
+    stopped = False
+
+    def terminate(_signum, _frame):
+        nonlocal stopped
+        stopped = True
+
+    previous_handler = signal.signal(signal.SIGTERM, terminate)
+    with lib.file_lock(directory / "watch.lock"):
+        info = {"pid": os.getpid(), "identity": fbr_runtime.process_identity(),
+                "started_at": lib.now_iso(), "state": "running"}
+        lib.save_json(directory / "watch.json", info)
+        idle_since = None
+        try:
+            while not stopped and not (directory / "stop").exists():
+                try:
+                    out = refresh_if_changed(root, batch_id, cfg)
+                    _save_sheet_state(root, batch_id, state=out["state"], last_error="")
+                except (lib.FbrError, OSError, ValueError) as exc:
+                    _save_sheet_state(root, batch_id, state="error", last_error=str(exc),
+                                      error_at=lib.now_iso())
+                if _batch_active(root, batch_id):
+                    idle_since = None
+                elif idle_since is None:
+                    idle_since = time.time()
+                elif time.time() - idle_since >= idle_exit:
+                    break
+                time.sleep(interval)
+        finally:
+            signal.signal(signal.SIGTERM, previous_handler)
+            current = lib.load_json(directory / "watch.json", default={})
+            if current.get("pid") == os.getpid():
+                (directory / "watch.json").unlink(missing_ok=True)
+    return 0
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="solo11 结果表")
     parser.add_argument("--root")
     parser.add_argument("--batch", required=True)
+    parser.add_argument("--watch", action="store_true")
+    parser.add_argument("--detach", action="store_true")
+    parser.add_argument("--stop", action="store_true")
+    parser.add_argument("--watch-status", action="store_true")
     args = parser.parse_args()
     try:
         root = lib.find_root(args.root)
-        out = write_sheet(root, args.batch, lib.settings(root))
+        cfg = lib.settings(root)
+        if args.stop:
+            out = stop_watch(root, args.batch)
+            print(out["state"])
+            return 0
+        if args.watch_status:
+            print(__import__("json").dumps(watch_status(root, args.batch), ensure_ascii=False, indent=2))
+            return 0
+        if args.watch:
+            if args.detach:
+                print(__import__("json").dumps(start_watch(root, args.batch, cfg), ensure_ascii=False))
+                return 0
+            return watch_loop(root, args.batch, cfg)
+        out = write_sheet(root, args.batch, cfg)
         print(f"{out['path']}")
         print(f"批次共 {out['tasks']} 题，进结果页 {out['rows']} 题，其中可提交 {out['ready']} 题")
         for name, state in out["pending"]:

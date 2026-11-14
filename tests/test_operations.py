@@ -306,6 +306,18 @@ class Flow(Sandbox):
         self.assertIn('不自动提交平台', err)
         run.assert_not_called()
 
+    def test_pre_submit_refuses_platform_cleanup(self):
+        from flow import run_main
+        batch = self.make_task().parent.name
+        with mock.patch.object(fbr_flow, 'run_flow') as run:
+            code, _, err = run_main(fbr_flow, '--root', str(self.root), 'pre-submit',
+                                    '--batch', batch, '--auto-cleanup',
+                                    '--confirm-cleanup', 'CLEANUP')
+        self.assertEqual(code, 2)
+        self.assertIn('不自动提交平台', err)
+        self.assertIn('也不自动清理平台数据', err)
+        run.assert_not_called()
+
     def test_downstream_starts_before_last_producer_finishes(self):
         first, second = self.make_task(1), self.make_task(2)
         events = {}
@@ -492,10 +504,36 @@ class BudgetAndLocking(Sandbox):
     def test_all_entrypoints_keep_earliest_batch_deadline(self):
         task = self.make_task()
         earlier = time.time() + 10
+        self.cfg['run']['batch_budget'] = 3600
         lib.save_json(task.parent / 'runner/budget.json', {'deadline': earlier})
         self.assertEqual(rt.batch_deadline(self.root, task.parent.name, self.cfg), earlier)
         lib.save_json(task.parent / 'runner/budget.json', {'deadline': earlier + 1000})
         self.assertEqual(rt.batch_deadline(self.root, task.parent.name, self.cfg), earlier)
+
+    def test_null_batch_budget_overrides_persisted_deadlines(self):
+        task = self.make_task()
+        expired = time.time() - 10
+        lib.save_json(task.parent / 'runner/budget.json', {'deadline': expired})
+        lib.save_json(task.parent / 'flow/plan.json', {'deadline': expired})
+        self.cfg['run']['batch_budget'] = None
+        self.assertEqual(rt.batch_deadline(self.root, task.parent.name, self.cfg), float('inf'))
+        runtime_budget = lib.load_json(task.parent / 'runtime-budget.json')
+        self.assertIsNone(runtime_budget['deadline'])
+        self.assertEqual(fbr_flow.resolve_deadline(
+            self.root, task.parent.name, self.cfg, {'deadline': expired}), float('inf'))
+
+    def test_tail_policy_activates_only_for_last_two_runnable_tasks(self):
+        tasks = [self.make_task(i) for i in range(1, 5)]
+        for task in tasks[:2]:
+            lib.set_stage(task, 'run', 'ok')
+        policy = rt.write_tail_policy(self.root, tasks[0].parent.name, tasks, self.cfg, 'runner')
+        self.assertTrue(policy['active'])
+        self.assertEqual(policy['remaining'], 2)
+        self.assertEqual(set(policy['task_ids']), {tasks[2].name, tasks[3].name})
+        lib.set_stage(tasks[2], 'run', 'abandoned', reason='fixture')
+        policy = rt.write_tail_policy(self.root, tasks[0].parent.name, tasks, self.cfg, 'runner')
+        self.assertTrue(policy['active'])
+        self.assertEqual(policy['task_ids'], [tasks[3].name])
 
     def test_gate_selected_task_does_not_lock_other_running_task(self):
         import fbr_feedback

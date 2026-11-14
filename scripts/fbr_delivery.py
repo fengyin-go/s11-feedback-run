@@ -3,10 +3,13 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
 import shutil
+import subprocess
+import sys
 import tempfile
 import uuid
 from pathlib import Path, PurePosixPath
@@ -26,6 +29,14 @@ FILES = ("trace/ids.json", "record/recording.mp4", "record/recording.json", "evi
          "evidence/audit.json", "evidence/probes.jsonl", "review/feedback.json", "review/gate.json",
          "review/model-review.json", "review/quality.json", "review/field-revisions.json",
          "review/trace-analysis.json", "review/trace-check.json")
+GENERATED_TOP = {"delivery-manifest.json", "result.xlsx", "preview.html", "field-audit.json",
+                 "cleanup-manifest.json"}
+RETAINED_TASK_FILES = {
+    "task-seed.json", "state.json", "recording-plan.json", "recording-plan.override.json",
+    "run/attempts.json", "review/diff.patch", "retention.json", "cleanup.json",
+    "platform/snapshot.json", "platform/upload.json",
+    "platform/submit-preflight.json",
+}
 
 
 def digest(path: Path) -> str:
@@ -43,6 +54,50 @@ def delivery_dir(root: Path, batch_id: str) -> Path:
     if (root / "results").is_symlink() or target.is_symlink():
         raise lib.FbrError("results 交付目录不能是符号链接")
     return target
+
+
+@contextlib.contextmanager
+def staging_file(root: Path, batch_id: str, suffix: str = ""):
+    """Yield a same-filesystem temporary path outside results."""
+    base = Path(root).resolve() / "_verification" / "delivery-staging"
+    base.mkdir(parents=True, exist_ok=True)
+    directory = Path(tempfile.mkdtemp(prefix=f"{batch_id}-", dir=base))
+    try:
+        yield directory / f"artifact{suffix}"
+    finally:
+        shutil.rmtree(directory, ignore_errors=True)
+
+
+def atomic_write_bytes(path: Path, data: bytes) -> None:
+    """Replace a delivery artifact without exposing a partial file at its stable path."""
+    path = Path(path)
+    root = path
+    for candidate in (path, *path.parents):
+        if (candidate / "_config/settings.json").is_file():
+            root = candidate
+            break
+    else:
+        root = path.parent
+    with staging_file(root, path.stem, path.suffix) as temporary:
+        temporary.write_bytes(data)
+        with temporary.open("rb") as stream:
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    if path.parent.exists():
+        descriptor = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+
+def atomic_write_text(path: Path, text: str) -> None:
+    atomic_write_bytes(path, text.encode("utf-8"))
+
+
+def atomic_save_json(path: Path, data) -> None:
+    payload = json.dumps(data, ensure_ascii=False, indent=2) + "\n"
+    atomic_write_bytes(path, payload.encode("utf-8"))
 
 
 def safe_file(base: Path, path: Path) -> bool:
@@ -143,7 +198,7 @@ def _source_files(task_dir: Path, feedback_sha: str) -> list[Path]:
 
 
 def _verify_files(root: Path, target: Path, manifest: dict) -> bool:
-    expected = {"delivery-manifest.json", "result.xlsx", "preview.html"}
+    expected = set(GENERATED_TOP)
     try:
         for task in manifest.get("tasks", []):
             for item in task["files"]:
@@ -151,29 +206,135 @@ def _verify_files(root: Path, target: Path, manifest: dict) -> bool:
                 if not safe_file(target, path) or digest(path) != item["sha256"] or path.stat().st_size != item["bytes"]:
                     return False
                 expected.add(path.relative_to(target).as_posix())
+            for relative in RETAINED_TASK_FILES:
+                if (target / task["task_id"] / relative).is_file():
+                    expected.add(f"{task['task_id']}/{relative}")
         for folder, dirs, files in os.walk(target, followlinks=False):
             if any((Path(folder) / d).is_symlink() for d in dirs):
                 return False
             for name in files:
                 path = Path(folder) / name
-                if path.is_symlink() or path.relative_to(target).as_posix() not in expected:
+                relative = path.relative_to(target).as_posix()
+                if name == ".DS_Store" or name.startswith("~$"):
+                    continue
+                if path.is_symlink() or relative not in expected:
                     return False
         return True
     except (OSError, KeyError, lib.FbrError, ValueError):
         return False
 
 
+def _task_entry_valid(root: Path, target: Path, entry: dict) -> bool:
+    try:
+        for item in entry.get("files", []):
+            path = root / item["path"]
+            if (not safe_file(target, path) or digest(path) != item.get("sha256")
+                    or path.stat().st_size != item.get("bytes")):
+                return False
+        return True
+    except (OSError, KeyError, lib.FbrError, ValueError):
+        return False
+
+
+def _semantic_manifest(manifest: dict) -> dict:
+    return {key: manifest.get(key) for key in ("schema_version", "batch_id", "tasks")}
+
+
+def _archive_projection(root: Path, batch_id: str, target: Path) -> Path | None:
+    """Keep one complete historical projection only when delivery semantics change."""
+    if not target.exists():
+        return None
+    history = root / "_verification" / "delivery-history"
+    history.mkdir(parents=True, exist_ok=True)
+    destination = history / f"{batch_id}-{uuid.uuid4().hex[:12]}"
+    if sys.platform == "darwin":
+        copied = subprocess.run(["cp", "-cR", str(target), str(destination)], capture_output=True)
+        if copied.returncode == 0:
+            return destination
+        shutil.rmtree(destination, ignore_errors=True)
+    try:
+        shutil.copytree(target, destination, copy_function=os.link)
+    except OSError:
+        shutil.rmtree(destination, ignore_errors=True)
+        shutil.copytree(target, destination)
+    return destination
+
+
+def _publish_staging(root: Path, staging: Path, target: Path, manifest: dict) -> None:
+    """Synchronize task files in place, then commit the manifest and remove stale entries."""
+    target.mkdir(parents=True, exist_ok=True)
+    manifest_source = staging / "delivery-manifest.json"
+    for source in sorted(staging.rglob("*")):
+        if not source.is_file() or source == manifest_source:
+            continue
+        relative = source.relative_to(staging)
+        destination = target / relative
+        if destination.is_file() and not destination.is_symlink() and digest(destination) == digest(source):
+            continue
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(source, destination)
+    atomic_save_json(target / "delivery-manifest.json", manifest)
+
+    valid_tasks = {task["task_id"] for task in manifest.get("tasks", [])}
+    expected = {(root / item["path"]).relative_to(target).as_posix()
+                for task in manifest.get("tasks", []) for item in task.get("files", [])}
+    retired_root = target.parent.parent / "_verification" / "delivery-retired"
+    retired_root.mkdir(parents=True, exist_ok=True)
+    retired = Path(tempfile.mkdtemp(prefix=f"{target.name}-", dir=retired_root))
+    try:
+        for child in sorted(target.iterdir()):
+            if child.is_dir() and lib.TASK_ID_RE.fullmatch(child.name) and child.name not in valid_tasks:
+                os.replace(child, retired / child.name)
+                continue
+            if not child.is_dir() or not lib.TASK_ID_RE.fullmatch(child.name):
+                continue
+            for path in sorted(child.rglob("*")):
+                if path.is_symlink():
+                    raise lib.FbrError(f"交付目录包含符号链接：{path}")
+                if path.is_file():
+                    relative = path.relative_to(target).as_posix()
+                    retained = (path.relative_to(child).as_posix() in RETAINED_TASK_FILES)
+                    if relative not in expected and not retained:
+                        old = retired / relative
+                        old.parent.mkdir(parents=True, exist_ok=True)
+                        os.replace(path, old)
+            for folder in sorted((p for p in child.rglob("*") if p.is_dir()), reverse=True):
+                try:
+                    folder.rmdir()
+                except OSError:
+                    pass
+    finally:
+        shutil.rmtree(retired, ignore_errors=True)
+
+
 def export_batch(root: Path, batch_id: str, cfg: dict | None = None) -> dict:
-    """完整刷新一个批次；旧投影移入验证历史，不改源任务或状态。"""
+    """Refresh the stable projection in place; archive only semantic delivery changes."""
     root = Path(root).resolve()
     target = delivery_dir(root, batch_id)
     cfg = cfg or lib.settings(root)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    staging = Path(tempfile.mkdtemp(prefix=f".{batch_id}.export-", dir=target.parent))
+    lock = root / "_verification" / "delivery-locks" / f"{batch_id}.lock"
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    with lib.file_lock(lock):
+        return _export_batch_locked(root, target, batch_id, cfg)
+
+
+def _export_batch_locked(root: Path, target: Path, batch_id: str, cfg: dict) -> dict:
+    staging_root = root / "_verification" / "delivery-staging"
+    staging_root.mkdir(parents=True, exist_ok=True)
+    staging = Path(tempfile.mkdtemp(prefix=f"{batch_id}-", dir=staging_root))
     tasks, excluded, pending_copies = [], [], []
     try:
+        old_manifest = lib.load_json(target / "delivery-manifest.json", default={})
+        old_entries = {row.get("task_id"): row for row in old_manifest.get("tasks", [])
+                       if isinstance(row, dict) and row.get("task_id")}
         for source in lib.task_dirs(root, batch_id):
             try:
+                if lib.load_json(source / "cleanup.json", default={}).get("state") == "cleaned":
+                    entry = old_entries.get(source.name)
+                    if not entry or not _task_entry_valid(root, target, entry):
+                        raise lib.FbrError("已清理任务缺少可验证的冻结交付投影")
+                    tasks.append(entry)
+                    continue
                 # 先核对所有会读的控制文件，避免先读入跨题链接。
                 for name in ("state.json", "task.json", *FILES, "review/spotcheck.json", "review/snapshot.json", "run/attempts.json"):
                     safe_file(source, source / name)
@@ -232,11 +393,10 @@ def export_batch(root: Path, batch_id: str, cfg: dict | None = None) -> dict:
                     raise
                 shutil.rmtree(staging / source.name, ignore_errors=True)
                 excluded.append({"task_id": source.name, "reason": str(exc)})
-        manifest = {"schema_version": 1, "batch_id": batch_id, "tasks": tasks, "excluded": excluded}
+        manifest = {"schema_version": 2, "batch_id": batch_id, "tasks": tasks, "excluded": excluded}
         old = lib.load_json(target / "delivery-manifest.json", default={})
-        if all(old.get(k) == manifest[k] for k in manifest) and _verify_files(root, target, old):
+        if _semantic_manifest(old) == _semantic_manifest(manifest) and _verify_files(root, target, old):
             return old
-        import subprocess
         for source,copied in pending_copies:
             if not copied.parent.exists(): continue  # task was excluded after preparing entries
             # APFS CoW retains independent files and history without re-reading unchanged videos.
@@ -247,11 +407,9 @@ def export_batch(root: Path, batch_id: str, cfg: dict | None = None) -> dict:
             if digest(copied)!=digest(source):raise lib.FbrError('导出期间来源发生变化，拒绝发布混合版本')
         manifest["generated_at"] = lib.now_iso()
         lib.save_json(staging / "delivery-manifest.json", manifest)
-        if target.exists():
-            history = root / "_verification" / "delivery-history"
-            history.mkdir(parents=True, exist_ok=True)
-            os.replace(target, history / f"{batch_id}-{uuid.uuid4().hex[:12]}")
-        os.replace(staging, target)
+        if target.exists() and old and _semantic_manifest(old) != _semantic_manifest(manifest):
+            _archive_projection(root, batch_id, target)
+        _publish_staging(root, staging, target, manifest)
         return manifest
     finally:
         if staging.exists():

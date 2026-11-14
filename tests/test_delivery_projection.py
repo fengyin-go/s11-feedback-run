@@ -75,6 +75,18 @@ class DeliveryProjection(SheetCase):
         self.assertTrue((good / "workspace/.git").is_dir())
         self.assertTrue((good / "review/feedback.json").is_file())
 
+    def test_rebuild_keeps_batch_directory_entry_in_place(self):
+        task = self.gated()
+        self.complete(task)
+        self.export()
+        target = self.root / "results" / BATCH
+        directory_id = target.stat().st_ino
+        self.put(task, feedback_doc=feedback(TEXT_B))
+        manifest = self.export()
+        self.assertEqual(target.stat().st_ino, directory_id)
+        self.assertTrue(target.is_dir())
+        self.assertIn(task.name, {row["task_id"] for row in manifest["excluded"]})
+
     def test_manifest_records_real_bytes_and_hashes_without_source_mutation(self):
         task = self.gated()
         self.complete(task)

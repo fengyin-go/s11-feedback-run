@@ -53,6 +53,44 @@ class DependencyCache(Sandbox):
         self.assertNotIn('node_modules',sh(repo,'ls-tree','-r','--name-only','HEAD'))
         self.assertEqual(deps.snapshot_problems(repo,'HEAD'),[])
 
+    def test_same_dependency_content_is_shared_across_different_task_commits(self):
+        first, first_repo = self.baseline()
+        second = self.make_task(2)
+        second_repo = second / 'workspace'
+        write(second_repo/'package.json', '{"name":"selftest","version":"1.0.0"}')
+        write(second_repo/'.gitignore', '.env\nnode_modules/\n.venv/\n__pycache__/\n')
+        write(second_repo/'src/app.py', 'print("different task commit")\n')
+        sh(second_repo, 'add', '-A')
+        sh(second_repo, 'commit', '-qm', 'different commit same dependencies')
+        record = lib.load_task(second)
+        record['initial_commit'] = sh(second_repo, 'rev-parse', 'HEAD')
+        lib.save_json(second/'task.json', record)
+        installs = []
+
+        def steps(image, clone, commands, **kwargs):
+            if commands[0]['name'] == 'setup':
+                installs.append(clone)
+                write(clone/'node_modules/pkg/index.js', 'shared dependency')
+            else:
+                self.assertTrue((clone/'node_modules/pkg/index.js').is_file())
+            return [{'rc': 0}, {'rc': 0}]
+
+        def run(args, **kwargs):
+            if args[:3] == ['docker', 'image', 'inspect']:
+                return done(0, self.cfg['image_id'] + '|linux|arm64')
+            return REAL_RUN(args, **kwargs)
+
+        with mock.patch.dict(os.environ, {'FBR_SCRATCH': str(self.root/'_scratch')}), \
+             mock.patch.object(lib, 'run', side_effect=run), \
+             mock.patch.object(lib, 'run_steps_in_image', side_effect=steps):
+            self.assertTrue(deps.seed(first_repo, self.cfg, task=first))
+            self.assertTrue(deps.seed(second_repo, self.cfg, task=second))
+        self.assertEqual(len(installs), 1)
+        self.assertEqual((first_repo/'node_modules/pkg/index.js').read_text(), 'shared dependency')
+        self.assertEqual((second_repo/'node_modules/pkg/index.js').read_text(), 'shared dependency')
+        manifests = list((self.root/'_registry/dependencies').glob('*/manifest.json'))
+        self.assertEqual(len(manifests), 1)
+
     def test_missing_ignore_and_tracked_dependencies_are_rejected(self):
         task=self.make_task();repo=task/'workspace'
         write(repo/'package.json','{}');sh(repo,'add','-A');sh(repo,'commit','-qm','package')
@@ -101,6 +139,29 @@ class DependencyCache(Sandbox):
             with self.assertRaisesRegex(lib.FbrError,'已有内容'):deps.seed(repo,self.cfg)
         self.assertFalse((repo/'node_modules').exists())
         self.assertEqual((repo/'.venv/lib/existing').read_text(),'keep')
+
+    def test_batch_prewarm_finishes_before_model_dispatch_and_uses_concurrency(self):
+        tasks = [self.make_task(i) for i in range(1, 4)]
+        lock = threading.Lock()
+        active = maximum = 0
+
+        def seed(_repo, _cfg, task=None):
+            nonlocal active, maximum
+            with lock:
+                active += 1
+                maximum = max(maximum, active)
+            time.sleep(.1)
+            with lock:
+                active -= 1
+            return True
+
+        self.cfg['concurrency'] = 3
+        with mock.patch.object(deps, 'seed', side_effect=seed):
+            state = deps.prewarm_batch(self.root, tasks[0].parent.name, self.cfg, tasks)
+        self.assertEqual((state['state'], state['prepared'], state['failed']), ('completed', 3, 0))
+        self.assertEqual(maximum, 3)
+        saved = lib.load_json(tasks[0].parent/'dependency-prewarm.json')
+        self.assertEqual(saved['model_concurrency'], 3)
 
 
 class CommonAndSlots(Sandbox):

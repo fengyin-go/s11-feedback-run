@@ -1,16 +1,30 @@
 """反馈证据契约：真实出处、数量口径、评分类别和独立复核完整性。"""
 import copy
+import json
 import unittest
 
-from test_gate import task, facts, audit, probes, TEXT5, S1_PASS
+from test_gate import task, facts, audit, probes, TEXT5, S1_PASS, S2, S3
 import fbr_quality as quality
+import fbr_gate as gate
 
 
 class Contract(unittest.TestCase):
     def doc(self):
         return {"score": 5, "feedback": TEXT5,
-                "results": [{"sentence": "--segment 0 和负数都会打印 error 并以退出码 2 结束",
-                             "requirement_ids": ["R3"], "anchors": [{"type": "probe", "id": "P2"}]}],
+                "requirements_status": [
+                    {"requirement_id": "R1", "status": "completed", "user_text": "分片功能已能正常生成多个输出文件",
+                     "anchors": [{"type": "tree", "path": "src/clipcut/segment.py"}]},
+                    {"requirement_id": "R2", "status": "completed", "user_text": "一小时以上输入可以完成分片",
+                     "anchors": [{"type": "probe", "id": "P1"}]},
+                    {"requirement_id": "R3", "status": "completed", "user_text": "零时长和负数参数会报错退出",
+                     "anchors": [{"type": "probe", "id": "P2"}]},
+                ],
+                "results": [
+                    {"sentence": S2, "requirement_ids": ["R1", "R2"],
+                     "anchors": [{"type": "probe", "id": "P1"}, {"type": "demo", "index": 1}]},
+                    {"sentence": S3.rstrip("。"), "requirement_ids": ["R3"],
+                     "anchors": [{"type": "probe", "id": "P2"}]},
+                ],
                 "score_basis": {"lowest_supported_score": 5, "lower_score_rejected": "没有真实交付缺口，不应凭空降低档位", "anchors": [{"type": "probe", "id": "P2"}], "category": "complete", "delivered": "短输入及长输入均能正确分片",
                                 "remaining": "当前实跑范围内未发现交付缺口", "why_this_score": "需求和两个边界均有成功运行证据"},
                 "test_claims": [{"sentence": S1_PASS.rstrip("。"), "requirement_ids": ["R1"],
@@ -89,7 +103,18 @@ class Contract(unittest.TestCase):
                                          "reject": {"passed": False}, "bad_bool": {"passed": "true"}}[change])
             self.assertTrue(quality.report_errors(bad))
 
-
+    def test_requirements_status_must_match_audit_and_cover_all_requirements(self):
+        doc = self.doc()
+        ev = gate.build_evidence(task(), facts(), audit(5), probes())
+        self.assertEqual(quality.requirements_status_errors(doc, task(), audit(5), ev), [])
+        broken = copy.deepcopy(doc)
+        broken["requirements_status"][1]["status"] = "missing"
+        self.assertTrue(any("audit 结论不一致" in error for error in
+                            quality.requirements_status_errors(broken, task(), audit(5), ev)))
+        broken = copy.deepcopy(doc)
+        broken["requirements_status"] = broken["requirements_status"][:2]
+        self.assertTrue(any("没有覆盖全部需求点" in error for error in
+                            quality.requirements_status_errors(broken, task(), audit(5), ev)))
 class ClaimReview(unittest.TestCase):
     def setUp(self):
         import tempfile
@@ -99,12 +124,18 @@ class ClaimReview(unittest.TestCase):
         self.task = Path(self.temp.name)
         (self.task / 'trace/projects').mkdir(parents=True)
         self.source = self.task / 'trace/projects/session.jsonl'
-        self.source.write_text('first: command failed\nlater: fixed and passed\n')
+        self.source.write_text(
+            json.dumps({"type": "user", "message": {"content": [
+                {"type": "tool_result", "content": "first: command failed"}]}}) + "\n" +
+            json.dumps({"type": "assistant", "message": {"content": [
+                {"type": "text", "text": "later: fixed and passed"}]}}) + "\n")
         self.doc = {'feedback': '第一次启动失败，修正后成功。页面现在可以打开。'}
+        self.locator = {'path': 'trace/projects/session.jsonl', 'start_line': 2, 'end_line': 2,
+                        'block': 0}
         self.report = {'claim_reviews': [
             {'sentence': sentence, 'assertions': ['启动结果已经修正'], 'verdict': 'supported',
              'reason': '原始返回同时记录了失败及修复成功', 'later_check': '已回查后续修复并确认最终成功',
-             'sources': [{'path': 'trace/projects/session.jsonl', 'excerpt': 'later: fixed and passed'}]}
+             'sources': [{**self.locator, 'excerpt': 'later: fixed and passed'}]}
             for sentence in quality.public_units(self.doc['feedback'])]}
 
     def errors(self, report=None):
@@ -126,7 +157,7 @@ class ClaimReview(unittest.TestCase):
                             ('evidence/facts.json', 'later: fixed and passed'),
                             ('../outside.jsonl', 'later: fixed and passed')]:
             report = copy.deepcopy(self.report)
-            report['claim_reviews'][0]['sources'] = [{'path': path, 'excerpt': quote}]
+            report['claim_reviews'][0]['sources'] = [{**self.locator, 'path': path, 'excerpt': quote}]
             self.assertTrue(self.errors(report))
 
     def test_original_quote_and_later_state_are_required(self):
@@ -153,10 +184,11 @@ class ClaimReview(unittest.TestCase):
             {'path': 'evidence/probes.jsonl', 'excerpt': 'first: command failed'}
         ]
         self.assertTrue(any('原始轨迹 JSONL' in error for error in self.errors()))
-        trace_source = {'path': 'trace/projects/session.jsonl', 'excerpt': 'later: fixed and passed'}
+        trace_source = {**self.locator, 'excerpt': 'later: fixed and passed'}
         self.report['claim_reviews'][0]['sources'] = [trace_source]
         self.assertTrue(any('evidence 对应的原始轨迹摘录' in error for error in self.errors()))
         trace_source['excerpt'] = 'command failed'
+        trace_source.update(start_line=1, end_line=1)
         self.assertNotIn('evidence 对应的原始轨迹摘录', '；'.join(self.errors()))
 
 

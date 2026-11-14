@@ -15,6 +15,7 @@ import fbr_delivery
 import fbr_reviewer as reviewer
 import fbrlib as lib
 import fbr_quality as quality
+import fbr_work
 
 
 class Configuration(unittest.TestCase):
@@ -127,8 +128,8 @@ class Review(FlowCase):
         self.finish_delivery = publishing.start()
         self.addCleanup(publishing.stop)
 
-    def semantic(self):
-        return json.dumps({"claim_reviews": mock_claim_reviews(feedback()), "checks": [{"id": name, "passed": True,
+    def semantic(self, task=None):
+        return json.dumps({"claim_reviews": mock_claim_reviews(feedback(), task_dir=task), "checks": [{"id": name, "passed": True,
                           "reason": "已对照当前轨迹和最终产物核对本项具体事实"} for name in quality.CHECKS]})
 
     def receipt(self):
@@ -146,7 +147,7 @@ class Review(FlowCase):
         return task
 
     def verification(self, task, candidate):
-        report = json.loads(self.semantic())
+        report = json.loads(self.semantic(task))
         report.update(task_agent='current_task_agent', candidate_sha=lib.content_hash(candidate),
                       binding=lib.load_json(task/'review/task-agent-work.json')['binding'])
         return report
@@ -175,6 +176,20 @@ class Review(FlowCase):
         self.assertEqual(receipt['model'], 'current_task_agent')
         self.assertEqual(receipt['reasoning_effort'], 'session')
         self.assertNotIn('trace-claims_sha', receipt)
+
+    def test_lint_catches_requirement_gaps_and_platform_style_before_finalize(self):
+        task = self.agent_prepared()
+        candidate = json.loads(self.candidate()[0])
+        self.assertEqual(reviewer.lint_candidate(task, candidate)['state'], 'ok')
+        broken = json.loads(json.dumps(candidate))
+        broken['feedback'].pop('requirements_status')
+        result = reviewer.lint_candidate(task, broken)
+        self.assertEqual(result['state'], 'repairing')
+        self.assertTrue(any('requirements_status' in error for error in result['errors']))
+        styled = json.loads(json.dumps(candidate))
+        styled['feedback']['feedback'] += '16 项后端测试通过。'
+        errors = reviewer.lint_candidate(task, styled)['errors']
+        self.assertTrue(any('测试总数' in error for error in errors))
 
     def test_semantic_rejection_keeps_old_candidate_and_can_be_repaired(self):
         task = self.agent_prepared()
@@ -273,3 +288,93 @@ class Review(FlowCase):
         self.assertEqual(result['state'], 'needs_probes')
         self.assertFalse(lib.stage_ok(task, 'feedback'))
         self.assertTrue((task/'review/probe-requests.json').is_file())
+
+    def test_identical_failed_attempt_is_content_addressed_and_not_duplicated(self):
+        task = self.agent_prepared()
+        candidate = json.loads(self.candidate()[0])
+        verification = self.verification(task, candidate)
+        verification['checks'][0]['passed'] = False
+        verification['checks'][0]['reason'] = '本句缺少原始轨迹中的直接支持'
+        first = reviewer.finalize(task, candidate, verification)
+        second = reviewer.finalize(task, candidate, verification)
+        self.assertEqual(first['state'], 'repairing')
+        self.assertEqual(second['state'], 'repairing')
+        self.assertIn('不要重复 finalize', second['detail'])
+        history = lib.load_json(task/'review/task-agent-history.json')
+        self.assertEqual(len(history['attempts']), 1)
+        attempt = history['attempts'][0]
+        self.assertTrue((task/attempt['candidate_ref']).is_file())
+        self.assertTrue((task/attempt['verification_ref']).is_file())
+        self.assertNotIn('candidate', attempt)
+        self.assertNotIn('verification', attempt)
+
+    def test_work_queue_returns_one_compact_packet_not_full_materials(self):
+        task = self.agent_prepared()
+        rows = fbr_work.pending(self.root, task.parent.name)
+        self.assertEqual([row['task_id'] for row in rows], [task.name])
+        packet = rows[0]
+        self.assertTrue(Path(packet['brief']).is_file())
+        self.assertTrue(Path(packet['trace_pack']).is_file())
+        self.assertTrue(Path(packet['candidate_schema']).is_file())
+        self.assertNotIsInstance(lib.load_json(Path(packet['checkpoint'])).get('candidate_schema'), dict)
+        self.assertNotIn('card', packet)
+        self.assertNotIn('facts', packet)
+
+    def test_compact_decision_expands_schema_and_resolves_unique_locator(self):
+        task = self.agent_prepared()
+        doc = feedback()
+        audit_doc = audit()
+        status = {row["requirement_id"]: row for row in doc["requirements_status"]}
+        claims = mock_claim_reviews(doc, task_dir=task)
+        process_sentence = doc["process"][0]["sentence"]
+        process_source = next(row for row in claims if row["sentence"] == process_sentence)["sources"][0]
+        for key in ("start_line", "end_line", "block"):
+            process_source.pop(key)
+        decision = {
+            "requirements": [
+                {**row, "user_text": status[row["id"]]["user_text"],
+                 "anchors": status[row["id"]]["anchors"]}
+                for row in audit_doc["requirements"]
+            ],
+            "counterexamples": audit_doc["counterexamples"],
+            "false_success": audit_doc["false_success"],
+            "false_success_note": audit_doc["false_success_note"],
+            "false_success_anchors": audit_doc["false_success_anchors"],
+            "score": doc["score"], "feedback": doc["feedback"],
+            "results": doc["results"], "issues": doc["issues"],
+            "test_claims": doc["test_claims"], "score_basis": doc["score_basis"],
+            "process": [{**row, "audit": doc["process_audit"][index]}
+                        for index, row in enumerate(doc["process"])],
+            "claims": claims,
+            "quality_checks": {name: "已按当前原始证据和最终产物核对该项"
+                               for name in quality.CHECKS},
+            "note": "", "needs_probes": [],
+        }
+        candidate, verification = fbr_feedback.expand_decision(task, decision)
+        self.assertEqual(candidate["feedback"]["requirements_status"],
+                         doc["requirements_status"])
+        self.assertEqual(verification["candidate_sha"], lib.content_hash(candidate))
+        self.assertEqual(len(verification["claim_reviews"]),
+                         len(quality.public_units(doc["feedback"])))
+        expanded_source = next(row for row in verification["claim_reviews"]
+                               if row["sentence"] == process_sentence)["sources"][0]
+        self.assertNotIn("rebound_from", expanded_source)
+        self.assertIn("start_line", expanded_source)
+        self.assertEqual(reviewer.lint_candidate(task, candidate, verification)["state"], "ok")
+
+    def test_work_wait_and_closeout_use_files_not_conversation_history(self):
+        task = self.agent_prepared()
+        flow = lib.batch_dir(self.root, task.parent.name)/'flow'
+        lib.save_json(flow/'waiting.json', {'tasks': [{
+            'task_id': task.name, 'checkpoint': str(task/'review/task-agent-work.json')}]})
+        now = [0.0]
+        result = fbr_work.wait_for_event(
+            self.root, task.parent.name, {'needs_task_agent'}, timeout=5,
+            clock=lambda: now[0], sleeper=lambda value: now.__setitem__(0, now[0]+value))
+        self.assertEqual(result['state'], 'needs_task_agent')
+        close = fbr_work.closeout(self.root, task.parent.name, task.name)
+        saved = lib.load_json(task/'review/task-closeout.json')
+        self.assertEqual(close['task_id'], task.name)
+        self.assertEqual(saved['version'], 1)
+        self.assertTrue(Path(saved['path']).is_file())
+        self.assertTrue(Path(fbr_work.stage_brief(task)).is_file())

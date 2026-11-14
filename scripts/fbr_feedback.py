@@ -21,6 +21,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import fbrlib as lib  # noqa: E402
+import fbr_evidence  # noqa: E402
 import fbr_gate as gate  # noqa: E402
 import fbr_reviewer as reviewer  # noqa: E402
 
@@ -32,9 +33,14 @@ AUDIT_TEMPLATE = {
 }
 FEEDBACK_TEMPLATE = {
     "score": 4, "feedback": "正文",
+    "requirements_status": [
+        {"requirement_id": "R1", "status": "completed | partial | missing | unverified",
+         "user_text": "用户能看到的完成内容、部分能力或具体缺口",
+         "anchors": [{"type": "file", "path": "src/x.py"}]}
+    ],
     "results": [{"sentence": "正文中描述最终行为的原句", "requirement_ids": ["R1"],
                  "anchors": [{"type": "demo", "index": 1}]}],
-    "score_basis": {"category": "delivery_issue | verification_gap | complete",
+    "score_basis": {"category": "delivery_issue | verification_gap | process_issue | complete",
                     "delivered": "哪些主要要求实际做到", "remaining": "真实缺口、验证边界或已验证完整范围",
                     "why_this_score": "结合最终交付影响解释本档，不能按过程出错次数扣分",
                     "lowest_supported_score": 4,
@@ -68,6 +74,185 @@ ANCHOR_HELP = """锚点写法（每个都会被核对，对不上就过不了闸
   {"type": "test", "name": "失败用例名"}       产物上失败的用例
   {"type": "probe", "id": "P1"}               实跑记录
   {"type": "demo", "index": 2}                演示的第 2 条命令"""
+
+
+def decision_template(task_dir: Path) -> dict:
+    record, facts = load_evidence(task_dir)
+    return {
+        "requirements": [
+            {"id": req["id"], "verdict": "做到 | 有问题 | 看不出来", "level": "",
+             "note": "", "user_text": "", "anchors": []}
+            for req in record["requirements"]
+        ],
+        "counterexamples": [],
+        "false_success": "无",
+        "false_success_note": "",
+        "false_success_anchors": [],
+        "score": 4,
+        "feedback": "",
+        "results": [],
+        "process": [],
+        "issues": [],
+        "test_claims": [],
+        "score_basis": {
+            "category": "complete | delivery_issue | verification_gap | process_issue",
+            "delivered": "", "remaining": "", "why_this_score": "",
+            "lowest_supported_score": 4, "lower_score_rejected": "", "anchors": [],
+        },
+        "claims": [],
+        "quality_checks": {name: {"passed": False, "reason": ""} for name in (
+            "result_and_process", "task_specific_voice", "test_relevance",
+            "score_alignment", "evidence_fidelity", "scope_discipline", "non_template")},
+        "note": "",
+        "needs_probes": [],
+        "template_notes": {
+            "trace_reference": "claims[].sources[] 写 path/excerpt；脚本只在摘录唯一时自动补行号和 block",
+            "process_audit": "process[] 内写 audit:{checks:{full_trace,baseline,timeline,source_boundary,scope},note}",
+        },
+    }
+
+
+def _canonical_sentence(text: str, sentence: str) -> str:
+    import fbr_quality
+    sentence = str(sentence or "").strip()
+    if not sentence or sentence in text:
+        return sentence
+    wanted = gate.squash(sentence)
+    matches = [unit for unit in fbr_quality.public_units(text)
+               if gate.squash(unit) == wanted]
+    return matches[0] if len(matches) == 1 else sentence
+
+
+def _normalize_rows(text: str, rows) -> list:
+    result = []
+    for row in rows if isinstance(rows, list) else []:
+        if not isinstance(row, dict):
+            result.append(row)
+            continue
+        item = dict(row)
+        item["sentence"] = _canonical_sentence(text, item.get("sentence", ""))
+        result.append(item)
+    return result
+
+
+def _enrich_claim_sources(task_dir: Path, claims: list) -> list:
+    result = []
+    for raw in claims if isinstance(claims, list) else []:
+        if not isinstance(raw, dict):
+            result.append(raw)
+            continue
+        claim = dict(raw)
+        sources = []
+        for raw_source in claim.get("sources") or []:
+            if not isinstance(raw_source, dict):
+                sources.append(raw_source)
+                continue
+            source = dict(raw_source)
+            path = str(source.get("path") or "")
+            if (path.startswith("trace/projects/") and source.get("excerpt")
+                    and any(source.get(key) is None for key in ("start_line", "end_line", "block"))):
+                located = fbr_evidence.resolve_excerpt(task_dir, path, str(source["excerpt"]))
+                source.update({key: located[key] for key in
+                               ("start_line", "end_line", "block")})
+            elif path.startswith("trace/projects/") and source.get("excerpt"):
+                checked = fbr_evidence.fetch_refs(
+                    task_dir, [source], operation="compact-authoring", allow_rebind=True)
+                if checked["state"] != "ok":
+                    raise lib.FbrError(checked["errors"][0]["error"])
+            sources.append(source)
+        claim["sources"] = sources
+        result.append(claim)
+    return result
+
+
+def expand_decision(task_dir: Path, decision: dict) -> tuple[dict, dict]:
+    """Expand compact semantic input into the existing immutable feedback contracts."""
+    if not isinstance(decision, dict):
+        raise lib.FbrError("decision-input 必须是 JSON 对象")
+    work = lib.load_json(task_dir/"review/task-agent-work.json")
+    text = str(decision.get("feedback") or "")
+    requirements = []
+    statuses = []
+    audit_rows = []
+    status_map = {"做到": "completed"}
+    for raw in decision.get("requirements") or []:
+        if not isinstance(raw, dict):
+            raise lib.FbrError("requirements 每项必须是对象")
+        item = dict(raw)
+        requirement_id = str(item.get("id") or "")
+        verdict = item.get("verdict")
+        level = item.get("level") or ""
+        if verdict == "有问题":
+            status = "missing" if level == "未实现" else "partial"
+        elif verdict == "看不出来":
+            status = "unverified"
+        else:
+            status = status_map.get(verdict, item.get("status") or "")
+        audit_rows.append({key: value for key, value in item.items()
+                           if key not in ("status", "user_text")})
+        statuses.append({"requirement_id": requirement_id, "status": status,
+                         "user_text": item.get("user_text", ""),
+                         "anchors": item.get("anchors", [])})
+        requirements.append(item)
+    audit = {
+        "requirements": audit_rows,
+        "counterexamples": decision.get("counterexamples") or [],
+        "false_success": decision.get("false_success") or "无",
+        "false_success_note": decision.get("false_success_note") or "",
+        "false_success_anchors": decision.get("false_success_anchors") or [],
+    }
+    process = _normalize_rows(text, decision.get("process"))
+    process_audit = []
+    for row in process:
+        if not isinstance(row, dict):
+            continue
+        audit_row = row.get("audit") if isinstance(row.get("audit"), dict) else {}
+        process_audit.append({
+            "sentence": row.get("sentence"),
+            "subject": "model",
+            "verdict": audit_row.get("verdict", ""),
+            "checks": audit_row.get("checks") or {},
+            "note": audit_row.get("note") or "",
+        })
+    feedback = {
+        "score": decision.get("score"),
+        "feedback": text,
+        "requirements_status": statuses,
+        "results": _normalize_rows(text, decision.get("results")),
+        "score_basis": decision.get("score_basis") or {},
+        "test_claims": _normalize_rows(text, decision.get("test_claims")),
+        "issues": _normalize_rows(text, decision.get("issues")),
+        "process": process,
+        "process_audit": process_audit,
+        "note": decision.get("note") or "",
+    }
+    claims = _normalize_rows(text, _enrich_claim_sources(task_dir, decision.get("claims")))
+    candidate = {"audit": audit, "feedback": feedback,
+                 "needs_probes": decision.get("needs_probes") or []}
+    checks_in = decision.get("quality_checks")
+    if isinstance(checks_in, dict):
+        checks = []
+        for name in reviewer.quality.CHECKS:
+            value = checks_in.get(name)
+            if isinstance(value, dict):
+                checks.append({"id": name, "passed": value.get("passed") is True,
+                               "reason": str(value.get("reason") or "")})
+            else:
+                checks.append({"id": name, "passed": bool(value), "reason": str(value or "")})
+    else:
+        checks = checks_in if isinstance(checks_in, list) else []
+    verification = {
+        "task_agent": "current_task_agent",
+        "binding": work.get("binding"),
+        "candidate_sha": lib.content_hash(candidate),
+        "checks": checks,
+        "claim_reviews": [
+            {key: row.get(key) for key in
+             ("sentence", "assertions", "verdict", "reason", "later_check", "sources")}
+            for row in claims if isinstance(row, dict)
+        ],
+    }
+    return candidate, verification
 
 
 def sha(text: str) -> str:
@@ -178,12 +363,61 @@ def build_card(record: dict, facts: dict, probes: list[dict]) -> str:
     return "\n".join(out) + "\n"
 
 
+def build_brief(record: dict, facts: dict, probes: list[dict]) -> str:
+    """Compact decision packet; full card and raw facts remain queryable references."""
+    tests, changes, check, claims = facts["tests"], facts["changes"], facts["verification"], facts["claims"]
+    out = [f"# {record['task_id']} 验收决策包", "",
+           "原始轨迹、facts 和历史只用于定向查询，不整文件朗读。每条过程结论必须绑定原始 trace 的行号、block 和连续原文。", "",
+           "## 题面", "", record["prompt"].strip(), "", "## 需求", ""]
+    for req in record["requirements"]:
+        out.append(f"- {req['id']}：{req.get('text', '')}")
+    out += ["", "## 交付结果",
+            f"- 测试：初始 `{tests['before']['test_rc']}` / 产物 `{tests['after']['test_rc']}`；"
+            f"产物 {'通过' if tests['after_ok'] else '不通过'}，新增失败 {'、'.join(tests['new_failures']) or '无'}",
+            f"- 改动：{changes['totals']['files']} 文件，+{changes['totals']['added']} / -{changes['totals']['deleted']}"]
+    for item in changes["files"][:40]:
+        out.append(f"  - {item['status']} {item['path']} (+{item['added']} / -{item['deleted']})")
+    for index, step in enumerate(facts["demo"]["steps"], 1):
+        state = "没跑到" if step.get("skipped") else f"退出码 {step.get('rc')}"
+        out.append(f"- 演示 {index}：`{lib.clip(step['cmd'], 180)}` → {state}；{step.get('show') or '未写'}")
+        if step.get("tail"):
+            out.append("  " + lib.clip(step["tail"][-600:].replace("\n", " / "), 600))
+    out += ["", "## 模型过程摘要",
+            f"- 工具 {facts['trace']['counts']['tools']} 步，报错 {facts['trace']['counts']['errors']}，"
+            f"编辑 {facts['trace']['counts']['edits']}；最后编辑第 {check['last_edit_step']} 步，"
+            f"之后{'有验证' if check['verified_after_last_edit'] else '没有验证'}"]
+    for row in check["checks"][-10:]:
+        out.append(f"  - 第 {row['step']} 步 {row['kind']}：`{lib.clip(row['cmd'], 120)}` → "
+                   f"{'通过' if row['passed'] else '没通过'}")
+    errors = [step for step in facts["trace"]["steps"] if step.get("is_error")]
+    for step in errors[-10:]:
+        out.append(f"  - 第 {step['step']} 步错误：`{lib.clip(step.get('target', ''), 120)}` → "
+                   f"{lib.clip(step.get('error', ''), 220)}")
+    out += ["", "## 最终回答（自述，不是完成证据）", "", "```",
+            lib.clip(claims["final_answer"], 2000), "```"]
+    if claims["mentioned_missing"]:
+        out.append("- 回答提到但产物没有：" + "、".join(claims["mentioned_missing"]))
+    out += ["", "## 实跑"]
+    for row in probes:
+        out.append(f"- {row['id']}：`{lib.clip(row['cmd'], 180)}` → 退出码 {row['rc']}；"
+                   f"{lib.clip((row.get('tail') or '')[-500:].replace(chr(10), ' / '), 500)}")
+    out += ["", "## 定向查询",
+            "- 精确轨迹：`fbr_evidence.py fetch --task <task-dir> --ref '<path/start_line/end_line/block/excerpt>'`",
+            "- 事件包：`trace/review-pack.json`",
+            "- 候选结构：`review/candidate-schema.json`",
+            "- 完整 diff：只在需要核验具体改动时按文件和 hunk 查看，不整份朗读。",
+            "- 打分与写作口径：只读取当前阶段需要的规范，不重复加载其他阶段文档。"]
+    return "\n".join(out) + "\n"
+
+
 @lib.task_locked
 def card_one(task_dir: Path) -> dict:
     record, facts = load_evidence(task_dir)
     text = build_card(record, facts, load_probes(task_dir))
     (task_dir / "review").mkdir(exist_ok=True)
     (task_dir / "review" / "card.md").write_text(text, encoding="utf-8")
+    (task_dir / "review" / "task-agent-brief.md").write_text(
+        build_brief(record, facts, load_probes(task_dir)), encoding="utf-8")
     return {"task_id": record["task_id"], "state": "ok", "detail": "review/card.md"}
 
 
@@ -250,6 +484,9 @@ def gate_task(task_dir: Path, cfg: dict) -> dict:
     out["errors"] += fbr_quality.check_contract(doc, record, facts, audit, load_probes(task_dir))
     conf = cfg["feedback_gate"]
     ev = gate.build_evidence(record, facts, audit, load_probes(task_dir))
+    quality_receipt = lib.load_json(task_dir / "review/quality.json", default={})
+    if isinstance(quality_receipt.get("version"), int) and quality_receipt["version"] >= 12:
+        out["errors"] += fbr_quality.requirements_status_errors(doc, record, audit, ev)
     for errors, warnings in (
         gate.check_audit(audit, record, ev),
         gate.check_score(doc.get("score"), facts, audit, ev, conf),
@@ -328,12 +565,16 @@ def main() -> int:
         item = sub.add_parser(name)
         item.add_argument("--batch", required=True)
         item.add_argument("--tasks")
+    sub.choices["gate"].add_argument("--json", action="store_true")
     probe = sub.add_parser("probe")
     probe.add_argument("--batch", required=True)
     probe.add_argument("--task", required=True)
     probe.add_argument("--cmd", required=True)
     probe.add_argument("--timeout", type=int, default=180)
     probe.add_argument("--no-setup", action="store_true")
+    decision = sub.add_parser("decision")
+    decision.add_argument("--batch", required=True)
+    decision.add_argument("--task", required=True)
     args = parser.parse_args()
     try:
         root = lib.find_root(args.root)
@@ -343,6 +584,12 @@ def main() -> int:
             row = probe_one(task_dir, cfg, args.cmd, args.timeout, not args.no_setup)
             print(f"{row['id']}  退出码 {row['rc']}  {row['seconds']} 秒")
             print(row["tail"])
+            return 0
+        if args.command == "decision":
+            task_dir = lib.task_dirs(root, args.batch, args.task)[0]
+            target = task_dir/"review/decision-input.json"
+            lib.save_json(target, decision_template(task_dir))
+            print(target)
             return 0
         if args.command == "card":
             failed = 0
@@ -354,11 +601,16 @@ def main() -> int:
                 print(f"{row['task_id']}  {row['state']}  {row['detail']}", flush=True)
             return 1 if failed else 0
         rows, notes = gate_batch(root, args.batch, cfg, args.tasks)
+        if args.json:
+            print(json.dumps({"rows": rows, "notes": notes}, ensure_ascii=False, indent=2))
+            return 0 if all(row["state"] == "ok" for row in rows) else 1
         for row in rows:
             label = {"ok": "通过", "failed": "没过", "todo": "待写"}[row["state"]]
             print(f"{row['task_id']}  {label}  分数 {row['score']}")
-            for line in row["errors"]:
+            for line in row["errors"][:5]:
                 print(f"    ✗ {line}")
+            if len(row["errors"]) > 5:
+                print(f"    …其余 {len(row['errors'])-5} 项见 review/gate.json")
             for line in row["warnings"]:
                 print(f"    ! {line}")
         for line in notes:

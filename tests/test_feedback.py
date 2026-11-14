@@ -23,7 +23,12 @@ class Card(FlowCase):
         return (task_dir / "review" / "card.md").read_text(encoding="utf-8")
 
     def test_sections(self):
-        text = self.card(self.evidenced())
+        task_dir = self.evidenced()
+        text = self.card(task_dir)
+        brief = (task_dir / "review/task-agent-brief.md").read_text(encoding="utf-8")
+        self.assertLess(len(brief.encode("utf-8")), len(text.encode("utf-8")))
+        self.assertNotIn("要写的两份文件", brief)
+        self.assertNotIn('{"type":"file"', brief)
         for line in (
             "# s11-000001 素材卡", PROMPT,
             "- R1：pack 支持 --segment 分片（怎么验：python3 -m clipcut pack fixtures/short.mp4 --segment 10）",
@@ -385,6 +390,18 @@ class Main(FlowCase):
         code, out, _ = self.run_cli("card", "--batch", BATCH)
         self.assertEqual((code, out.splitlines()), (0, ["s11-000001  ok  review/card.md"]))
         self.assertTrue((task_dir / "review" / "card.md").is_file())
+
+    def test_decision_writes_compact_requirement_skeleton(self):
+        task_dir = self.evidenced()
+        code, out, err = self.run_cli("decision", "--batch", BATCH, "--task", task_dir.name)
+        self.assertEqual((code, err), (0, ""))
+        target = task_dir / "review/decision-input.json"
+        self.assertEqual(out.strip(), str(target))
+        doc = lib.load_json(target)
+        self.assertEqual([row["id"] for row in doc["requirements"]], ["R1", "R2", "R3"])
+        self.assertIn("claims", doc)
+        self.assertIn("quality_checks", doc)
+        self.assertTrue(all(item["passed"] is False for item in doc["quality_checks"].values()))
 
     def test_probe(self):
         task_dir = self.evidenced()

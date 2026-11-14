@@ -32,7 +32,8 @@ NEXT = {
     "facts": "fbr_facts.py --batch {b}",
     "feedback": "fbr_feedback.py card --batch {b}，按 references/reviewer.md 调用指定验收模型后 fbr_feedback.py gate --batch {b}",
 }
-LABEL = {"run": "运行", "collect": "收集", "commit": "提交", "record": "录屏", "facts": "取证", "feedback": "Feedback"}
+LABEL = {"run": "运行", "collect": "收集", "commit": "提交", "record": "录屏", "facts": "取证",
+         "feedback": "Feedback", "abandoned": "放弃"}
 PAGE_HEAD = """<!doctype html><html lang="zh"><meta charset="utf-8"><title>%s 抽检预览</title><style>
 body{font:14px/1.6 -apple-system,"PingFang SC",sans-serif;margin:0;background:#f6f7f9;color:#1f2328}
 main{max-width:1100px;margin:0 auto;padding:24px}
@@ -52,10 +53,30 @@ def esc(value) -> str:
 
 
 def next_stage(task_dir: Path) -> str | None:
+    if lib.load_state(task_dir)['stages'].get('run', {}).get('state') == 'abandoned':
+        return 'abandoned'
     for stage in lib.STAGES:
         if not lib.stage_ok(task_dir, stage):
             return stage
     return None
+
+
+def platform_state(task_dir: Path) -> str:
+    cleanup = lib.load_json(task_dir / "cleanup.json", default={})
+    if cleanup.get("state") == "cleaned":
+        return f"已清理 / {cleanup.get('remote_status', 'QC_PASSED')}"
+    upload = lib.load_json(task_dir / "review/upload.json", default={})
+    if upload.get("state") == "confirmed":
+        return f"已提交 / {upload.get('remote_status', '待质检')}"
+    if upload.get("submission_id") or upload.get("state") in ("creating", "verifying", "uncertain"):
+        return "提交待核对"
+    preflight = lib.load_json(task_dir / "review/submit-preflight.json", default={})
+    if preflight.get("state") == "ready":
+        return "预检通过，待提交"
+    if preflight.get("state") == "blocked":
+        errors = preflight.get("errors") or ["存在阻断项"]
+        return "预检未过：" + lib.clip("；".join(str(item) for item in errors), 160)
+    return "未提交"
 
 
 def status(root: Path, batch_id: str) -> list[dict]:
@@ -66,18 +87,23 @@ def status(root: Path, batch_id: str) -> list[dict]:
         info = stages.get(stage, {}) if stage else {}
         detail = info.get("problems") or info.get("reason") or ""
         snapshot = lib.load_json(task_dir / "review" / "snapshot.json", default={})
-        rows.append({
+        platform = platform_state(task_dir)
+        row = {
             "task_id": task_dir.name, "next": stage, "failed": info.get("state") == "failed",
             "detail": "；".join(detail) if isinstance(detail, list) else str(detail),
             "pushed": bool(snapshot.get("pushed")), "committed": lib.stage_ok(task_dir, "commit"),
-        })
+        }
+        if platform != "未提交":
+            row["platform"] = platform
+        rows.append(row)
     return rows
 
 
 def print_status(rows: list[dict], batch_id: str) -> None:
     counts: dict[str, int] = {}
     for row in rows:
-        label = "都做完了" if row["next"] is None else f"等{LABEL[row['next']]}"
+        label = (row.get("platform", "都做完了") if row["next"] is None else
+                 "已放弃（批次尾部超时）" if row["next"] == "abandoned" else f"等{LABEL[row['next']]}")
         counts[label] = counts.get(label, 0) + 1
         line = f"{row['task_id']}  {label}"
         if row["failed"]:
@@ -170,7 +196,7 @@ def preview(root: Path, batch_id: str, wanted: str | None = None) -> Path:
     parts += [task_section(root, task_dir, batch_path, batch_path / task_dir.name) for task_dir in items]
     parts.append("</main></html>")
     target = batch_path / "preview.html"
-    target.write_text("\n".join(parts), encoding="utf-8")
+    delivery.atomic_write_text(target, "\n".join(parts))
     return target
 
 
@@ -219,11 +245,13 @@ def main() -> int:
     upload.add_argument("--limit", type=int)
     upload.add_argument("--execute", action="store_true")
     upload.add_argument("--confirm", default="")
+    upload.add_argument("--json", action="store_true")
     repair = sub.choices["repair"]
     repair.add_argument("--tasks")
     repair.add_argument("--execute", action="store_true")
     repair.add_argument("--confirm", default="")
     repair.add_argument("--comment", default="")
+    repair.add_argument("--json", action="store_true")
     check = sub.choices["spotcheck"]
     check.add_argument("--task", required=True)
     check.add_argument("--state", required=True)
@@ -249,12 +277,12 @@ def main() -> int:
             import fbr_submit
             result = fbr_submit.repair_batch(root, args.batch, tasks=args.tasks,
                                              execute=args.execute, confirm=args.confirm, comment=args.comment)
-            print(json.dumps(result, ensure_ascii=False, indent=2))
+            print(fbr_submit.compact_result(result, full=args.json))
         else:
             import fbr_submit
             result = fbr_submit.run_batch(root, args.batch, tasks=args.tasks, limit=args.limit,
                                           execute=args.execute, confirm=args.confirm)
-            print(json.dumps(result, ensure_ascii=False, indent=2))
+            print(fbr_submit.compact_result(result, full=args.json))
         return 0
     except lib.FbrError as exc:
         print(f"错误：{exc}", file=sys.stderr)

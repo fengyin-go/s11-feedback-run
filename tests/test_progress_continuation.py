@@ -8,6 +8,8 @@ from fixtures import SCRIPTS
 import fbrlib as lib
 import fbr_runtime as rt
 import fbr_worker
+import fbr_retry
+import fbr_trace
 
 class ProgressContinuation(unittest.TestCase):
  def request(self,task,code):
@@ -105,3 +107,19 @@ class ProgressContinuation(unittest.TestCase):
    with patch.object(rt.time,'time',return_value=1000):
     self.assertEqual(rt.monitor_process(Mock(pid=999),req,{'pid':999}, {'task':task,'cfg':cfg,'gateway':Mock()},started=900),(124,True))
    self.assertEqual(lib.load_json(task/'run/current.json')['reason'],'stalled')
+
+ def test_tail_timeout_stops_progressing_last_task(self):
+  with TemporaryDirectory() as d:
+   batch=Path(d)/'batches'/'b1111-01';task=batch/'s11-000001';(task/'run').mkdir(parents=True)
+   out=task/'out';out.write_text(json.dumps({'type':'system','subtype':'thinking_tokens','estimated_tokens_delta':1,'estimated_tokens':1})+'\n')
+   result=task/'exit';lib.save_json(batch/'runner/tail-policy.json',{'active':True,'task_ids':[task.name],
+    'remaining':1,'max_active_seconds':50,'max_wall_seconds':500,'activated_at':'2026-11-10T10:00:00+0800'})
+   cfg=copy.deepcopy(lib.DEFAULTS)
+   req={'id':'x','result':str(result),'stdout':str(out),'started_epoch':900,
+        'base_budget':{'active_seconds':0,'waiting_seconds':0},'timeout':1000,'guard_deadline':99999}
+   with patch.object(rt.time,'time',return_value=1000),patch.object(lib,'run'):
+    self.assertEqual(rt.monitor_process(Mock(pid=999),req,{'pid':999},
+      {'task':task,'cfg':cfg,'gateway':Mock()},started=900),(124,True))
+   self.assertEqual(lib.load_json(task/'run/current.json')['reason'],'tail_timeout')
+   self.assertEqual(fbr_retry.classify_attempt({'termination_reason':'tail_timeout'})['action'],'stop')
+   self.assertEqual(fbr_trace.classify_attempt(124,True,{},termination_reason='tail_timeout')['verdict'],'abandon')

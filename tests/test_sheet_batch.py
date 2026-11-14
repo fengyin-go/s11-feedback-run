@@ -8,6 +8,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import time
 import unittest
 from unittest import mock
 
@@ -308,15 +309,17 @@ class WriteSheet(SheetCase):
         self.assertTrue(sheet["R2"].alignment.wrap_text)
 
         self.assertEqual([c.value for c in board[1]],
-                         ["任务编号", "运行", "收集", "提交", "录屏", "取证", "Feedback", "已推送", "卡在哪"])
+                         ["任务编号", "运行", "收集", "提交", "录屏", "取证", "Feedback", "已推送", "卡在哪", "最后刷新"])
         lines = [[c.value for c in line] for line in board.iter_rows(min_row=2)]
-        self.assertEqual(lines[0], ["s11-000001", "✓", "✓", "✓", "✓", "✓", "✓", "✓", None])
-        self.assertEqual(lines[1], ["s11-000002", "✓", "✓", "✓", "✓", "✓", "✓", None, NOT_PUSHED])
-        self.assertEqual(lines[2], ["s11-000003", "✓", "✓", "✓", "✓", None, None, None, "模型已跑完，待取证"])
+        self.assertEqual(lines[0][:9], ["s11-000001", "✓", "✓", "✓", "✓", "✓", "✓", "✓", None])
+        self.assertEqual(lines[1][:9], ["s11-000002", "✓", "✓", "✓", "✓", "✓", "✓", None, NOT_PUSHED])
+        self.assertEqual(lines[2][:9], ["s11-000003", "✓", "✓", "✓", "✓", None, None, None, "模型已跑完，待取证"])
         self.assertEqual(lines[3][:8], ["s11-000004", "✓", "✓", "✓", "✓", "✓", "✗", None])
         self.assertTrue(lines[3][8].startswith("Feedback 校验失败，待返修复验："))
         self.assertIn("5 分不写缺口：issues 应当为空", lines[3][8])
-        self.assertEqual(lines[4], ["s11-000005", None, None, None, None, None, None, None, "s11-000005/task.json 缺少 image"])
+        self.assertEqual(lines[4][:9], ["s11-000005", None, None, None, None, None, None, None, "s11-000005/task.json 缺少 image"])
+        self.assertTrue(all(line[9] for line in lines))
+        self.assertEqual(book.active.title, "进度")
 
     def test_regenerated_from_source(self):
         task_dir = self.gated()
@@ -338,6 +341,70 @@ class WriteSheet(SheetCase):
         code, out, err = run_main(fbr_sheet, "--root", str(self.root), "--batch", "b1111-09")
         self.assertEqual((code, out), (2, ""))
         self.assertIn("错误：批次不存在：", err)
+
+    def test_progress_refresh_keeps_delivery_entries_stable(self):
+        valid = self.gated()
+        pending = self.written(2, TEXT_B)
+        self.complete(valid)
+        first = fbr_sheet.write_sheet(self.root, BATCH, self.cfg)
+        target = first["path"].parent
+        names = {path.name for path in target.iterdir()}
+        directory_id = target.stat().st_ino
+        delivered = target / valid.name
+        before = {path.relative_to(delivered).as_posix(): path.read_bytes()
+                  for path in delivered.rglob("*") if path.is_file()}
+        history = self.root / "_verification" / "delivery-history"
+        history_before = set(history.iterdir()) if history.exists() else set()
+        first_xlsx = first["path"].read_bytes()
+
+        lib.set_stage(pending, "run", "failed", problems=["进度刷新测试"])
+        self.cfg["sheet"]["min_write_seconds"] = 0
+        refreshed = fbr_sheet.refresh_if_changed(self.root, BATCH, self.cfg)
+
+        self.assertEqual(refreshed["state"], "updated")
+        self.assertEqual({path.name for path in target.iterdir()}, names)
+        self.assertEqual(target.stat().st_ino, directory_id)
+        self.assertEqual({path.relative_to(delivered).as_posix(): path.read_bytes()
+                          for path in delivered.rglob("*") if path.is_file()}, before)
+        self.assertNotEqual(refreshed["path"].read_bytes(), first_xlsx)
+        self.assertEqual(set(history.iterdir()) if history.exists() else set(), history_before)
+
+    def test_unchanged_progress_does_not_rewrite_workbook(self):
+        self.complete(self.gated())
+        first = fbr_sheet.write_sheet(self.root, BATCH, self.cfg)
+        fingerprint = fbr_sheet.progress_fingerprint(self.root, BATCH, self.cfg)
+        before = first["path"].read_bytes()
+        self.cfg["sheet"]["min_write_seconds"] = 0
+        result = fbr_sheet.refresh_if_changed(self.root, BATCH, self.cfg)
+        self.assertEqual(result["state"], "unchanged")
+        self.assertEqual(result["path"], first["path"])
+        self.assertEqual(first["path"].read_bytes(), before)
+        self.assertEqual(fbr_sheet.progress_fingerprint(self.root, BATCH, self.cfg), fingerprint)
+
+    def test_failed_workbook_save_preserves_previous_file(self):
+        self.complete(self.gated())
+        first = fbr_sheet.write_sheet(self.root, BATCH, self.cfg)
+        before = first["path"].read_bytes()
+        with mock.patch("openpyxl.Workbook.save", side_effect=RuntimeError("fixture failure")):
+            with self.assertRaises(RuntimeError):
+                fbr_sheet.write_sheet(self.root, BATCH, self.cfg)
+        self.assertTrue(first["path"].is_file())
+        self.assertEqual(first["path"].read_bytes(), before)
+
+    def test_watch_is_singleton_and_can_be_stopped(self):
+        self.complete(self.gated())
+        self.cfg["sheet"].update(interval_seconds=.25, min_write_seconds=.25, idle_exit_seconds=30)
+        first = fbr_sheet.start_watch(self.root, BATCH, self.cfg)
+        second = fbr_sheet.start_watch(self.root, BATCH, self.cfg)
+        self.assertEqual(first["pid"], second["pid"])
+        deadline = time.time() + 5
+        while time.time() < deadline and not (
+                self.root / "results" / BATCH / "result.xlsx").is_file():
+            time.sleep(.1)
+        self.assertTrue((self.root / "results" / BATCH / "result.xlsx").is_file())
+        self.assertEqual(fbr_sheet.watch_status(self.root, BATCH)["state"], "running")
+        self.assertEqual(fbr_sheet.stop_watch(self.root, BATCH)["state"], "stopped")
+        self.assertEqual(fbr_sheet.watch_status(self.root, BATCH)["state"], "stopped")
 
 
 class Status(SheetCase):
@@ -527,12 +594,12 @@ class Main(SheetCase):
         self.assertEqual((code, out.strip()), (0, str(self.root / "results" / BATCH / "preview.html")))
         planned = {"execute": False, "tasks": [{"task_id": task_dir.name, "state": "dry"}]}
         with mock.patch("fbr_submit.run_batch", return_value=planned) as submit:
-            code, out, err = self.run_cli("upload", "--batch", BATCH)
+            code, out, err = self.run_cli("upload", "--batch", BATCH, "--json")
         submit.assert_called_once_with(self.root, BATCH, tasks=None, limit=None, execute=False, confirm="")
         self.assertEqual((code, json.loads(out), err), (0, planned, ""))
         with mock.patch("fbr_submit.run_batch", return_value={"execute": True}) as submit:
             code, out, err = self.run_cli("upload", "--batch", BATCH, "--tasks", task_dir.name,
-                                        "--limit", "1", "--execute", "--confirm", "SUBMIT")
+                                        "--limit", "1", "--execute", "--confirm", "SUBMIT", "--json")
         submit.assert_called_once_with(self.root, BATCH, tasks=task_dir.name, limit=1, execute=True, confirm="SUBMIT")
         self.assertEqual((code, json.loads(out), err), (0, {"execute": True}, ""))
         code, out, err = self.run_cli("spotcheck", "--batch", BATCH, "--task", task_dir.name, "--state", "通过")

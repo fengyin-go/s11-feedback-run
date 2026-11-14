@@ -57,7 +57,10 @@ DEFAULTS = {
         "timeout": 3600,
         "grace_seconds": 900,
         "task_budget": 4500,
-        "batch_budget": 25200,
+        "batch_budget": None,       # None = 整批不设派发截止
+        "tail_max_tasks": 2,
+        "tail_max_active_seconds": 5400,
+        "tail_hard_wall_seconds": 7200,
         "stall_seconds": 480,
         "gateway_grace": 900,
         "gateway_grace_max": 3600,
@@ -80,6 +83,7 @@ DEFAULTS = {
         "max_seconds": 90, "max_attempts": 3, "setup_timeout": 900, "step_timeout": 60,
         "width": 1280, "height": 720,
     },
+    "sheet": {"watch": True, "interval_seconds": 2, "min_write_seconds": 5, "idle_exit_seconds": 60},
     "facts": {"setup_cmd": "make setup", "test_cmd": "make test", "setup_timeout": 900, "test_timeout": 600},
     "feedback_gate": {
         "min_chars": 120, "max_chars": 700,
@@ -182,13 +186,24 @@ def settings(root: Path) -> dict:
     count = cfg["run"]["max_continuations"]
     if type(count) is not int or not 0 <= count <= 2:
         raise FbrError("run.max_continuations 必须是 0 到 2 的整数")
-    for section, keys in (("run", ("timeout", "task_budget", "batch_budget", "max_attempts", "poll_seconds")),
+    for section, keys in (("run", ("timeout", "task_budget", "max_attempts", "poll_seconds")),
                           ("gateway", ("machine_parallel", "probe_interval", "probe_successes"))):
         for name in keys:
             if type(cfg[section][name]) not in (int, float) or cfg[section][name] <= 0:
                 raise FbrError(f"{section}.{name} 必须为正数")
+    batch_budget = cfg["run"]["batch_budget"]
+    if batch_budget is not None and (type(batch_budget) not in (int, float) or batch_budget <= 0):
+        raise FbrError("run.batch_budget 必须为正数或 null（null 表示不设批次派发截止）")
     if type(cfg["run"]["max_attempts"]) is not int or not 1 <= cfg["run"]["max_attempts"] <= 3:
         raise FbrError("run.max_attempts 必须为 1 到 3")
+    for name in ("tail_max_tasks", "tail_max_active_seconds", "tail_hard_wall_seconds"):
+        value = cfg["run"][name]
+        if type(value) not in (int, float) or value <= 0:
+            raise FbrError(f"run.{name} 必须为正数")
+    for name in ("interval_seconds", "min_write_seconds", "idle_exit_seconds"):
+        value = cfg["sheet"][name]
+        if type(value) not in (int, float) or value <= 0:
+            raise FbrError(f"sheet.{name} 必须为正数")
     return cfg
 
 

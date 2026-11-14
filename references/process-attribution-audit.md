@@ -43,6 +43,8 @@ Feedback 的过程句只描述被测模型在这次轨迹中做了什么、为�
 - `field` 只能是 `tool`、`target`、`output`、`error`，摘录必须逐字落在该步骤对应的真实工具名、输入目标、输出尾部或错误文本中。
 - 没有工具步骤的特殊会话才允许 `steps: []`，并必须使用 `{"kind":"assistant","index":1,"excerpt":"真实助手文本摘录"}`。
 - 独立逐句复核时，过程句的 `claim_reviews.sources` 必须引用原始 `trace/projects/*.jsonl`，并逐条包含上述 evidence 的同一段摘录。只写一个存在的 step 号、引用另一段无关日志，不能通过。
+- 原始轨迹引用必须带 `start_line`、`end_line`、`block` 和 `excerpt`。`fbr_evidence.py` 按行偏移批量读取，脚本核对摘录确实位于该区间；仅凭事实卡中的 step 摘要不能作为最终原文证据。
+- 需要回看修正、重试或最终状态时，再按对应事件的行号/block 读取，不得整文件读取 `trace/projects/*.jsonl`。事件包负责导航，原始区间负责最终证据。
 
 `feedback.json.process_audit` 必须与 `process` 等长、同序、同句，并逐项记录：
 

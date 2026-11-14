@@ -331,6 +331,8 @@ def recover_one(task_dir: Path, cfg: dict) -> dict:
     row = {'task_id': task_dir.name}
     if lib.stage_ok(task_dir, 'run'):
         return {**row, 'state': 'ok', 'detail': '运行已收口，可继续 collect'}
+    if lib.load_state(task_dir)['stages'].get('run', {}).get('state') == 'abandoned':
+        return {**row, 'state': 'abandoned', 'detail': '批次尾部超时，已主动放弃'}
     if current.get('state') not in ('running', 'exited', 'starting', 'continue_ready'):
         return {**row, 'state': 'idle', 'detail': '没有需要接管的运行'}
     record = lib.load_task(task_dir)
@@ -450,6 +452,13 @@ def recover_one(task_dir: Path, cfg: dict) -> dict:
         archive_attempt(task_dir, record, current['attempt'], secret)
         lib.set_stage(task_dir, 'run', 'deferred', reason=decision['reason'])
         return {**row, 'state': 'deferred', 'detail': '失败运行已归档，可在剩余预算和次数内 resume'}
+    if decision['verdict'] == 'abandon':
+        archive_attempt(task_dir, record, current['attempt'], secret)
+        current.update(state='abandoned')
+        lib.save_json(current_path, current)
+        lib.set_stage(task_dir, 'run', 'abandoned', reason=decision['reason'],
+                      detail=decision['detail'], abandoned_at=lib.now_iso())
+        return {**row, 'state': 'abandoned', 'detail': decision['detail']}
     lib.set_stage(task_dir, 'run', 'failed', reason=decision['reason'])
     return {**row, 'state': 'blocked', 'detail': decision['detail']}
 
@@ -460,6 +469,8 @@ def run_one(task_dir: Path, cfg: dict) -> dict:
     name = record["task_id"]
     if lib.stage_ok(task_dir, "run"):
         return {"task_id": name, "state": "skip", "detail": "已经跑过"}
+    if lib.load_state(task_dir)["stages"].get("run", {}).get("state") == "abandoned":
+        return {"task_id": name, "state": "abandoned", "detail": "批次尾部超时，已主动放弃"}
     current = lib.load_json(task_dir / 'run/current.json', default={})
     recovering = bool(current.get('request_id') and current.get('state') in ('running', 'exited'))
     prepared = current.get('state') in ('starting', 'continue_ready')
@@ -626,7 +637,7 @@ def run_one(task_dir: Path, cfg: dict) -> dict:
             if not changed:
                 verdict = {"verdict": "retry", "reason": "零代码改动", "detail": "最终产物没有代码改动，归档后新容器重跑"}
         terminal = lib.load_json(run_dir / 'current.json', default={})
-        if timed_out and terminal.get('reason') not in ('batch_budget', 'worker_guard'):
+        if timed_out and terminal.get('reason') not in ('batch_budget', 'worker_guard', 'tail_timeout'):
             # Gateway errors can reach disk only after process termination; retain both decisions.
             time.sleep(cfg['run'].get('reclassify_settle_seconds', 8))
             stream = fbr_trace.read_stream(run_dir / 'stream.jsonl')
@@ -662,6 +673,13 @@ def run_one(task_dir: Path, cfg: dict) -> dict:
                           ended_at=attempts[-1]["ended_at"], session_id=stream["session_id"],
                           continuations=continuations)
             return {"task_id": name, "state": "ok", "detail": f"第 {number} 次运行算数"}
+        if verdict["verdict"] == "abandon":
+            archive_attempt(task_dir, record, number, secret)
+            current.update(state='abandoned', verdict='abandon')
+            lib.save_json(run_dir / "current.json", current)
+            lib.set_stage(task_dir, 'run', 'abandoned', reason=verdict['reason'],
+                          detail=verdict['detail'], abandoned_at=lib.now_iso(), attempts=number)
+            return {"task_id": name, "state": "abandoned", "detail": verdict["detail"]}
         if verdict["verdict"] == "stop":
             if gateway and verdict['reason'] == '网关鉴权失败':
                 gateway.event('auth')
@@ -757,6 +775,47 @@ def fan_out(items: list[Path], worker, parallel: int) -> list[dict]:
     return rows
 
 
+def status_rows(items: list[Path]) -> list[dict]:
+    rows = []
+    for task in items:
+        current = lib.load_json(task/'run/current.json', default={})
+        heartbeat = lib.load_json(task/'run/heartbeat.json', default={})
+        rows.append({
+            'task_id': task.name,
+            'state': current.get('state') or 'not_started',
+            'attempt': current.get('attempt'),
+            'rc': current.get('rc'),
+            'verdict': current.get('verdict'),
+            'reason': current.get('reason'),
+            'session_id': current.get('session_id') or heartbeat.get('session_id'),
+            'elapsed': round(float(heartbeat.get('elapsed') or 0), 1),
+            'idle': round(float(heartbeat.get('idle') or 0), 1),
+            'tools': int(heartbeat.get('tools') or 0),
+        })
+    return rows
+
+
+def status_text(rows: list[dict], batch: str, report: Path) -> str:
+    counts = {}
+    for row in rows:
+        counts[row['state']] = counts.get(row['state'], 0)+1
+    active = [row for row in rows if row['state'] in ('starting', 'running', 'continue_ready')]
+    failed = [row for row in rows if row['state'] in ('exited', 'failed', 'deferred') or row.get('reason')]
+    lines = [f"{batch}：{len(rows)} 题，状态 " +
+             " / ".join(f"{key} {value}" for key, value in sorted(counts.items()))]
+    if active:
+        lines.append("运行中：" + "、".join(
+            f"{row['task_id']}(attempt {row.get('attempt')}, {row.get('elapsed')}s, {row.get('tools')} tools)"
+            for row in active[:8]))
+    for row in failed[:8]:
+        lines.append(f"- {row['task_id']} {row['state']} "
+                     f"{lib.clip(row.get('reason') or row.get('verdict') or '', 120)}")
+    if len(failed) > 8:
+        lines.append(f"- 其余 {len(failed)-8} 题见报告")
+    lines.append(f"完整状态：{report}")
+    return "\n".join(lines)
+
+
 def all_tasks_resumable(tasks: list[Path]) -> bool:
     return bool(tasks) and all(
         lib.load_json(task / "run/current.json", default={}).get("state")
@@ -777,12 +836,15 @@ def main() -> int:
         item.add_argument("--limit", type=int)
     sub.choices["run"].add_argument("--execute", action="store_true")
     sub.choices['run'].add_argument('--detach', action='store_true')
+    sub.choices['run'].add_argument('--no-sheet-watch', action='store_true')
     sub.choices['resume'].add_argument('--execute', action='store_true')
     sub.choices['resume'].add_argument('--detach', action='store_true')
+    sub.choices['resume'].add_argument('--no-sheet-watch', action='store_true')
     sub.choices['recover'].add_argument('--execute', action='store_true')
     sub.choices['legacy-recover'].add_argument('--execute', action='store_true')
     sub.choices['drain'].add_argument('--execute', action='store_true')
     sub.choices["collect"].add_argument("--keep-container", action="store_true")
+    sub.choices["status"].add_argument("--json", action="store_true")
     args = parser.parse_args()
     if getattr(args, "limit", None) is not None and args.limit < 1:
         parser.error("--limit 必须是正整数")
@@ -796,8 +858,11 @@ def main() -> int:
         items = lib.task_dirs(root, args.batch, args.tasks)
         directory = lib.batch_dir(root, args.batch) / 'runner'
         if args.command == 'status':
-            print(json.dumps([{'task_id': p.name, 'current': lib.load_json(p / 'run/current.json', default={}),
-                              'heartbeat': lib.load_json(p / 'run/heartbeat.json', default={})} for p in items], ensure_ascii=False))
+            rows = status_rows(items)
+            target = root/'_verification/status'/f'{args.batch}-run.json'
+            lib.save_json(target, {'version': 1, 'batch': args.batch, 'at': lib.now_iso(), 'tasks': rows})
+            print(json.dumps(rows, ensure_ascii=False, indent=2)
+                  if args.json else status_text(rows, args.batch, target))
             return 0
         if args.command == 'recover':
             if not args.execute:
@@ -826,7 +891,8 @@ def main() -> int:
                 proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
             print(json.dumps({'pid': proc.pid, 'log': str(directory / 'runner.log')}))
             return 0
-        todo = [p for p in items if not lib.stage_ok(p, "run")][: args.limit or None]
+        todo = [p for p in items if not lib.stage_ok(p, "run")
+                and lib.load_state(p)['stages'].get('run', {}).get('state') != 'abandoned'][: args.limit or None]
         if not todo:
             print("没有待运行的任务")
             return 0
@@ -844,27 +910,57 @@ def main() -> int:
         print("预检：")
         if not print_checks(preflight(cfg)):
             raise lib.FbrError("预检没过，不起跑")
-        with lib.file_lock(directory / 'runner.lock'):
-            if args.command == 'resume':
-                (directory / 'drain').unlink(missing_ok=True)
-            budget_path = directory / 'budget.json'
-            legacy_grants = []
-            for task_dir in todo:
-                current = lib.load_json(task_dir / 'run/current.json', default={})
-                marker = lib.load_json(task_dir / 'run/legacy-progress-recovery.json', default={})
-                legacy_grants.append(marker.get('state') == 'ready' and not marker.get('used_at')
-                                     and marker.get('attempt') == current.get('attempt'))
-            batch_budget = {'deadline': float('inf')
-                            if (legacy_grants and all(legacy_grants)) or all_tasks_resumable(todo)
-                            else runtime.batch_deadline(root, args.batch, cfg)}
-            lib.save_json(budget_path, batch_budget)
-            cfg.update(_deadline=batch_budget['deadline'], _drain=str(directory / 'drain'))
-            import fbr_schedule
-            cfg['_single_attempt'] = True
-            rows = fbr_schedule.rolling(todo, lambda p: run_one(p, cfg), parallel=cfg['concurrency'],
-                deadline=cfg['_deadline'], stopped=lambda: Path(cfg['_drain']).exists(),
-                on_result=lambda task, row: print(f"{task.name}  {row['state']}  {row.get('detail', '')}", flush=True))
-        return 0 if all(r["state"] in ("ok", "skip") for r in rows) else 1
+        process_path = directory / 'process.json'
+        process_info = {'pid': os.getpid(), 'identity': runtime.process_identity(),
+                        'started_at': lib.now_iso(), 'command': args.command}
+        lib.save_json(process_path, process_info)
+        try:
+            if not args.no_sheet_watch and cfg.get('sheet', {}).get('watch', True):
+                import fbr_sheet
+                fbr_sheet.start_watch(root, args.batch, cfg)
+            with lib.file_lock(directory / 'runner.lock'):
+                if args.command == 'resume':
+                    (directory / 'drain').unlink(missing_ok=True)
+                import fbr_dependencies
+                prewarm = fbr_dependencies.prewarm_batch(root, args.batch, cfg, todo)
+                gateway_state = runtime.Gateway(cfg)
+                with gateway_state.transaction() as pressure:
+                    effective_parallel = min(int(cfg['concurrency']), int(pressure['cap']))
+                print(f"依赖预热：{prewarm['prepared']} 已准备，{prewarm['fallback']} 回退原 setup，"
+                      f"{prewarm['failed']} 失败；模型并发准备为 "
+                      f"{min(effective_parallel, max(0, len(todo) - prewarm['failed']))}"
+                      f"（配置 {cfg['concurrency']}，网关 cap {pressure['cap']}）", flush=True)
+                budget_path = directory / 'budget.json'
+                legacy_grants = []
+                for task_dir in todo:
+                    current = lib.load_json(task_dir / 'run/current.json', default={})
+                    marker = lib.load_json(task_dir / 'run/legacy-progress-recovery.json', default={})
+                    legacy_grants.append(marker.get('state') == 'ready' and not marker.get('used_at')
+                                         and marker.get('attempt') == current.get('attempt'))
+                batch_budget = {'deadline': float('inf')
+                                if (legacy_grants and all(legacy_grants)) or all_tasks_resumable(todo)
+                                else runtime.batch_deadline(root, args.batch, cfg)}
+                lib.save_json(budget_path, batch_budget)
+                cfg.update(_deadline=batch_budget['deadline'], _drain=str(directory / 'drain'))
+                import fbr_schedule
+                cfg['_single_attempt'] = True
+                tail = runtime.write_tail_policy(root, args.batch, todo, cfg, 'runner')
+                if tail.get('active'):
+                    print(f"尾部模式：剩余 {tail['remaining']} 题，有效时限 "
+                          f"{int(tail['max_active_seconds'])} 秒", flush=True)
+                def on_result(task, row):
+                    tail = runtime.write_tail_policy(root, args.batch, todo, cfg, 'runner')
+                    if tail.get('active') and not row.get('detail'):
+                        row['detail'] = f"尾部模式，剩余 {tail['remaining']} 题"
+                    print(f"{task.name}  {row['state']}  {row.get('detail', '')}", flush=True)
+                rows = fbr_schedule.rolling(todo, lambda p: run_one(p, cfg), parallel=cfg['concurrency'],
+                    deadline=cfg['_deadline'], stopped=lambda: Path(cfg['_drain']).exists(),
+                    on_result=on_result)
+        finally:
+            current = lib.load_json(process_path, default={})
+            if current.get('pid') == process_info['pid'] and current.get('identity') == process_info['identity']:
+                process_path.unlink(missing_ok=True)
+        return 0 if all(r["state"] in ("ok", "skip", "abandoned") for r in rows) else 1
     except lib.FbrError as exc:
         print(f"错误：{exc}", file=sys.stderr)
         return 2

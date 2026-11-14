@@ -3,11 +3,18 @@ from __future__ import annotations
 import hashlib
 import os
 from pathlib import Path, PurePosixPath
+import re
 import shutil
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import fbrlib as lib
 
 NAMES = {'node_modules', '.venv', 'venv', 'vendor'}
+LOCAL_DEPENDENCY = re.compile(
+    r'(?i)(?:"(?:file|link|portal):|["\'](?:file|link|portal):|'
+    r'(?:^|\s)(?:-e|--editable)\s+(?:\.{1,2}/?|["\']?\.{1,2}["\']?)|'
+    r'["\']workspaces["\']\s*:)'
+)
 
 
 def roots(repo, cfg):
@@ -55,29 +62,65 @@ def wait_lock(path, deadline):
     return held()
 
 
-def ensure(repo, cfg, setup_cmd=None):
+def _identity(repo, cfg, setup_cmd=None):
     repo = Path(repo)
-    if not cfg.get('dependencies', {}).get('enabled', False): return None
     paths = roots(repo, cfg)
-    if not paths: return None
-    root = lib.containing_root(repo)
+    if not paths:
+        return None, None
     commit = lib.git_out(repo, 'rev-parse', 'HEAD')
-    image = lib.run(['docker', 'image', 'inspect', '--format', '{{.Id}}|{{.Os}}|{{.Architecture}}', cfg['image']], timeout=60)
+    image = lib.run(['docker', 'image', 'inspect', '--format', '{{.Id}}|{{.Os}}|{{.Architecture}}',
+                     cfg['image']], timeout=60)
     parts = image.stdout.strip().split('|')
     if image.returncode or len(parts) != 3 or parts[0] != cfg['image_id'] or parts[1] != 'linux':
         raise lib.FbrError('依赖缓存镜像/平台与真实预检不符')
     setup = setup_cmd if setup_cmd is not None else cfg['facts']['setup_cmd']
     smoke = cfg.get('dependencies', {}).get('smoke_cmd') or cfg['facts']['test_cmd']
     dependency_files = {}
+    local_inputs = []
     for name in lib.git_out(repo, 'ls-files').splitlines():
         p = Path(name)
         if p.name in ('package.json','package-lock.json','pnpm-lock.yaml','yarn.lock','requirements.txt','pyproject.toml','poetry.lock','Pipfile','Pipfile.lock','uv.lock') or p.name.startswith('requirements'):
-            dependency_files[name] = hashlib.sha256((repo/name).read_bytes()).hexdigest()
-    # Full commit also isolates install hooks and local file dependencies; never reuse across changed product code implicitly.
+            data = (repo/name).read_bytes()
+            dependency_files[name] = hashlib.sha256(data).hexdigest()
+            if LOCAL_DEPENDENCY.search(data.decode('utf-8', 'replace')):
+                local_inputs.append(name)
+    if LOCAL_DEPENDENCY.search(setup):
+        local_inputs.append('setup_cmd')
     restore = cfg.get('dependencies', {}).get('setup_after_restore_cmd') or 'true'
-    identity = {'version': 2, 'commit': commit, 'image': parts, 'dependency_files': dependency_files,
-                'paths': paths, 'setup': setup, 'smoke': smoke, 'restore':restore}
-    key = lib.content_hash(identity)
+    identity = {'version': 3, 'image': parts, 'dependency_files': dependency_files,
+                'paths': paths, 'setup': setup, 'smoke': smoke, 'restore': restore,
+                'source_commit': commit if local_inputs else None,
+                'local_dependency_inputs': sorted(set(local_inputs))}
+    return identity, lib.content_hash(identity)
+
+
+def _receipt_valid(repo, cfg, task):
+    if not task:
+        return False
+    repo = Path(repo)
+    receipt = lib.load_json(Path(task) / 'run/dependencies.json', default={})
+    if receipt.get('state') != 'copied' or receipt.get('initial_commit') != lib.git_out(repo, 'rev-parse', 'HEAD'):
+        return False
+    cached = lib.load_json(Path(receipt.get('cache', '/nonexistent')) / 'manifest.json', default={})
+    if cached.get('identity') != receipt.get('identity') or cached.get('state') != 'verified':
+        return False
+    return all((repo / path).is_dir() and not (repo / path).is_symlink()
+               for path in receipt.get('paths', []))
+
+
+def ensure(repo, cfg, setup_cmd=None):
+    repo = Path(repo)
+    if not cfg.get('dependencies', {}).get('enabled', False): return None
+    identity, key = _identity(repo, cfg, setup_cmd)
+    if identity is None:
+        return None
+    paths = identity['paths']
+    root = lib.containing_root(repo)
+    commit = lib.git_out(repo, 'rev-parse', 'HEAD')
+    setup = identity['setup']
+    smoke = identity['smoke']
+    restore = identity['restore']
+    parts = identity['image']
     directory = root/'_registry/dependencies'/key
     directory.parent.mkdir(parents=True, exist_ok=True)
     with wait_lock(directory.with_suffix('.lock'), min(cfg.get('_deadline',float('inf')),time.time()+2*cfg['facts']['setup_timeout']+2*cfg['facts']['test_timeout']+240)):
@@ -131,10 +174,12 @@ def ensure(repo, cfg, setup_cmd=None):
 
 
 def seed(repo, cfg, *, task=None, setup_cmd=None):
+    repo = Path(repo)
+    if _receipt_valid(repo, cfg, task):
+        return True
     prepared = ensure(repo, cfg, setup_cmd)
     if not prepared: return False
     directory, saved = prepared
-    repo = Path(repo)
     destinations = []
     for name in saved['paths']:
         dst = repo/name
@@ -160,6 +205,50 @@ def seed(repo, cfg, *, task=None, setup_cmd=None):
         lib.save_json(Path(task)/'run/dependencies.json', {'state':'copied','initial_commit':lib.git_out(repo,'rev-parse','HEAD'),
             'cache':str(directory),'identity':saved['identity'],'paths':saved['paths'],'at':lib.now_iso()})
     return True
+
+
+def prewarm_batch(root, batch, cfg, tasks):
+    """Prepare all task workspaces before model dispatch so the first wave is parallel."""
+    root = Path(root)
+    batch_dir = lib.batch_dir(root, batch)
+    path = batch_dir / 'dependency-prewarm.json'
+    todo = []
+    for task in map(Path, tasks):
+        current = lib.load_json(task / 'run/current.json', default={})
+        run_state = lib.load_state(task)['stages'].get('run', {}).get('state')
+        if current.get('state') in ('starting', 'running', 'exited', 'continue_ready'):
+            continue
+        if lib.stage_ok(task, 'run') or run_state == 'abandoned':
+            continue
+        todo.append(task)
+    state = {'state': 'running', 'batch': batch, 'total': len(todo), 'prepared': 0,
+             'fallback': 0, 'failed': 0, 'results': [], 'started_at': lib.now_iso()}
+    lib.save_json(path, state)
+    if not cfg.get('dependencies', {}).get('enabled') or not todo:
+        state.update(state='completed', completed_at=lib.now_iso())
+        lib.save_json(path, state)
+        return state
+
+    def prepare(task):
+        try:
+            prepared = seed(task / 'workspace', cfg, task=task)
+            return {'task_id': task.name, 'state': 'prepared' if prepared else 'fallback'}
+        except (lib.FbrError, OSError, ValueError) as exc:
+            return {'task_id': task.name, 'state': 'failed', 'detail': str(exc)}
+
+    workers = max(1, min(int(cfg.get('concurrency', 5)), len(todo)))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(prepare, task): task for task in todo}
+        for future in as_completed(futures):
+            row = future.result()
+            state['results'].append(row)
+            state[row['state']] += 1
+            state['updated_at'] = lib.now_iso()
+            lib.save_json(path, state)
+    state.update(state='completed', completed_at=lib.now_iso(),
+                 workers=workers, model_concurrency=min(int(cfg.get('concurrency', 5)), len(todo)))
+    lib.save_json(path, state)
+    return state
 
 
 def unexpected_ignored(task, status):

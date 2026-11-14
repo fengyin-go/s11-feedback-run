@@ -8,6 +8,8 @@
 
 ```bash
 fbr_submit.py probe
+fbr_submit.py schema-field --fingerprint <fingerprint> --field repro_level
+fbr_submit.py preflight --batch b1110-01 --task s11-000123
 fbr_batch.py --root "<root>" upload --batch b1110-01 --tasks s11-000123 --limit 1
 # 用户明确授权本次平台提交后：
 fbr_batch.py --root "<root>" upload --batch b1110-01 --tasks s11-000123 --limit 1 --execute --confirm SUBMIT
@@ -16,7 +18,11 @@ fbr_sheet.py --root "<root>" --batch b1110-01
 
 `fbr_submit.py submit` 与 `fbr_batch.py upload` 是同一实现。默认只向平台发送登录请求和 GET，不上传、不建单；本地会刷新交付清单。已有绑定当前内容的回执时，默认演练也会 GET 回读并刷新本地回执的质检状态。
 
-真实提交串行进行；所选任务先全部完成本地校验，再上传第一份文件。`--tasks` 逗号分隔，`--limit` 限制本次处理数。未传选择参数时检查整个批次；未就绪任务不被悄悄跳过。平台第一次提交会锁定该账号的领域，跨领域整批停止。首次提交属于哪个领域由用户确定，不由脚本替用户选择。
+默认输出只给状态、任务数、阻断摘要和结果路径，`--json` 才展开完整回执。`probe` 将完整 schema 写入 `_registry/platform-schema/<fingerprint>.json`；`preflight` 将完整计划写入 `review/upload-plan.json`。当前 AI 按 fingerprint、字段名或错误项定向查询，不整份回读 schema/plan/upload receipt。
+
+`fbr_submit.py preflight` 是单题只读门闸：重新跑当前题 Feedback/查重，刷新白名单交付投影，核对字段、媒体和历史 SessionID，再读取实时 schema 与账号领域。结果写 `review/submit-preflight.json`，包含当前 `feedback_sha`、`source_digest`、`content_digest`、产物快照、schema fingerprint 和错误清单；不包含凭据，也不上传附件或创建记录。滚动提交只有该文件状态为 `ready` 才进入上传，正式上传前仍由底层再次核对来源摘要和 schema。
+
+真实提交串行进行；人工批量提交时，所选任务先全部完成本地校验，再上传第一份文件。滚动模式每次只对一条执行同样的单条 all-or-nothing 预检，一条失败不会阻止其他题继续生产或提交。`--tasks` 逗号分隔，`--limit` 限制本次处理数。未传选择参数时检查整个批次；未就绪任务不被悄悄跳过。平台第一次提交会锁定该账号的领域，跨领域整批停止。首次提交属于哪个领域由用户确定，不由脚本替用户选择。
 
 ## 凭据和认证
 

@@ -348,7 +348,11 @@ def classify_attempt(rc: int, timed_out: bool, stream: dict, stderr_tail: str = 
     if timed_out:
         labels = {'gateway_wait_exhausted': '网关等待预算耗尽', 'timeout': '单次有效运行超时',
                   'stalled': '运行无进展超时', 'task_budget': '单题累计有效运行预算耗尽',
-                  'batch_budget': '批次运行截止', 'worker_guard': '执行器保护时限到达'}
+                  'batch_budget': '批次运行截止', 'worker_guard': '执行器保护时限到达',
+                  'tail_timeout': '批次尾部超时，主动放弃'}
+        if termination_reason == 'tail_timeout':
+            return {"verdict": "abandon", "reason": labels[termination_reason],
+                    "detail": "批次只剩最后一至两题，达到尾部时限后主动放弃并保留现场"}
         return {"verdict": "retry", "reason": labels.get(termination_reason, "进程超时（历史记录未保留具体原因）"), "detail": termination_reason}
     if result is None:
         why = "网关报错" if GATEWAY_RE.search(stderr_tail or "") else "进程异常退出" if rc != 0 else "无故中断"

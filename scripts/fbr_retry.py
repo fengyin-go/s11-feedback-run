@@ -99,6 +99,8 @@ def classify_attempt(record: Mapping) -> dict:
     # Known local termination takes precedence over past/recovered API errors.
     if termination in ("batch_budget", "worker_guard"):
         return _decision("budget", "defer", termination)
+    if termination == "tail_timeout":
+        return _decision("budget", "stop", termination)
     if termination == "task_budget":
         return _decision("model", "defer", termination)
     if termination in ("timeout", "stalled", "model_timeout", "zero_code_changes", "interrupted"):

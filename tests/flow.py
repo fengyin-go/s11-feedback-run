@@ -13,6 +13,7 @@ from __future__ import annotations
 import contextlib
 import copy
 import io
+import json
 import sys
 from pathlib import Path
 from unittest import mock
@@ -49,8 +50,12 @@ TEXT_B = (
     "收尾的说明还提到 docs/usage.md 这份文档，仓库里找不到它，按说明去查用法的人拿不到任何东西。")
 PARTS = {
     TEXT_A: {"gap": "超过一小时的输入没有做", "claim": "最后的回答里说新增了 docs/usage.md，产物里并没有这个文件",
+             "result1": "实际执行 pack fixtures/short.mp4 --segment 10 能切出 6 个分片，--segment 0 会打印 error 并以退出码 2 结束",
+             "result2": "超过一小时的输入没有做：拿 fixtures/long.mp4 去跑，直接抛出 RuntimeError: input longer than 3600s is not supported，退出码 1，packer.py 里对应的位置只留了一行 TODO，长素材完全打不了包",
              "process": [("make test 在第 3 步通过", [3]), ("随后第 4 步又改了一次 packer.py，之后没有再跑测试", [4])]},
     TEXT_B: {"gap": "长时长这一项落空了", "claim": "收尾的说明还提到 docs/usage.md 这份文档，仓库里找不到它",
+             "result1": "用 fixtures/short.mp4 加 --segment 10 试过，拿到 6 个分片；--segment 0 被拒绝，返回码是 2",
+             "result2": "长时长这一项落空了：fixtures/long.mp4 一跑就是 RuntimeError: input longer than 3600s is not supported，返回码 1，packer.py 里那段逻辑只有一行 TODO 占着位置，时长过长的文件根本处理不了",
              "process": [("第 3 步运行 make test 时通过", [3]), ("可第 4 步再次修改 packer.py 以后没有重新验证", [4])]},
 }
 
@@ -87,8 +92,20 @@ def feedback(text: str = TEXT_A, score: int = 3) -> dict:
                for index, (sentence, steps) in enumerate(parts["process"])]
     return copy.deepcopy({
         "score": score, "feedback": text, "note": "",
-        "results": [{"sentence": "--segment 0 会打印 error 并以退出码 2 结束" if text == TEXT_A else "--segment 0 被拒绝，返回码是 2",
-                     "requirement_ids": ["R3"], "anchors": [{"type": "probe", "id": "P1"}]}],
+        "requirements_status": [
+            {"requirement_id": "R1", "status": "completed", "user_text": "短素材能够按目标时长切成分片",
+             "anchors": [{"type": "demo", "index": 1}, {"type": "file", "path": "src/clipcut/segment.py"}]},
+            {"requirement_id": "R2", "status": "missing", "user_text": "超过一小时的素材仍然无法打包",
+             "anchors": [{"type": "probe", "id": "P2"}, {"type": "file", "path": "src/clipcut/packer.py"}]},
+            {"requirement_id": "R3", "status": "completed", "user_text": "零时长参数会被拒绝并返回错误",
+             "anchors": [{"type": "probe", "id": "P1"}]},
+        ],
+        "results": [
+            {"sentence": parts["result1"], "requirement_ids": ["R1", "R3"],
+             "anchors": [{"type": "probe", "id": "P1"}, {"type": "demo", "index": 1}]},
+            {"sentence": parts["result2"], "requirement_ids": ["R2"],
+             "anchors": [{"type": "probe", "id": "P2"}, {"type": "file", "path": "src/clipcut/packer.py"}]},
+        ],
         "score_basis": {"lowest_supported_score": score, "lower_score_rejected": "更低档缺少主要功能完全不可用的证据", "anchors": [{"type": "probe", "id": "P2"}], "category": "delivery_issue", "delivered": "短输入可以生成分片且拒绝零时长",
                         "remaining": "长输入未实现且文档声明不实", "why_this_score": "主要链路部分可用但长输入明确未实现"},
         "test_claims": [{"sentence": fbr_feedback.gate.squash(m.group()), "requirement_ids": ["R1"],
@@ -112,7 +129,8 @@ def feedback(text: str = TEXT_A, score: int = 3) -> dict:
     })
 
 
-def mock_claim_reviews(doc, trace_source: str | None = None, trace_excerpt: str | None = None):
+def mock_claim_reviews(doc, trace_source: str | None = None, trace_excerpt: str | None = None,
+                       task_dir: Path | None = None):
     """仅模拟模型协议，不代表夹具正文已经过真实语义审核。"""
     process = {
         item["sentence"]: item.get("evidence", [{}])[0].get("excerpt")
@@ -120,9 +138,30 @@ def mock_claim_reviews(doc, trace_source: str | None = None, trace_excerpt: str 
     }
     trace_source = trace_source or f"trace/projects/-workspace/{SID}.jsonl"
     trace_excerpt = trace_excerpt or '"type": "tool_use"'
+    def locator(excerpt: str) -> dict:
+        row = {"path": trace_source, "excerpt": excerpt}
+        if task_dir is None:
+            return {**row, "start_line": 1, "end_line": 1, "block": 0}
+        path = Path(task_dir) / trace_source
+        for line_number, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            if excerpt in raw:
+                block = 0
+                try:
+                    value = json.loads(raw)
+                    content = (value.get("message") or {}).get("content", value.get("content"))
+                    if isinstance(content, list):
+                        for number, item in enumerate(content):
+                            if excerpt in json.dumps(item, ensure_ascii=False):
+                                block = number
+                                break
+                except ValueError:
+                    pass
+                return {**row, "start_line": line_number, "end_line": line_number, "block": block}
+        first = path.read_text(encoding="utf-8").splitlines()[0]
+        return {"path": trace_source, "excerpt": first, "start_line": 1, "end_line": 1, "block": 0}
     rows = []
     for sentence in fbr_quality.public_units(doc["feedback"]):
-        source = ({"path": trace_source, "excerpt": process.get(sentence) or trace_excerpt}
+        source = (locator(process.get(sentence) or trace_excerpt)
                   if sentence in process else {"path": "task.json", "excerpt": '"task_id"'})
         rows.append({"sentence": sentence, "assertions": ["离线模拟事实断言"], "verdict": "supported",
                      "reason": "离线模拟模型独立复核的具体依据", "later_check": "离线模拟后续修正与最终状态检查",
@@ -189,17 +228,25 @@ class FlowCase(FactsCase):
         fbr_reviewer.trace_index(task_dir)
         paths = sorted((task_dir/'trace/projects').rglob('*.jsonl'))
         engine = SimpleNamespace(file_sha=fbr_reviewer.file_sha, quality=fbr_quality)
+        import fbr_evidence
+        check = fbr_evidence.ingest(task_dir)
+        source_meta = {row["path"]: row for row in check["sources"]}
         trace = {'state': 'accepted', 'identity': fbr_trace_review.identity(task_dir, engine),
                  'receipt': {'model': fbr_reviewer.MODEL, 'reasoning_effort': fbr_reviewer.EFFORT, 'provider': fbr_reviewer.PROVIDER},
-                 'coverage': [{'path': p.relative_to(task_dir).as_posix(), 'last_line': len(p.read_text().splitlines())} for p in paths],
+                 'coverage': [{'path': p.relative_to(task_dir).as_posix(),
+                               'last_line': source_meta[p.relative_to(task_dir).as_posix()]['lines'],
+                               'sha256': source_meta[p.relative_to(task_dir).as_posix()]['sha256']} for p in paths],
                  'statements': [{'statement': '离线轨迹分析协议夹具', 'verdict': 'supported', 'later_check': '离线夹具后续状态',
-                     'sources': [{'path': paths[0].relative_to(task_dir).as_posix(), 'excerpt': paths[0].read_text().splitlines()[0]}]}]}
+                     'sources': [{'path': paths[0].relative_to(task_dir).as_posix(),
+                                  'start_line': 1, 'end_line': 1, 'block': 0,
+                                  'excerpt': paths[0].read_text().splitlines()[0]}]}]}
         lib.save_json(task_dir/'review/trace-analysis.json', trace)
         receipt = {
             "state": "completed", "model": "current_task_agent", "reasoning_effort": "session",
             "workflow": "task-agent-v1", "trace-analysis_sha": fbr_reviewer.file_sha(task_dir/"review/trace-analysis.json"),
             "provider": "current_task_agent",
             "inputs": fbr_reviewer.inputs(task_dir),
+            "trace_check_sha": fbr_reviewer.file_sha(task_dir / fbr_evidence.CHECK),
             "audit_sha": fbr_reviewer.file_sha(task_dir / "evidence/audit.json"),
             "feedback_sha": fbr_reviewer.file_sha(task_dir / "review/feedback.json"),
             "policy_sha": fbr_quality.policy_sha(),
@@ -209,7 +256,7 @@ class FlowCase(FactsCase):
         trace_excerpt = paths[0].read_text().splitlines()[0]
         lib.save_json(task_dir / "review/quality.json", {**receipt, "version": fbr_quality.VERSION,
             "state": "accepted", "claim_reviews": mock_claim_reviews(
-                lib.load_json(task_dir / "review/feedback.json"), trace_source, trace_excerpt
+                lib.load_json(task_dir / "review/feedback.json"), trace_source, trace_excerpt, task_dir
             ), "checks": [{"id": name, "passed": True,
                 "reason": "离线夹具已核对当前证据及评价结构"} for name in fbr_quality.CHECKS]})
 

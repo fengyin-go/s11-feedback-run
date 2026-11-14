@@ -29,8 +29,12 @@ def validate_plan(plan):
     if any(not isinstance(path, str) or not path.startswith('/') or path.startswith('//') for path in plan.get('health_paths', [])):
         raise lib.FbrError('health_paths 只能为当前服务的绝对路径')
     for step in plan['steps']:
-        if not isinstance(step, dict) or step.get('action') not in ('click', 'fill', 'select', 'press', 'wait_for', 'expect_text'):
-            raise lib.FbrError('Web steps 仅支持 click/fill/select/press/wait_for/expect_text')
+        if not isinstance(step, dict) or step.get('action') not in ('click', 'fill', 'set_files', 'select', 'press', 'wait_for', 'expect_text'):
+            raise lib.FbrError('Web steps 仅支持 click/fill/set_files/select/press/wait_for/expect_text')
+        if step['action'] == 'set_files':
+            value = step.get('value')
+            if not isinstance(value, str) or not value.strip() or not Path(value).expanduser().is_file():
+                raise lib.FbrError('set_files 必须提供存在的本地文件路径')
         if step['action'] == 'select' and not isinstance(step.get('value'), str):
             raise lib.FbrError('select 必须提供原生选项的字符串 value')
         if not isinstance(step.get('selector'), str) or not step['selector']:
@@ -142,6 +146,8 @@ def render(plan, container, port, out_dir, rec):
                                 locator.click(timeout=wait)
                             elif action == 'fill':
                                 locator.fill(str(item.get('value', '')), timeout=wait)
+                            elif action == 'set_files':
+                                locator.set_input_files(str(Path(item['value']).expanduser()), timeout=wait)
                             elif action == 'select':
                                 locator.select_option(value=item['value'], timeout=wait)
                             elif action == 'press':

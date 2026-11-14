@@ -2,11 +2,37 @@
 
 评价并发默认 5，配置超过 5 时仍取 5。每题跑题完成后立即进入录屏、取证和评价，不等整批结束，也不等凑齐五题。补证使用单独队列，不占轨迹模型槽。`needs_task_agent` 是当前 AI 的待办：持续读取检查点中的失败项，修复候选、补证、执行 finalize，不能当作整条数据完成。
 
+实时结果表使用单实例 watcher。它比较状态指纹而不是固定每轮重建：心跳、无变化轮询和纯进度重复值都不触发写入；阶段状态变化才合并刷新。`result.xlsx` 固定在 `results/<批次>/`，由目录外临时文件原子替换；交付目录本身不移动。证据文件只在任务有效集合或源摘要变化时同步，不随每次进度刷新重复制。
+
+滚动平台提交使用单独的串行通道。运行、录屏、取证和评价线程只报告本地完成；提交通道对每条重新执行单题门闸与实时 schema 预检，通过后按稳定顺序一次上传建单一条。这样不会因为网络上传长期占用评价线程，也不会让同一批次的多条完成记录同时抢平台提交锁。预检回执与正式上传回执分别绑定来源摘要，任何上游变化都会使旧结果失效。
+
+清理使用另一个独立单线程通道，只在显式启用后运行。平台返回 `QC_PASSED` 后，清理 worker 再回读一次详情，校验结果投影、轨迹、录屏和平台附件摘要，写入 `retention.json` 与 `cleanup.json`，随后把过程目录原子移入 cleanup trash 再删除。等待 QC 的轮询不占用运行 key，也不影响其他任务继续提交。共享依赖缓存和批次历史不在单题清理范围内。
+
 仅轨迹分析调用 reviewer.env；过程证据核查、产物验收、评分、Feedback 和修复均由推进任务的当前 AI 完成，不指定模型或推理强度。轨迹未变化可复用分析；当前 AI 核实的过程断言及引用未变化可复用证据核查；产物和评分变化仍须当前 AI 重新核对。
+
+## 轨迹证据访问
+
+原始 `trace/projects/*.jsonl` 只由 `fbr_evidence.py ingest` 做一次全量流式摄取，生成 manifest、行偏移、全量事件图、review pack 和 trace-check。reviewer 读取事件包，不读取完整原始轨迹。当前 AI 复核 claim 时通过批量 `fetch/verify` 读取精确行号和 block；同一来源在一次请求中只打开一次，相同区间自动去重。读取统计写到批次外部的 `_verification/evidence-access/`，不在交付任务目录里追加日志。
+
+事件图保留原始重复块。同一 `tool_use_id` 因上下文压缩被重复输出时，review pack 按逻辑 tool ID 选用实际完成结果对应的调用；`trace-check` 同时记录 raw tool blocks、logical tools、duplicates 和真正 unpaired 数，避免把合法重复误判成未配对。
+
+事件包不是最终证据。每条过程结论仍必须回到原始区间核对连续摘录和后续最终状态；索引、facts、card 或生成侧摘要不能替代原文。轨迹在摄取后变化时，清单与当前文件大小/mtime 不一致，必须重新摄取，旧偏移和旧分析不能复用。
+
+`review/task-agent-brief.md` 是当前 AI 的默认决策包，完整 `card.md`、`facts.json`、`diff.patch` 和事件图只用于定向查询。`review/metrics.json` 记录 reviewer 返回的 token usage、prompt/response 字节、raw trace 大小、pack 大小和证据访问次数。Token 下降不是通过标准；任何无法由原始区间支持的模型过程描述都必须被闸门拒绝。
+
+批量处理用 `fbr_work.py next --batch …` 逐题领取精简包，只返回当前题的 stage brief、checkpoint、trace pack 和候选 schema 路径。完成一题后运行 `closeout` 写结构化任务摘要；不要把多题 card、facts、diff 或 history 一起放进同一上下文。
+
+`fbr_metrics.py aggregate --batch …` 分开统计产物模型、reviewer、Feedback attempt 和证据访问。`fbr_flow.py wait` 在服务端等待 `needs_task_agent/blocked/completed` 等事件，避免当前 AI 反复轮询状态。
+
+命令默认摘要，完整对象落盘：运行状态在 `_verification/status/`，批次指标在 `_verification/metrics/`，平台 schema 在 `_registry/platform-schema/`，upload plan 在 `review/upload-plan.json`，校验错误在 `review/*-errors.json`。只有 `--json` 或定向查询才展开，不能把摘要当成数据源。
+
+运行 stream、stderr、测试日志和 probe 日志只通过 `fbr_logs.py` 查询。默认按错误文本取上下文并限制返回字节；只有明确排查缺口时才提高窗口，不整文件读取。
 
 ## 同基线依赖
 
-`dependencies.enabled` 默认 true。从冻结基础代码准备一次 Linux 依赖缓存，绑定完整提交、依赖清单/锁文件、镜像 ID、OS、架构、准备及 smoke 命令；并发构建使用文件锁。命中后复制到每题 workspace 的同位置，不用共享可写目录或硬链接。宿主 MacOS 的 native 依赖不能直接复制到 Linux；首次在实际任务镜像中安装并验证，后续同环境复用。
+`dependencies.enabled` 默认 true。从冻结基础代码准备 Linux 依赖缓存，身份优先绑定依赖清单元数据/内容摘要、锁文件、镜像 ID、OS、架构、准备及 smoke 命令，因此不同任务 commit 只要依赖内容相同即可共享；发现本地 `file:`、`link:`、workspace 或 editable 依赖时改用完整 commit 隔离。并发构建使用文件锁。命中后复制到每题 workspace 的同位置，不用共享可写目录或硬链接。宿主 MacOS 的 native 依赖不能直接复制到 Linux；首次在实际任务镜像中安装并验证，后续同环境复用。
+
+真跑在模型派发前调用批次依赖预热。预热逐题写入 `dependency-prewarm.json`，完成后再填满模型线程池；这样首次启动不会出现一个任务先建缓存、其余任务长时间停留在 starting 的情况。
 
 自动识别 package.json 同级 node_modules 和 Python 清单同级 .venv；其他目录通过 `dependencies.paths` 显式指定（当前支持 node_modules/.venv/venv/vendor）。目录必须在冻结基线中被 Git 忽略且未跟踪。安装没有产生可复制目录时记录 unavailable，沿用原 setup，不搬全局 site-packages。自动识别兼容 monorepo hoist；显式配置的路径则必须全部存在。
 
