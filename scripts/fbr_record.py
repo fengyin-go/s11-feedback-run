@@ -446,6 +446,13 @@ def main() -> int:
         with ThreadPoolExecutor(max_workers=max(1, int(cfg["record_parallel"]))) as pool:
             rows = list(pool.map(safe, todo))
         for row in rows:
+            task_dir = lib.task_dirs(root, args.batch, row["task_id"])[0]
+            if row["state"] in ("ok", "skip") and lib.stage_ok(task_dir, "record"):
+                try:
+                    import fbr_retention
+                    fbr_retention.compact_record_attempts(root, task_dir, cfg)
+                except (lib.FbrError, OSError, ValueError):
+                    pass
             print(f"{row['task_id']}  {row['state']}  {row['detail']}", flush=True)
         return 0 if all(r["state"] in ("ok", "skip") for r in rows) else 1
     except lib.FbrError as exc:

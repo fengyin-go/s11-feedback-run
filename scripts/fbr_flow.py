@@ -100,13 +100,27 @@ def produce(task, cfg, options):
 
 def record_task(task, cfg):
     import fbr_record
+    import fbr_retention
     checked(fbr_record.record_one(task, cfg))
+    try:
+        fbr_retention.compact_record_attempts(lib.containing_root(task), task, cfg)
+    except (lib.FbrError, OSError, ValueError) as exc:
+        lib.save_json(task / "review" / "retention-warning.json", {
+            "at": lib.now_iso(), "stage": "record", "state": "blocked", "reason": str(exc),
+        })
     return task
 
 
 def facts_task(task, root, cfg):
     import fbr_facts
+    import fbr_retention
     checked(fbr_facts.facts_one(task, root, cfg))
+    try:
+        fbr_retention.compact_task_scratch(root, task, cfg)
+    except (lib.FbrError, OSError, ValueError) as exc:
+        lib.save_json(task / "review" / "retention-warning.json", {
+            "at": lib.now_iso(), "stage": "facts", "state": "blocked", "reason": str(exc),
+        })
     return task
 
 
@@ -292,7 +306,21 @@ def finish_review(task, root, cfg, options):
             task, root, cfg, force=state['state'] == 'delivery_changed')
     else:
         raise lib.FbrError(state['reason'])
-    return {'task_id':task.name,'state':'ok','detail':'验收、快照推送及本地字段核查完成' if publishing else '本地验收完成（显式不发布）'}
+    compacted = None
+    if publishing:
+        import fbr_cleanup
+        try:
+            compacted = fbr_cleanup.compact_local_task(root, options.batch, task, cfg)
+        except (lib.FbrError, OSError, ValueError) as exc:
+            compacted = {"state": "blocked", "reason": str(exc)}
+            lib.save_json(task / "review" / "retention-warning.json", {
+                "at": lib.now_iso(), "state": "blocked", "reason": str(exc),
+            })
+    suffix = ""
+    if compacted and compacted.get("state") == "ok":
+        suffix = f"，已回收 {compacted.get('bytes_removed', 0)} 字节"
+    detail = '验收、快照推送及本地字段核查完成' if publishing else '本地验收完成（显式不发布）'
+    return {'task_id':task.name,'state':'ok','detail':detail + suffix}
 
 
 def run_flow(root, args):
@@ -308,6 +336,12 @@ def run_flow(root, args):
             root, getattr(args, 'submit_interval', None))
         args.submit_context = fbr_submit.SubmitContext()
         if getattr(args,'publish',None) is None: args.publish=True
+        cleanup_cfg = cfg.get('cleanup') or {}
+        if (getattr(args, 'auto_submit', False)
+                and cleanup_cfg.get('auto') is True
+                and cleanup_cfg.get('policy', 'minimal') != 'safe'):
+            args.auto_cleanup = True
+            args.confirm_cleanup = 'CLEANUP'
         if getattr(args, 'auto_submit', False) and not args.publish:
             raise lib.FbrError('滚动平台提交要求产物快照已发布，不能同时使用 --no-publish')
         if getattr(args, 'auto_cleanup', False) and not getattr(args, 'auto_submit', False):
@@ -497,10 +531,17 @@ def run_flow(root, args):
             fbr_sheet.write_sheet(root, args.batch, cfg)
         problem = any(r['state'] not in ('ok', 'frozen', 'abandoned') for r in rows)
         reason = 'budget' if time.time() >= deadline else 'paused' if args.stopped() else 'needs_task_agent' if any(r['state']=='needs_task_agent' for r in rows) else 'blocked' if problem else 'completed'
+        maintenance = None
+        try:
+            import fbr_cleanup
+            maintenance = fbr_cleanup.maintain_batch(root, args.batch, cfg, execute=True)
+        except (lib.FbrError, OSError, ValueError) as exc:
+            maintenance = {"state": "blocked", "reason": str(exc)}
+            lib.save_json(directory / 'retention-warning.json', maintenance)
         lib.save_json(directory / 'stop.json', {
             'reason': reason, 'at': lib.now_iso(), 'results': rows,
-            'platform': platform_summary(tasks)})
-        return {'state': reason, 'results': rows}
+            'platform': platform_summary(tasks), 'maintenance': maintenance})
+        return {'state': reason, 'results': rows, 'maintenance': maintenance}
 
 
 def spawn(root, args, watchdog=False):

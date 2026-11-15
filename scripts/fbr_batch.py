@@ -76,6 +76,8 @@ def platform_state(task_dir: Path) -> str:
     if preflight.get("state") == "blocked":
         errors = preflight.get("errors") or ["存在阻断项"]
         return "预检未过：" + lib.clip("；".join(str(item) for item in errors), 160)
+    if cleanup.get("state") == "local_compacted":
+        return "本地已封存 / 现场已压缩"
     return "未提交"
 
 
@@ -300,12 +302,24 @@ def main() -> int:
             result = fbr_submit.repair_batch(root, args.batch, tasks=args.tasks,
                                              execute=args.execute, confirm=args.confirm, comment=args.comment,
                                              interval=args.submit_interval)
+            if args.execute:
+                try:
+                    import fbr_cleanup
+                    fbr_cleanup.maintain_batch(root, args.batch, lib.settings(root), execute=True, tasks=args.tasks)
+                except (lib.FbrError, OSError, ValueError):
+                    pass
             print(fbr_submit.compact_result(result, full=args.json))
         else:
             import fbr_submit
             result = fbr_submit.run_batch(root, args.batch, tasks=args.tasks, limit=args.limit,
                                           execute=args.execute, confirm=args.confirm,
                                           interval=args.submit_interval)
+            if args.execute:
+                try:
+                    import fbr_cleanup
+                    fbr_cleanup.maintain_batch(root, args.batch, lib.settings(root), execute=True, tasks=args.tasks)
+                except (lib.FbrError, OSError, ValueError):
+                    pass
             print(fbr_submit.compact_result(result, full=args.json))
         return 0
     except lib.FbrError as exc:

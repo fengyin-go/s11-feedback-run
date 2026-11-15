@@ -97,6 +97,16 @@ DEFAULTS = {
         "rate_limit_retries": 3,
         "rate_limit_backoff_seconds": [15, 30, 45],
     },
+    "cleanup": {
+        "policy": "minimal",
+        "auto": True,
+        "history_keep": 1,
+        "compact_record_attempts": True,
+        "compact_scratch_after_facts": True,
+        "compact_task_after_local_seal": True,
+        "require_remote_snapshot": True,
+        "purge_dependencies_on_batch_complete": True,
+    },
 }
 
 
@@ -568,6 +578,9 @@ def restore_git_config(task_dir: Path) -> dict:
     配置里能挂外部命令（过滤器、差异工具、凭据助手），不能带着被改过的配置在宿主机上执行。
     """
     task_dir = Path(task_dir)
+    if not (task_dir / "workspace" / ".git").is_dir():
+        import fbr_retention
+        fbr_retention.ensure_workspace(task_dir)
     git_dir = validate_git_layout(task_dir)
     saved = task_dir / "run" / "git-config.before"
     out = {"config_restored": False, "hooks_moved": []}
@@ -608,6 +621,10 @@ def git_out(repo: Path, *args: str) -> str:
 
 def clean_clone(workspace: Path, commit: str, prefix: str) -> Path:
     """把某个提交克隆到独立目录（只含已提交的内容），给录屏和取证用；保留目录供核查。"""
+    workspace = Path(workspace)
+    if not (workspace / ".git").is_dir():
+        import fbr_retention
+        fbr_retention.ensure_workspace(workspace.parent)
     dest = scratch_dir(prefix) / "workspace"
     result = git(Path(workspace), "clone", "-q", "--no-hardlinks", "--no-checkout", str(Path(workspace).resolve()),
                  str(dest))

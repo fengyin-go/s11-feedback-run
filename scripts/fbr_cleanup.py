@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Archive and clean task process directories only after live platform QC_PASSED."""
+"""Archive task evidence, compact rebuildable data, and finalize after QC_PASSED."""
 from __future__ import annotations
 
 import argparse
@@ -9,11 +9,13 @@ import os
 import shutil
 import sys
 import tempfile
+import uuid
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import fbrlib as lib
 import fbr_delivery as delivery
+import fbr_retention as retention
 import fbr_runtime as runtime
 import fbr_submit
 
@@ -152,7 +154,10 @@ def _write_copy(source: Path, target: Path) -> bool:
 
 
 def _write_retention(root: Path, task_dir: Path, manifest: dict, task: dict,
-                     receipt: dict, detail: dict) -> dict:
+                     receipt: dict | None = None, detail: dict | None = None,
+                     *, state: str = "qc_cleaned") -> dict:
+    receipt = receipt or {}
+    detail = detail or {}
     artifact = delivery.delivery_dir(root, task_dir.parent.name) / task_dir.name
     platform = artifact / "platform"
     platform.mkdir(parents=True, exist_ok=True)
@@ -171,20 +176,24 @@ def _write_retention(root: Path, task_dir: Path, manifest: dict, task: dict,
     files = {}
     for path in sorted(artifact.rglob("*")):
         if path.is_file() and not path.is_symlink():
+            if path.name in ("retention.json", "cleanup.json"):
+                continue
             files[path.relative_to(artifact).as_posix()] = {
                 "bytes": path.stat().st_size,
                 "sha256": _digest(path),
             }
+    local_snapshot = lib.load_json(task_dir / "review/snapshot.json", default={})
     snapshot = receipt.get("remote_data") or {}
     retention = {
         "schema_version": RETENTION_VERSION,
         "task_id": task_dir.name,
         "batch": task_dir.parent.name,
+        "state": state,
         "archived_at": lib.now_iso(),
         "platform": {
             "account": receipt.get("account"),
             "submission_id": receipt.get("submission_id"),
-            "status": receipt.get("remote_status"),
+            "status": receipt.get("remote_status") or "local_sealed",
             "submitted_at": receipt.get("submitted_at"),
             "verified_at": receipt.get("verified_at"),
             "qc_checked_at": lib.now_iso(),
@@ -200,7 +209,8 @@ def _write_retention(root: Path, task_dir: Path, manifest: dict, task: dict,
             "repo_full": task.get("task_repo_full"),
             "initial_commit": task.get("initial_commit"),
             "initial_snapshot": (task.get("publish") or {}).get("initial_snapshot"),
-            "artifact_snapshot": snapshot.get("artifact_snapshot"),
+            "artifact_snapshot": snapshot.get("artifact_snapshot")
+            or local_snapshot.get("artifact_snapshot"),
             "image": task.get("image"),
             "image_id": task.get("image_id"),
             "harness": task.get("harness"),
@@ -294,10 +304,12 @@ def _cleanup_candidates(root: Path, task_dir: Path) -> list[Path]:
     return [path for path in candidates if path.exists() or path.is_symlink()]
 
 
-def _safe_remove(root: Path, task_dir: Path, candidates: list[Path], receipt: dict) -> list[dict]:
+def _safe_remove(root: Path, task_dir: Path, candidates: list[Path], receipt: dict,
+                 *, state: str = "cleaned", reason: str = "") -> list[dict]:
     task_dir = task_dir.resolve()
     scratch_root = (root.resolve() / "_verification/runtime-scratch").resolve()
-    trash = root.resolve() / "_verification/cleanup-trash" / task_dir.parent.name / task_dir.name
+    trash = (root.resolve() / "_verification/cleanup-trash" / task_dir.parent.name
+             / f"{task_dir.name}-{uuid.uuid4().hex[:8]}")
     trash.mkdir(parents=True, exist_ok=True)
     removed = []
     for path in candidates:
@@ -320,10 +332,11 @@ def _safe_remove(root: Path, task_dir: Path, candidates: list[Path], receipt: di
         removed.append({"path": relative.as_posix(), "bytes": size,
                         "trashed_at": lib.now_iso()})
     cleanup = {
-        "state": "cleaned",
+        "state": state,
         "at": lib.now_iso(),
         "submission_id": receipt.get("submission_id"),
-        "remote_status": receipt.get("remote_status"),
+        "remote_status": receipt.get("remote_status") or "local_sealed",
+        "reason": reason,
         "removed": removed,
         "bytes_removed": sum(item["bytes"] for item in removed),
         "retained": ["task.json", "task-seed.json", "state.json", "recording-plan.json",
@@ -336,6 +349,180 @@ def _safe_remove(root: Path, task_dir: Path, candidates: list[Path], receipt: di
         cleanup)
     shutil.rmtree(trash, ignore_errors=True)
     return removed
+
+
+def _local_seal_problems(root: Path, batch_id: str, task_dir: Path,
+                         manifest: dict, cfg: dict) -> list[str]:
+    problems = []
+    for name in ("run/attempts.json", "run/key-identity.json"):
+        path = task_dir / name
+        if not path.is_file() or path.is_symlink():
+            problems.append(f"缺少保留文件：{name}")
+    if not all(lib.stage_ok(task_dir, stage) for stage in lib.STAGES):
+        problems.append("任务阶段尚未全部完成")
+    if _task_active(task_dir):
+        problems.append(_task_active(task_dir))
+    snapshot = lib.load_json(task_dir / "review/snapshot.json", default={})
+    require_remote = bool((cfg.get("cleanup") or {}).get("require_remote_snapshot", True))
+    if require_remote and (snapshot.get("pushed") is not True or not snapshot.get("artifact_snapshot")):
+        problems.append("产物快照尚未推送并回读")
+    try:
+        _verify_result_task(root, manifest, task_dir.name)
+    except lib.FbrError as exc:
+        problems.append(str(exc))
+    return problems
+
+
+@lib.task_locked
+def compact_local_task(root: Path, batch_id: str, task_dir: Path, cfg: dict,
+                       *, force: bool = False) -> dict:
+    """Compact rebuildable task data after local delivery is sealed."""
+    root = Path(root).resolve()
+    task_dir = Path(task_dir).resolve()
+    if not retention.enabled(cfg, "local", force=force):
+        return {"task_id": task_dir.name, "state": "disabled", "bytes_removed": 0}
+    cleanup = lib.load_json(task_dir / "cleanup.json", default={})
+    if cleanup.get("state") == "cleaned":
+        return {"task_id": task_dir.name, "state": "skip", "bytes_removed": 0, "reason": "已经清理"}
+    manifest = lib.load_json(
+        delivery.delivery_dir(root, batch_id) / "delivery-manifest.json", default={})
+    try:
+        if not manifest.get("batch_id"):
+            raise lib.FbrError("缺少交付清单")
+        _verify_result_task(root, manifest, task_dir.name)
+    except lib.FbrError:
+        manifest = delivery.export_batch(root, batch_id, cfg)
+    problems = _local_seal_problems(root, batch_id, task_dir, manifest, cfg)
+    if problems:
+        return {
+            "task_id": task_dir.name,
+            "state": "blocked",
+            "bytes_removed": 0,
+            "reason": "；".join(dict.fromkeys(problems)),
+        }
+    candidates = _cleanup_candidates(root, task_dir)
+    if not candidates:
+        return {"task_id": task_dir.name, "state": "skip", "bytes_removed": 0, "reason": "没有可回收现场"}
+    record = lib.load_task(task_dir)
+    snapshot = lib.load_json(task_dir / "review/snapshot.json", default={})
+    _write_retention(root, task_dir, manifest, record, state="local_sealed")
+    _verify_retention(root, task_dir.name, batch_id)
+    removed = _safe_remove(
+        root, task_dir, candidates,
+        {
+            "submission_id": "",
+            "remote_status": "local_sealed",
+            "artifact_snapshot": snapshot.get("artifact_snapshot"),
+        },
+        state="local_compacted",
+        reason="本地交付封存且产物快照已推送",
+    )
+    return {
+        "task_id": task_dir.name,
+        "state": "ok",
+        "bytes_removed": sum(item["bytes"] for item in removed),
+        "removed": removed,
+    }
+
+
+def _task_terminal(task_dir: Path) -> tuple[bool, str]:
+    state = lib.load_state(task_dir)["stages"]
+    if state.get("run", {}).get("state") == "abandoned":
+        return True, "运行已主动放弃"
+    cleanup = lib.load_json(task_dir / "cleanup.json", default={})
+    if cleanup.get("state") in ("local_compacted", "cleaned"):
+        return True, "现场已压缩"
+    current = lib.load_json(task_dir / "run/current.json", default={})
+    if runtime.alive(current):
+        return False, "任务仍在运行"
+    return False, "尚未本地封存或清理"
+
+
+def maintain_batch(root: Path, batch_id: str, cfg: dict, *,
+                   execute: bool = False, tasks: str | None = None,
+                   force: bool = False) -> dict:
+    """Apply bounded retention at task and batch boundaries."""
+    root = Path(root).resolve()
+    manifest = lib.load_json(
+        delivery.delivery_dir(root, batch_id) / "delivery-manifest.json", default={})
+    task_dirs = lib.task_dirs(root, batch_id, tasks)
+    all_task_dirs = lib.task_dirs(root, batch_id)
+    rows = []
+    for task_dir in task_dirs:
+        if execute:
+            try:
+                row = compact_local_task(root, batch_id, task_dir, cfg, force=force)
+            except (lib.FbrError, OSError, ValueError) as exc:
+                row = {
+                    "task_id": task_dir.name,
+                    "state": "blocked",
+                    "bytes_removed": 0,
+                    "reason": str(exc),
+                }
+        else:
+            candidates = _cleanup_candidates(root, task_dir)
+            if lib.load_json(task_dir / "cleanup.json", default={}).get("state") == "cleaned":
+                state, reason = "skip", "已经清理"
+            elif not manifest.get("batch_id"):
+                state, reason = "blocked", "缺少交付清单"
+            else:
+                problems = _local_seal_problems(root, batch_id, task_dir, manifest, cfg)
+                state = "ready" if not problems and candidates else "blocked"
+                reason = "；".join(dict.fromkeys(problems)) if problems else (
+                    "" if candidates else "没有可回收现场"
+                )
+            rows.append({
+                "task_id": task_dir.name,
+                "state": state,
+                "reason": reason,
+                "candidate_bytes": sum(retention.path_size(path) for path in candidates),
+                "candidate_paths": [
+                    str(path.relative_to(task_dir)) if path.is_relative_to(task_dir) else str(path)
+                    for path in candidates
+                ],
+            })
+            continue
+        rows.append(row)
+    history = None
+    dependencies = None
+    if execute:
+        history = retention.trim_delivery_history(root, batch_id, cfg, force=force)
+        terminal = [_task_terminal(task_dir) for task_dir in all_task_dirs]
+        no_active = all(
+            not runtime.alive(lib.load_json(task_dir / "run/current.json", default={}))
+            for task_dir in all_task_dirs
+        )
+        if terminal and all(item[0] for item in terminal) and no_active:
+            dependencies = retention.purge_dependencies(root, cfg, force=force)
+    elif retention.enabled(cfg, "history", force=force):
+        kept, removed = retention.history_candidates(
+            root, batch_id, retention.history_keep(cfg))
+        history = {
+            "state": "preview",
+            "kept": [str(path) for path in kept],
+            "candidate_snapshots": len(removed),
+            "candidate_bytes": sum(retention.path_size(path) for path in removed),
+        }
+    summary = {
+        "batch": batch_id,
+        "at": lib.now_iso(),
+        "execute": execute,
+        "policy": retention.policy(cfg),
+        "tasks": rows,
+        "bytes_removed": sum(int(row.get("bytes_removed", 0)) for row in rows),
+        "history": history,
+        "dependencies": dependencies,
+    }
+    if execute:
+        lib.save_json(root / "_verification" / "retention" / f"{batch_id}-maintenance.json", summary)
+    return summary
+
+
+def hydrate_task(root: Path, batch_id: str, task: str) -> dict:
+    task_dir = lib.task_dirs(root, batch_id, task)
+    if len(task_dir) != 1:
+        raise lib.FbrError("恢复 workspace 必须只指定一道题")
+    return retention.ensure_workspace(task_dir[0])
 
 
 def audit_batch(root: Path, batch_id: str, tasks: str | None = None, *, client=None) -> dict:
@@ -448,7 +635,7 @@ def verify_batch(root: Path, batch_id: str, tasks: str | None = None) -> dict:
     rows = []
     for task_dir in lib.task_dirs(root, batch_id, tasks):
         cleanup = lib.load_json(task_dir / "cleanup.json", default={})
-        if cleanup.get("state") != "cleaned":
+        if cleanup.get("state") not in ("local_compacted", "cleaned"):
             continue
         row = {"task_id": task_dir.name, "valid": False, "errors": []}
         try:
@@ -459,8 +646,10 @@ def verify_batch(root: Path, batch_id: str, tasks: str | None = None) -> dict:
                 task_dir / "trace/ids.json", task_dir / "record/recording.mp4",
                 task_dir / "record/recording.json", task_dir / "evidence/facts.json",
                 task_dir / "review/feedback.json", task_dir / "review/gate.json",
-                task_dir / "review/upload.json",
+                task_dir / "review/snapshot.json",
             )
+            if cleanup.get("state") == "cleaned":
+                required += (task_dir / "review/upload.json",)
             missing = [str(path.relative_to(task_dir)) for path in required
                        if not path.is_file() or path.is_symlink()]
             if missing:
@@ -477,13 +666,18 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="S11 task archive and process cleanup")
     parser.add_argument("--root")
     sub = parser.add_subparsers(dest="command", required=True)
-    for name in ("restore", "audit", "prune", "verify"):
+    for name in ("restore", "audit", "prune", "verify", "maintain", "hydrate"):
         item = sub.add_parser(name)
         item.add_argument("--batch", required=True)
         item.add_argument("--tasks")
         if name == "prune":
             item.add_argument("--execute", action="store_true")
             item.add_argument("--confirm", default="")
+        if name == "maintain":
+            item.add_argument("--execute", action="store_true")
+            item.add_argument("--confirm", default="")
+        if name == "hydrate":
+            item.add_argument("--task", required=True)
     args = parser.parse_args()
     try:
         root = lib.find_root(args.root)
@@ -494,6 +688,15 @@ def main() -> int:
         elif args.command == "prune":
             result = prune_batch(root, args.batch, args.tasks,
                                  execute=args.execute, confirm=args.confirm)
+        elif args.command == "maintain":
+            if args.execute and args.confirm != "MAINTAIN":
+                raise lib.FbrError("真实维护需要 --execute --confirm MAINTAIN")
+            result = maintain_batch(
+                root, args.batch, lib.settings(root),
+                execute=args.execute, tasks=args.tasks, force=args.execute,
+            )
+        elif args.command == "hydrate":
+            result = hydrate_task(root, args.batch, args.task)
         else:
             result = verify_batch(root, args.batch, args.tasks)
         print(json.dumps(result, ensure_ascii=False, indent=2))

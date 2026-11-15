@@ -109,6 +109,13 @@ class RollingFlow(SubmitCase):
                         return_value={"prepared": 0, "fallback": 2, "failed": 0}), \
              mock.patch.object(fbr_flow, "review_task", side_effect=review), \
              mock.patch.object(fbr_flow, "submit_task", side_effect=submitted), \
+             mock.patch.object(
+                 fbr_flow, "cleanup_task",
+                 side_effect=lambda task, *args: {
+                     "task_id": task.name,
+                     "state": "ok",
+                     "detail": "离线测试不连接平台",
+                 }), \
              mock.patch("fbr_sheet.write_sheet", return_value={}):
             result = fbr_flow.run_flow(self.root, self.options(auto_submit=True))
         self.assertEqual(result["state"], "completed")

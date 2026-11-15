@@ -24,7 +24,7 @@ fbr_flow.py resume --batch b1110-01 --execute --confirm FLOW --detach
 
 GitHub 推送在独立验收和 Feedback 闸门通过、首次落表之后执行；推送后回读并再次落表核查全部必填字段。完整流水线默认主动发布，明确本地模式加 `--no-publish`；平台提交另加 `--auto-submit --confirm-submit SUBMIT`，不是默认模式。当前有效版本写 `review/attestation.json`，冻结评审输入、交付输入、Feedback、来源摘要、内容摘要和产物快照。滚动提交由独立的单线程队列串行消费 `ready_submit`，不占运行、录屏、取证或评价并发。每条提交前只验证凭证和实时平台条件，写 `review/submit-preflight.json`，不重新调用 AI 或重跑内容评审；失败只阻断当前题。人工整批提交先运行 `fbr_batch.py closeout`，检查所有凭证、字段、SessionID、领域和查重后再上传。平台单存在的任务冻结自动生产，返修需另行处理。产物尚未推送时本地仍可评价，但表格不会假报可提交。spotcheck 必须由真实审核人登记。
 
-显式开启 `--auto-cleanup --confirm-cleanup CLEANUP` 时，提交成功后进入独立 QC/清理轮询。只有实时详情为 `QC_PASSED`、本地回执 `confirmed`、结果包 SHA256 全部有效且任务无活动进程时，才写 `retention.json`、平台回执副本与 `cleanup.json`，然后删除 `origin/workspace/run-tree/run` 大目录和该题 scratch。`QC_RUNNING` 继续等，`PENDING_FIX`、`uncertain`、摘要漂移和活动任务只报阻塞，不自动删除。该模式仍须显式授权，`pre-submit` 一律拒绝。
+默认 `cleanup.auto=true` 且 `policy=minimal`。录屏、取证和每次交付投影成功后分别执行阶段回收、本题 scratch 回收和历史快照裁剪；本地交付封存后删除可重建代码现场。滚动提交成功后进入独立 QC/清理轮询，只有实时详情为 `QC_PASSED`、本地回执 `confirmed`、结果包 SHA256 全部有效且任务无活动进程时，才写最终 `retention.json`、平台回执副本与 `cleanup.json`。`QC_RUNNING` 继续等，`PENDING_FIX`、`uncertain` 和摘要漂移不会删除长期证据。`pre-submit` 不做平台提交，因此只执行本地封存和批次维护，不连接平台。细节见 [retention.md](retention.md)。
 
 `pause --execute` 不发起新题，当前阶段完成后保留检查点；`drain --execute` 停止新跑题和新尝试，已经有效完成的题可继续下游。两种哨兵持久保留，只有显式 resume 清除。默认不设批次派发截止；只有显式配置有限 `run.batch_budget` 时才在到顶后停止继续投递。持续进展的已派发模型执行继续运行；已进入录屏/测试/评价的调用仍受各自超时约束，不中途破坏文件。
 

@@ -15,6 +15,7 @@ import uuid
 from pathlib import Path, PurePosixPath
 
 import fbrlib as lib
+import fbr_retention
 import fbr_reviewer as reviewer
 
 
@@ -319,7 +320,15 @@ def export_batch(root: Path, batch_id: str, cfg: dict | None = None) -> dict:
     lock = root / "_verification" / "delivery-locks" / f"{batch_id}.lock"
     lock.parent.mkdir(parents=True, exist_ok=True)
     with lib.file_lock(lock):
-        return _export_batch_locked(root, target, batch_id, cfg)
+        manifest = _export_batch_locked(root, target, batch_id, cfg)
+        try:
+            fbr_retention.trim_delivery_history(root, batch_id, cfg)
+        except (lib.FbrError, OSError, ValueError) as exc:
+            lib.save_json(
+                root / "_verification" / "retention" / f"{batch_id}-history-blocked.json",
+                {"state": "blocked", "at": lib.now_iso(), "reason": str(exc)},
+            )
+        return manifest
 
 
 def _export_batch_locked(root: Path, target: Path, batch_id: str, cfg: dict) -> dict:

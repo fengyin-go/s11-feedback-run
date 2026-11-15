@@ -469,6 +469,13 @@ def probe_many(task_dir, cfg, requests, with_setup=True):
             shutil.copy2(done['output_file'],target)
             row.update(output_file=str(target.relative_to(task_dir)),output_sha256=done.get('output_sha256'))
         lib.append_jsonl(task_dir/'evidence/probes.jsonl',row);outputs.append(row)
+    if lib.load_json(task_dir / 'cleanup.json', default={}).get('state') == 'local_compacted':
+        try:
+            import fbr_cleanup
+            fbr_cleanup.compact_local_task(
+                lib.containing_root(task_dir), task_dir.parent.name, task_dir, cfg)
+        except (lib.FbrError, OSError, ValueError):
+            pass
     return outputs
 
 

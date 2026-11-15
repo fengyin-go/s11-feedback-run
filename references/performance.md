@@ -8,7 +8,9 @@
 
 批次提交前的结果写在 `results/<批次>/batch-closeout.json`，包含每题凭证摘要、来源摘要、内容摘要、SessionID、领域和查重结论。只有 `ready` 才允许整批上传；单题失败只让该题回到执行期评价或交付修复。
 
-清理使用另一个独立单线程通道，只在显式启用后运行。平台返回 `QC_PASSED` 后，清理 worker 再回读一次详情，校验结果投影、轨迹、录屏和平台附件摘要，写入 `retention.json` 与 `cleanup.json`，随后把过程目录原子移入 cleanup trash 再删除。等待 QC 的轮询不占用运行 key，也不影响其他任务继续提交。共享依赖缓存和批次历史不在单题清理范围内。
+回收使用三个边界：阶段成功、交付投影成功和批次终止，详细规则见 [retention.md](retention.md)。录屏成功后只保留正式视频和元数据；取证成功后回收本题 scratch；每次 `results` 投影成功后把 `delivery-history` 限制为 `cleanup.history_keep` 份；本地交付封存后压缩 `origin/workspace/run-tree`。平台返回 `QC_PASSED` 后，清理 worker 再回读详情，校验结果投影、轨迹、录屏和平台附件摘要，写入最终 `retention.json` 与 `cleanup.json`。
+
+依赖缓存不在单题清理范围内，只在整批没有活动任务且所有任务都进入 `local_compacted`、`cleaned` 或 `abandoned` 后由批次维护回收。依赖缓存可以按身份重建，回收后不影响现有证据和平台提交；下一次同基线任务会重新准备。`cleanup.policy` 分 `safe`、`balanced`、`minimal`，默认 `minimal`；`--no-publish` 只停用代码现场压缩，阶段 scratch 和历史裁剪仍可执行。任何删除先进入 `_verification/cleanup-trash/`，验证或记账失败时保留现场。
 
 仅轨迹分析调用 reviewer.env；过程证据核查、产物验收、评分、Feedback 和修复均由推进任务的当前 AI 完成，不指定模型或推理强度。轨迹未变化可复用分析；当前 AI 核实的过程断言及引用未变化可复用证据核查；产物和评分变化仍须当前 AI 重新核对。
 

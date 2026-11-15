@@ -1489,6 +1489,14 @@ def main() -> int:
             result = run_batch(lib.find_root(args.root), args.batch, tasks=args.tasks,
                                limit=args.limit, execute=args.execute, confirm=args.confirm,
                                interval=args.submit_interval)
+        if args.command in ("submit", "repair") and args.execute:
+            try:
+                import fbr_cleanup
+                root = lib.find_root(args.root)
+                fbr_cleanup.maintain_batch(
+                    root, args.batch, lib.settings(root), execute=True, tasks=args.tasks)
+            except (lib.FbrError, OSError, ValueError):
+                pass
         if args.command == "schema-field":
             print(json.dumps(result, ensure_ascii=False, indent=2) if args.json
                   else f"{result.get('field_key')}\t{result.get('label')}\t"

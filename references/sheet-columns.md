@@ -69,7 +69,7 @@
 | 闸门状态 | 进了这页的都是「通过」 |
 | 抽检状态 | 未抽检 / 通过 / 退回。抽检之后正文改过的，之前的结论不算，回到「未抽检」 |
 | 数据状态 | 见下 |
-| 上传状态 | 未提交 / 预检通过，待提交 / 预检失败及原因 / 附件已上传 / 提交待核对 / 已提交及平台状态 / 已清理 / 回执已失效 |
+| 上传状态 | 未提交 / 本地已封存、现场已压缩 / 预检通过，待提交 / 预检失败及原因 / 附件已上传 / 提交待核对 / 已提交及平台状态 / 已清理 / 回执已失效 |
 
 ## 数据状态
 
@@ -107,11 +107,11 @@ fbr_sheet.py --batch b1110-01 --stop
 
 `review/upload.json` 必须是已回读确认、绑定当前交付摘要和全部字段的回执，才会回填远端媒体、实际账号和时间；旧占位字符串、正文变化、附件变化都不能冒充已提交。重新演练已有提交会刷新平台质检状态；没有回读到最终质检结论时，保持平台实际状态。不会自动返修、删除或覆盖远端记录。
 
-显式开启自动清理时，实时 `QC_PASSED` 后写任务 `cleanup.json` 和批次 `cleanup-manifest.json`，并保留 `results/<批次>/<任务>/retention.json`、`platform/upload.json`、`platform/snapshot.json` 及原始轨迹、录屏、证据、Feedback。结果表把该行标成“已提交 / QC_PASSED / 已清理”，不会删除整题记录。
+本地交付封存时先写 `cleanup.json` 的 `local_compacted` 状态和 `retention.json`，只删除可重建代码现场；平台实时 `QC_PASSED` 后再升级为 `cleaned` 并写批次 `cleanup-manifest.json`。`results/<批次>/<任务>/retention.json`、`platform/upload.json`、`platform/snapshot.json` 及原始轨迹、录屏、证据、Feedback 始终保留。结果表分别显示“本地已封存”或“已提交 / QC_PASSED / 已清理”，不会删除整题记录。
 
 ## 本地交付清单
 
-`fbr_batch.py export --batch <批次>` 生成 `results/<批次>/delivery-manifest.json`。清单只收反馈阶段有效、闸门文件与当前正文和分数一致、当前证据仍能通过单题规则的任务；排除原因逐题列出。每个文件记录相对 root 路径、字节数和 SHA256。`preview`、`upload`、`fbr_sheet` 都会刷新投影，防止引用过期副本；源反馈失效后旧任务只从当前清单和结果页移除。当前交付目录不会被整目录替换，旧版本保存在 `_verification/delivery-history/`。
+`fbr_batch.py export --batch <批次>` 生成 `results/<批次>/delivery-manifest.json`。清单只收反馈阶段有效、闸门文件与当前正文和分数一致、当前证据仍能通过单题规则的任务；排除原因逐题列出。每个文件记录相对 root 路径、字节数和 SHA256。`preview`、`upload`、`fbr_sheet` 都会刷新投影，防止引用过期副本；源反馈失效后旧任务只从当前清单和结果页移除。当前交付目录不会被整目录替换，旧版本保存在 `_verification/delivery-history/`，默认按 `cleanup.history_keep` 保留最近一份。
 
 白名单只有主/子会话 JSONL 和 ids、录屏与录屏元数据、facts/audit/probes、feedback/gate/对应当前正文的 spotcheck，以及生成的基础任务摘要。代码、.git、run、配置备份、钩子和作者参考解信息不进入交付层。符号链接与跨任务轨迹路径拒绝导出。平台上传仅取清单中的主会话 JSONL 与视频，并再次核对实际上传字节的 SHA256。
 

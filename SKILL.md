@@ -19,7 +19,7 @@ description: solo11（26.11 领域专项，单轮 pointwise）的运行侧：把
 
 ## 流程
 
-默认使用 [滚动调度与恢复](references/runtime-flow.md) 和 [缓存与并发](references/performance.md)：跑完一题就进入录屏、取证和独立评价，不等待整批跑题结束。下列命令均须加 `python3 <skill>/scripts/` 前缀。
+默认使用 [滚动调度与恢复](references/runtime-flow.md)、[缓存与并发](references/performance.md) 和 [分阶段保留与回收](references/retention.md)：跑完一题就进入录屏、取证和独立评价，不等待整批跑题结束。下列命令均须加 `python3 <skill>/scripts/` 前缀。
 
 当用户说“运行所有提示词”“跑完这批任务”或同义指令时，默认模式是完成平台提交前的全部操作，不把“运行”理解成只做 R1。直接使用 `fbr_flow.py pre-submit --batch … --detach`，继续处理运行、收集、快照、录屏、取证、Feedback、闸门、导出、本地表和字段核查；该命令默认发布验收通过的 GitHub 产物快照，但不提交 SOLO2 平台。平台提交仍需用户另行明确授权。
 
@@ -61,7 +61,7 @@ fbr_flow.py run --batch b1110-01 \
 
 同一平台账号的上次写请求时间持久化在 `~/.codex/solo11/runtime/platform-write-pacing-<账号摘要>.json`。脚本退出、resume、换批次或手工补交后仍继续按上次时间计算。建单明确遇到 429 时优先使用 `Retry-After`，否则按 15、30、45 秒退避；每次重投前按 SessionID 回查，发现已建单就直接回读，不重复 POST。其他 5xx、超时和结果未知仍保留 `uncertain`，不自动重试。
 
-需要平台质检通过后立即回收过程目录时，显式增加清理授权：
+默认启用 `cleanup.policy=minimal`：录屏成功后回收候选，取证成功后回收本题 scratch，每次交付成功后历史快照只保留 `history_keep` 份，本地交付封存后删除可重建代码现场，批次终止后再回收依赖缓存。平台滚动提交确认后也会继续轮询 `QC_PASSED` 并完成最终清理。完整约束见 [retention.md](references/retention.md)。
 
 ```bash
 fbr_flow.py run --batch b1110-01 \
@@ -70,9 +70,11 @@ fbr_flow.py run --batch b1110-01 \
   --submit-mode drain --submit-interval 10 --execute --confirm FLOW --detach
 ```
 
-自动清理不是默认行为。启用后，每条只有同时满足以下条件才会删除：平台实时详情为 `QC_PASSED`、本地回执为 `confirmed`、当前正文/附件/轨迹摘要与回执一致、结果投影全部通过 SHA256 校验、任务没有活动进程。`QC_RUNNING` 会继续轮询；`PENDING_FIX`、`uncertain`、摘要漂移或活动任务只报阻塞，不删除。轮询间隔由 `--cleanup-poll-seconds` 控制，默认 60 秒。
+单题最终清理只有同时满足以下条件才会写入 `cleaned`：平台实时详情为 `QC_PASSED`、本地回执为 `confirmed`、当前正文/附件/轨迹摘要与回执一致、结果投影全部通过 SHA256 校验、任务没有活动进程。`QC_RUNNING` 会继续轮询；`PENDING_FIX`、`uncertain`、摘要漂移或活动任务只报阻塞。轮询间隔由 `--cleanup-poll-seconds` 控制，默认 60 秒。
 
-清理前把平台回执、产物快照、题面与复现字段、录屏方案、尝试摘要、diff 和文件摘要归档到 `results/<批次>/<任务>/retention.json` 及 `platform/`。随后只删除 `origin/`、`workspace/`、大体积 `run/` 现场、失败录屏候选和映射到该题的 runtime scratch；原始轨迹、录屏、证据、Feedback、平台回执和小型任务骨架保留。
+清理前把产物快照、题面与复现字段、录屏方案、尝试摘要、diff 和文件摘要归档到 `results/<批次>/<任务>/retention.json`；平台清理时再补 `platform/` 回执。随后删除 `origin/`、`workspace/`、`run-tree/`、大体积 `run/` 现场、失败录屏候选和映射到该题的 runtime scratch；原始轨迹、录屏、证据、Feedback、平台回执和小型任务骨架保留。
+
+本地封存要求全部阶段通过、长期结果包摘要有效、无活动进程，并要求 GitHub 快照已推送和回读。`--no-publish` 自动禁止删除代码现场。需要重新做代码 probe 时运行 `fbr_cleanup.py hydrate`，从远端 `artifact_snapshot` 恢复 workspace；结束时流程会再次压缩。
 
 ```
 fbr_run.py preflight                 R0  镜像、版本、context 上限、key、本机依赖
@@ -98,18 +100,21 @@ fbr_submit.py preflight --batch … --task …  单题只读预检，不上传
 fbr_batch.py upload --batch …            平台演练；真提交要 --execute --confirm SUBMIT
 fbr_sheet.py --batch …                   回执有效时回填远端媒体、实际提交人/时间
 fbr_cleanup.py audit --batch …           只读盘点 QC_PASSED 清理候选
+fbr_cleanup.py maintain --batch …        预览分阶段回收、历史裁剪和批次缓存回收
+fbr_cleanup.py hydrate --batch … --task …  从已推送产物快照恢复 workspace
 fbr_cleanup.py restore --batch …         从完整 history 恢复被后续规则缩掉的冻结投影
 fbr_cleanup.py prune --batch …           预览清理，不删除
 fbr_cleanup.py verify --batch …          校验已清理任务的长期结果包
 ```
 
-`fbr_cleanup.py prune` 默认只预览；真实删除必须：
+`fbr_cleanup.py maintain` 默认只预览；真实维护和平台清理分别必须：
 
 ```bash
+fbr_cleanup.py maintain --batch b1113-01 --execute --confirm MAINTAIN
 fbr_cleanup.py prune --batch b1113-01 --execute --confirm CLEANUP
 ```
 
-删除前先把目标原子移动到 `_verification/cleanup-trash/`，写 `cleanup.json` 和批次 `cleanup-manifest.json` 后才清空 trash。清理后仍保留 `task.json`、`state.json`、`recording-plan.json`、`run/attempts.json`、`run/key-identity.json`、`trace/`、`record/recording.mp4`、`record/recording.json`、`evidence/` 和 `review/`。依赖缓存和批次交付历史不与单题一起删除。
+删除前先把目标原子移动到 `_verification/cleanup-trash/`，写维护记录、`cleanup.json` 和批次 `cleanup-manifest.json` 后才清空 trash。清理后仍保留 `task.json`、`state.json`、`recording-plan.json`、`run/attempts.json`、`run/key-identity.json`、`trace/`、`record/recording.mp4`、`record/recording.json`、`evidence/` 和 `review/`。依赖缓存和旧交付历史由批次维护回收，不与单题 `prune` 混在一起。
 
 已清理任务的当前结果包会冻结保存，后续刷新结果表不再用新规则重新淘汰；若历史批次曾被后来的规则刷新缩减，可先运行 `fbr_cleanup.py restore --batch …`，从已校验的 delivery history 恢复原任务投影，再审计和清理。
 
@@ -311,6 +316,7 @@ fbr_sheet.py --batch b1110-01                       # 确认回执后回填媒�
 <root>/_registry/delivered-feedback.jsonl           已交付的 Feedback（查重用，每行 {task_id, feedback}）
 <root>/_verification/status/<batch>-run.json         运行状态完整明细
 <root>/_verification/metrics/<batch>.json             三类模型/修复/证据访问成本
+<root>/_verification/retention/                      维护记录与阻断原因
 ```
 
 `batches` 下的 `run/trace/record/evidence/review` 继续作为运行源记录，与 workspace 为兄弟目录，并未整棵搬到 results。交付层不复制 origin、workspace、.git、run、Git 配置备份、钩子、密钥豁免或额外文件；它不另建阶段状态。失效任务从当前投影移除，旧投影保留在 `_verification/delivery-history/` 供核查。原始轨迹不重命名、不改写。预览只显示当前可导出的任务，改动展示使用事实中的清单，代码留在任务仓库。
