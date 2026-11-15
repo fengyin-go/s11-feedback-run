@@ -233,7 +233,10 @@ def run_command(task_dir: Path, record: dict, cfg: dict) -> list[str]:
 
 def execution_command(name: str, session_id: str = "") -> list[str]:
     if not session_id:
-        return ["docker", "exec", "-i", name, "/usr/local/bin/entrypoint.sh", "print"]
+        shell = """rm -rf /home/node/.claude/projects /home/node/.claude/todos /home/node/.claude/history.jsonl
+exec /usr/local/bin/entrypoint.sh print
+"""
+        return ["docker", "exec", "-i", name, "bash", "-c", shell, "fbr-first-run"]
     # 仅同一道题恢复。首轮仍执行镜像入口的空会话检查；续写沿用同一组隔离参数。
     uuid.UUID(session_id)
     shell = """export ANTHROPIC_AUTH_TOKEN="${apikey:-${APIKEY:-${ANTHROPIC_AUTH_TOKEN:-}}}"

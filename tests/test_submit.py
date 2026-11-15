@@ -8,11 +8,12 @@ from pathlib import Path
 from unittest import mock
 
 from fixtures import BATCH
-from flow import TEXT_B, feedback
+from flow import TEXT_A, TEXT_B, feedback
 from test_sheet_batch import SheetCase
 import fbrlib as lib
 import fbr_delivery as delivery
 import fbr_feedback
+import fbr_platform
 import fbr_sheet
 import fbr_submit as submit
 
@@ -410,6 +411,16 @@ class FakeClient:
             raise lib.FbrError("POST timeout, result unknown")
         row = {"id": len(self.records) + 1, "status": "pending", "created_at": "2026-11-11T07:08:09.123456Z",
                "data": copy.deepcopy(data)}
+        if self.create_mode in ("rate_limit_then_ok", "rate_limit_existing"):
+            if self.create_mode == "rate_limit_existing":
+                self.records.append(row)
+            self.create_mode = "ok" if self.create_mode == "rate_limit_then_ok" else self.create_mode
+            if self.create_mode == "rate_limit_existing":
+                self.create_mode = "created"
+            raise fbr_platform.PlatformHTTPError(429, "7")
+        if self.create_mode == "http_500":
+            self.create_mode = "ok"
+            raise fbr_platform.PlatformHTTPError(500)
         self.records.append(row)
         if self.create_mode == "timeout_after_create":
             self.create_mode = "ok"
@@ -425,8 +436,8 @@ class FakeClient:
 
 
 class SubmitCase(SheetCase):
-    def ready(self):
-        task_dir = self.gated()
+    def ready(self, number=1, text=TEXT_A):
+        task_dir = self.gated(number, text)
         self.complete(task_dir)
         ids = lib.load_json(task_dir / "trace/ids.json")
         ids.update(user_turns=1, cli_version="2.1.319")
@@ -438,6 +449,7 @@ class SubmitCase(SheetCase):
         return task_dir
 
     def run_submit(self, client, **kwargs):
+        kwargs.setdefault("interval", 0)
         return submit.run_batch(self.root, BATCH, client=client, **kwargs)
 
     def execute(self, client):
@@ -528,6 +540,115 @@ class Submission(SubmitCase):
         self.execute(client)
         self.assertEqual([kind for kind, _ in client.uploads], ["attachment", "video", "video"])
         self.assertEqual(len(client.creates), 1)
+
+    def test_batch_write_pacing_is_account_level_and_persistent(self):
+        tasks = [self.ready(1, TEXT_A), self.ready(2, TEXT_B)]
+        ids_path = tasks[1] / "trace/ids.json"
+        ids = lib.load_json(ids_path)
+        ids["session_id"] = "s11-test-session-2"
+        lib.save_json(ids_path, ids)
+        self.refresh_source_fixture(tasks[1])
+        self.review_receipt(tasks[1])
+        client = FakeClient()
+        ticks = {"now": 1000.0, "sleeps": []}
+
+        def now():
+            return ticks["now"]
+
+        def sleep(seconds):
+            ticks["sleeps"].append(round(float(seconds), 3))
+            ticks["now"] += float(seconds)
+
+        with mock.patch.object(submit.time, "time", side_effect=now), \
+             mock.patch.object(submit.time, "sleep", side_effect=sleep):
+            out = submit.run_batch(
+                self.root, BATCH, client=client, execute=True, confirm="SUBMIT", interval=10)
+            submit.wait_for_write_slot(self.root, "s11-000003", "create", 10)
+        self.assertTrue(all(row["state"] == "confirmed" for row in out["tasks"]))
+        self.assertEqual(len(client.creates), 2)
+        pacing_sleeps = [value for value in ticks["sleeps"] if value >= 9.99]
+        self.assertEqual(pacing_sleeps, [10.0, 10.0])
+        for task in tasks:
+            receipt = self.receipt(task)
+            self.assertEqual(receipt["pacing"]["interval_seconds"], 10.0)
+            self.assertEqual(receipt["pacing"]["attempts"], 1)
+
+    def test_explicit_429_retries_only_after_session_recheck(self):
+        task = self.ready()
+        client = FakeClient()
+        client.create_mode = "rate_limit_then_ok"
+        with mock.patch.object(submit.time, "sleep") as sleep:
+            out = self.execute(client)
+        self.assertEqual(out["tasks"][0]["state"], "confirmed")
+        self.assertEqual(len(client.creates), 2)
+        sleep.assert_called_once_with(7.0)
+        pacing = self.receipt(task)["pacing"]
+        self.assertEqual(pacing["attempts"], 2)
+        self.assertEqual(pacing["rate_limit_waits"][0]["seconds"], 7.0)
+
+    def test_429_rechecks_existing_session_without_duplicate_create(self):
+        task = self.ready()
+        client = FakeClient()
+        client.create_mode = "rate_limit_existing"
+        with mock.patch.object(submit.time, "sleep") as sleep:
+            out = self.execute(client)
+        self.assertEqual(out["tasks"][0]["state"], "confirmed")
+        self.assertEqual(len(client.creates), 1)
+        sleep.assert_not_called()
+        pacing = self.receipt(task)["pacing"]
+        self.assertTrue(pacing["recovered_after_rate_limit"])
+
+    def test_non_429_write_error_is_never_retried(self):
+        task = self.ready()
+        client = FakeClient()
+        client.create_mode = "http_500"
+        with self.assertRaisesRegex(fbr_platform.PlatformError, "HTTP 500"):
+            self.execute(client)
+        self.assertEqual(len(client.creates), 1)
+        self.assertEqual(self.receipt(task)["state"], "uncertain")
+
+    def test_repair_429_rechecks_applied_fields_before_retry(self):
+        desired = {"title": "修正"}
+
+        class RepairClient:
+            updates = 0
+            details = 0
+
+            def __init__(self):
+                self.updates = 0
+                self.details = 0
+
+            def update(self, *args, **kwargs):
+                self.updates += 1
+                raise fbr_platform.PlatformHTTPError(429, "9")
+
+            def detail(self, *args, **kwargs):
+                self.details += 1
+                return {"id": 7, "status": "QC_WAITING", "data": copy.deepcopy(desired)}
+
+        client = RepairClient()
+        pacing = {"interval_seconds": 0, "attempts": 0, "waits": [], "rate_limit_waits": []}
+        with mock.patch.object(submit.time, "sleep") as sleep:
+            updated = submit.update_with_pacing(
+                self.root, client, 7, desired, "fp", "修正", "s11-000001", pacing)
+        self.assertEqual(updated["id"], 7)
+        self.assertEqual((client.updates, client.details), (1, 1))
+        self.assertTrue(pacing["recovered_after_rate_limit"])
+        sleep.assert_not_called()
+
+    def test_submit_interval_cli_aliases_and_default(self):
+        self.assertEqual(submit.resolve_submit_interval(self.root, None), 10.0)
+        self.cfg["submit"] = {"interval_seconds": 4}
+        lib.save_json(self.root / "_config/settings.json", self.cfg)
+        self.assertEqual(submit.resolve_submit_interval(self.root, None), 4.0)
+        parser = submit.build_parser()
+        for flag in ("--submit-interval", "--interval", "--delay"):
+            args = parser.parse_args(["submit", "--batch", BATCH, flag, "7"])
+            self.assertEqual(args.submit_interval, 7.0)
+        args = parser.parse_args(["submit", "--batch", BATCH])
+        self.assertIsNone(args.submit_interval)
+        args = parser.parse_args(["repair", "--batch", BATCH, "--delay", "3"])
+        self.assertEqual(args.submit_interval, 3.0)
 
     def test_schema_change_blocks_create_after_upload(self):
         task_dir, client = self.ready(), FakeClient()
@@ -714,7 +835,7 @@ class RepairReceipt(SubmitCase):
             {"name": trace["name"], "size": trace["size"], "url": "https://media.example/trace.jsonl"}
         ]
         result = submit.repair_one(self.root, plan, client, client.schema(), execute=True,
-                                   comment="verify receipt refresh")
+                                   comment="verify receipt refresh", interval=0)
         self.assertEqual(result["state"], "confirmed")
         receipt = self.receipt(task)
         self.assertNotEqual(receipt["remote_data"]["trace_file"],

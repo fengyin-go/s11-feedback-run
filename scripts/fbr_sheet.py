@@ -327,7 +327,8 @@ def progress_fingerprint(root: Path, batch_id: str, cfg: dict) -> str:
     tasks = []
     watched = ("state.json", "run/current.json", "run/attempts.json", "trace/ids.json",
                "review/snapshot.json", "review/feedback.json", "review/gate.json",
-               "review/submit-preflight.json", "review/upload.json", "cleanup.json",
+               "review/attestation.json", "review/submit-preflight.json",
+               "review/upload.json", "cleanup.json",
                "record/recording.json")
     active_states = {"starting", "running", "continue_ready", "exited"}
     for task in lib.task_dirs(root, batch_id):
@@ -350,11 +351,13 @@ def progress_fingerprint(root: Path, batch_id: str, cfg: dict) -> str:
             "pause": (batch / kind / "pause").exists(),
         }
     manifest = lib.load_json(delivery.delivery_dir(root, batch_id) / "delivery-manifest.json", default={})
+    closeout = _source_values(delivery.delivery_dir(root, batch_id) / "batch-closeout.json")
     visible_manifest = [{key: task.get(key) for key in ("task_id", "feedback_sha", "source_digest")}
                         for task in manifest.get("tasks", [])]
     prewarm = _source_values(batch / "dependency-prewarm.json")
     return lib.content_hash({"tasks": tasks, "controllers": controllers,
-                             "manifest": visible_manifest, "prewarm": prewarm})
+                             "manifest": visible_manifest, "prewarm": prewarm,
+                             "batch_closeout": closeout})
 
 
 def _sheet_home(root: Path, batch_id: str) -> Path:
@@ -546,12 +549,11 @@ def _write_sheet_unlocked(root: Path, batch_id: str, cfg: dict, *, force: bool =
     result = {"path": target, "tasks": len(progress), "rows": len(rows), "ready": ready,
               "pending": [(row["任务编号"], row["数据状态"]) for row in rows if row["数据状态"] != "可提交"]}
     stored_result = {**result, "path": str(target)}
-    with lib.file_lock(lock):
-        book.active = book.sheetnames.index("进度")
-        _atomic_workbook(root, batch_id, book, target)
-        fingerprint = progress_fingerprint(root, batch_id, cfg)
-        _save_sheet_state(root, batch_id, last_fingerprint=fingerprint,
-                          last_write_epoch=time.time(), last_result=stored_result)
+    book.active = book.sheetnames.index("进度")
+    _atomic_workbook(root, batch_id, book, target)
+    fingerprint = progress_fingerprint(root, batch_id, cfg)
+    _save_sheet_state(root, batch_id, last_fingerprint=fingerprint,
+                      last_write_epoch=time.time(), last_result=stored_result)
     return result
 
 

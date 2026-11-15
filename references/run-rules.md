@@ -41,10 +41,16 @@
 docker run -i -d --init --restart=no --cap-drop ALL --security-opt no-new-privileges \
   --name <任务编号> --label solo11.owner=<任务绝对路径摘要> --mount type=bind,src=<workspace>,dst=/workspace \
   --env-file <key 文件> --entrypoint sleep <镜像> infinity
-docker exec -i <任务编号> /usr/local/bin/entrypoint.sh print < run/prompt.txt
+docker exec -i <任务编号> bash -c \
+  'rm -rf /home/node/.claude/projects /home/node/.claude/todos /home/node/.claude/history.jsonl; exec /usr/local/bin/entrypoint.sh print' \
+  < run/prompt.txt
 ```
 
-- 新容器用 sleep 保活；首轮通过 `docker exec` 执行镜像原入口脚本，仍执行空会话检查和全部运行参数（禁用斜杠命令、禁用记忆、空 MCP、固定六个工具、流式 JSON 输出）。只有明确检测到模型自行中断且有有效 SessionID，脚本才在同一容器用相同参数加 `--resume <首轮SessionID>`，stdin 严格为“继续”。正常结束、任务做错或一行没改都不触发续写。
+- 新容器用 sleep 保活；首轮执行镜像原入口前先删除预置的跨会话 `projects`、`todos` 和
+  `history.jsonl`，避免模型读取其他任务留下的答案笔记；随后执行空会话检查和全部运行参数
+  （禁用斜杠命令、禁用记忆、空 MCP、固定六个工具、流式 JSON 输出）。只有明确检测到模型
+  自行中断且有有效 SessionID，脚本才在同一容器用相同参数加 `--resume <首轮SessionID>`，
+  stdin 严格为“继续”。正常结束、任务做错或一行没改都不触发续写。
 - 只挂这道题的 workspace。不挂用户目录、不挂 Claude 或 Codex 的配置、不挂别的题。
 - 不加 `--rm`：容器退出后轨迹还在容器里，要等导出。
 - 同一个容器只跑同一道题；中断续写是这道题的例外操作，不是新题。工程异常重跑仍须先导出旧容器，再停止、删除并新建容器。

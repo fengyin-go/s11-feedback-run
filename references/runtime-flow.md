@@ -18,11 +18,11 @@ fbr_flow.py resume --batch b1110-01 --execute --confirm FLOW --detach
 
 用户说“运行所有提示词/所有任务”时默认执行 `pre-submit`：它直接真跑并完成平台提交前全部阶段，默认发布验收通过的 GitHub 快照；不接受 `--auto-submit`。底层 `run` 和分阶段命令仍保留演练模式供排错。
 
-真跑默认完成：跑题/收集/本地快照 → 录屏 → 取证 → 轨迹分析 → 当前任务 AI 验收、评分和文字复核 → 轨迹模型核查过程断言 → 闸门/本地表格。跑题、录屏、取证、评价和补证队列分别工作，一题完成即可进入下一队列，完成的结果立即进入状态。跑题并发默认 5、录屏 2、取证 2、评价 `review_parallel` 默认 5 且硬上限 5（含跨进程轨迹调用槽）；needs_task_agent 由当前任务 AI 持续处理；后三者不占跑题 key 的生成额度。表格和交付写入串行化。
+真跑默认完成：跑题/收集/本地快照 → 录屏 → 取证 → 轨迹分析 → 当前任务 AI 验收、评分和文字复核 → 轨迹模型核查过程断言 → 闸门/本地表格。跑题、录屏、取证、评价和补证队列分别工作，一题完成即可进入下一队列，完成的结果立即进入状态。跑题并发默认 5、录屏 2、取证 2、评价 `review_parallel` 默认 5 且硬上限 5（含跨进程轨迹调用槽）；后三者不占跑题 key 的生成额度。滚动评价默认开启，当前 AI 在 flow 运行时持续执行 `fbr_work.py next --wait`，逐题领取最老的待办；不能等整批任务结束后再集中评价。表格和交付写入串行化。
 
 结果表 watcher 随真跑批次启动，每 2 秒检查进度指纹，可见状态变化后最多每 5 秒写一次。`results/<批次>/` 不再整体移动，普通刷新只原子替换 `result.xlsx`；证据目录只在交付集合变化时进入或退出。无变化轮询不写工作簿，历史只记录交付语义变化。
 
-GitHub 推送在独立验收和 Feedback 闸门通过、首次落表之后执行；推送后回读并再次落表核查全部必填字段。完整流水线默认主动发布，明确本地模式加 `--no-publish`；平台提交另加 `--auto-submit --confirm-submit SUBMIT`，不是默认模式。滚动提交由独立的单线程队列串行消费 `ready_submit`，不占运行、录屏、取证或评价并发。每条提交前先写 `review/submit-preflight.json`，绑定正文、来源、产物快照和实时 schema；预检不上传、不建单，失败只阻断当前题，其他题继续。人工整批上传仍要求所选任务全部预检通过后才开始上传。平台单存在的任务冻结自动生产，返修需另行处理。产物尚未推送时本地仍可评价，但表格不会假报可提交。spotcheck 必须由真实审核人登记。
+GitHub 推送在独立验收和 Feedback 闸门通过、首次落表之后执行；推送后回读并再次落表核查全部必填字段。完整流水线默认主动发布，明确本地模式加 `--no-publish`；平台提交另加 `--auto-submit --confirm-submit SUBMIT`，不是默认模式。当前有效版本写 `review/attestation.json`，冻结评审输入、交付输入、Feedback、来源摘要、内容摘要和产物快照。滚动提交由独立的单线程队列串行消费 `ready_submit`，不占运行、录屏、取证或评价并发。每条提交前只验证凭证和实时平台条件，写 `review/submit-preflight.json`，不重新调用 AI 或重跑内容评审；失败只阻断当前题。人工整批提交先运行 `fbr_batch.py closeout`，检查所有凭证、字段、SessionID、领域和查重后再上传。平台单存在的任务冻结自动生产，返修需另行处理。产物尚未推送时本地仍可评价，但表格不会假报可提交。spotcheck 必须由真实审核人登记。
 
 显式开启 `--auto-cleanup --confirm-cleanup CLEANUP` 时，提交成功后进入独立 QC/清理轮询。只有实时详情为 `QC_PASSED`、本地回执 `confirmed`、结果包 SHA256 全部有效且任务无活动进程时，才写 `retention.json`、平台回执副本与 `cleanup.json`，然后删除 `origin/workspace/run` 大目录和该题 scratch。`QC_RUNNING` 继续等，`PENDING_FIX`、`uncertain`、摘要漂移和活动任务只报阻塞，不自动删除。该模式仍须显式授权，`pre-submit` 一律拒绝。
 
@@ -70,7 +70,7 @@ GitHub 推送在独立验收和 Feedback 闸门通过、首次落表之后执行
 
 只有待当前任务 AI 验收/返修时，flow 保持在线并写 waiting.json；不会因 needs_task_agent 就结束。当前 AI 完成有效 finalize 后恢复交付阶段。机器守护不能代替 AI 写事实评价，既有派发预算和 pause/drain 仍有效，持续进展的已派发执行按上述规则继续。
 
-当前 AI 不需要反复轮询状态。用 `fbr_flow.py wait --events needs_task_agent,blocked,completed --timeout 300` 在一次工具调用里等待事件；返回只包含任务 ID、checkpoint、brief 和平台汇总。随后用 `fbr_work.py next` 一次领取一题，完成后 `closeout`，再进入下一题。
+当前 AI 不需要反复轮询状态。用 `fbr_work.py next --batch … --wait --timeout 300` 在服务端等待并领取最老的一题；返回只包含任务 ID、checkpoint、brief、队列积压数和平台汇总。完成 finalize 后运行 `closeout`，再立即进入下一题。只有在排错时才显式使用 `fbr_flow.py wait` 查看单一事件。
 
 状态位于 `batches/<批次>/flow/`，包括 plan、process、state、waiting、stop、revives 和日志。run/current、run/budget、run/heartbeat 负责逐题现场。不要手改这些文件伪造进度、预算或授权。
 

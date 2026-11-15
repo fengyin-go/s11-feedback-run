@@ -34,7 +34,7 @@ class RollingSubmit(SubmitCase):
     def test_submit_ready_runs_preflight_then_submits_once(self):
         task_dir, client = self.ready(), FakeClient()
         result = submit.submit_ready(
-            self.root, BATCH, task_dir.name, execute=True, confirm="SUBMIT", client=client)
+            self.root, BATCH, task_dir.name, execute=True, confirm="SUBMIT", client=client, interval=0)
         self.assertEqual(result["state"], "confirmed")
         self.assertEqual((len(client.uploads), len(client.creates)), (2, 1))
         self.assertEqual(lib.load_json(task_dir / "review/upload.json")["state"], "confirmed")
@@ -60,7 +60,7 @@ class RollingSubmit(SubmitCase):
         self.assertFalse(second["ready"])
         self.assertTrue(second["errors"])
         attempted = submit.submit_ready(
-            self.root, BATCH, task_dir.name, execute=True, confirm="SUBMIT", client=client)
+            self.root, BATCH, task_dir.name, execute=True, confirm="SUBMIT", client=client, interval=0)
         self.assertFalse(attempted["ready"])
         self.assertEqual((client.uploads, client.creates), ([], []))
 
@@ -131,6 +131,19 @@ class RollingFlow(SubmitCase):
             result = fbr_flow.run_flow(self.root, self.options(auto_submit=False))
         self.assertEqual(result["state"], "completed")
         submit_task.assert_not_called()
+
+    def test_flow_passes_submit_interval_to_single_task_submit(self):
+        task = self.make_task()
+        options = self.options(auto_submit=True)
+        options.submit_interval = 7.5
+        options.delivery_lock = mock.MagicMock()
+        with mock.patch.object(submit, "submit_ready", return_value={
+                "state": "confirmed",
+                "task_result": {"submission_id": 1, "status": "pending"},
+        }) as submit_ready, mock.patch("fbr_sheet.write_sheet", return_value={}):
+            result = fbr_flow.submit_task(task, self.root, self.cfg, options)
+        self.assertEqual(result["state"], "ok")
+        self.assertEqual(submit_ready.call_args.kwargs["interval"], 7.5)
 
     def test_auto_cleanup_runs_only_after_successful_submit(self):
         task = self.make_task()

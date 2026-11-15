@@ -560,6 +560,7 @@ def _gate_batch(root: Path, batch_id: str, cfg: dict, wanted: str | None = None)
             lib.set_stage(task_dir, "feedback", "ok", score=result["score"], feedback_sha=sha(result["text"]))
         elif result["ready"] or lib.load_state(task_dir)["stages"].get("feedback"):
             lib.set_stage(task_dir, "feedback", "failed", problems=result["errors"][:20])
+            (task_dir / "review/attestation.json").unlink(missing_ok=True)
         rows.append({"task_id": name, "state": "ok" if passed else ("failed" if result["ready"] else "todo"),
                      "score": result["score"], "errors": result["errors"], "warnings": result["warnings"]})
     scores = []

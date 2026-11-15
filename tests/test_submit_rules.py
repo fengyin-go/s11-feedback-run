@@ -105,6 +105,31 @@ class Rules(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(lib.FbrError):
                 submit.media_url(value)
 
+    def test_domain_mismatch_is_not_reclassified_as_feedback_repair(self):
+        detail = {
+            "status": "PENDING_FIX",
+            "qc_checks": [
+                {
+                    "check_key": "llm_desc_domain_mismatch_0",
+                    "check_name": "整体 · 题面与所属领域不符",
+                    "passed": False,
+                    "summary": "题面主体是服务路由逻辑",
+                    "evidence": {
+                        "problem_type": "DOMAIN_MISMATCH",
+                        "quote": "请把路由匹配逻辑收拢到共用内核",
+                    },
+                },
+                {
+                    "check_key": "typo_overall",
+                    "passed": True,
+                    "evidence": {},
+                },
+            ],
+        }
+        blockers = submit.non_repairable_prompt_checks(detail)
+        self.assertEqual(len(blockers), 1)
+        self.assertEqual(blockers[0]["check_key"], "llm_desc_domain_mismatch_0")
+
 
 class BindingDrift(SubmitCase):
     def test_source_change_during_upload_blocks_create(self):

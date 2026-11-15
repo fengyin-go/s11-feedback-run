@@ -281,6 +281,16 @@ class Transport(HTTPCase):
         self.assert_private_error(lambda: self.client.request("POST", "/probe", json={"a": 1}))
         self.assertEqual(len(self.calls("POST", "/api/v1/probe")), 1)
 
+    def test_429_preserves_status_and_retry_after_without_retrying(self):
+        self.api.reply("POST", "/api/v1/submissions", {"detail": "busy"}, status=429,
+                       headers=[("Retry-After", "17")])
+        error = self.assert_private_error(
+            lambda: self.client.create({"title": "示例"}, FINGERPRINT))
+        self.assertIsInstance(error, platform.PlatformHTTPError)
+        self.assertEqual(error.status, 429)
+        self.assertEqual(error.retry_after_seconds, 17.0)
+        self.assertEqual(len(self.calls("POST", "/api/v1/submissions")), 1)
+
     def test_success_status_still_requires_valid_json_object(self):
         for payload in (b"not-json", [1, 2], None):
             with self.subTest(payload=payload):

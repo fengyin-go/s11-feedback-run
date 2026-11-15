@@ -30,7 +30,7 @@ NEXT = {
     "commit": "fbr_snapshot.py commit --batch {b}",
     "record": "fbr_record.py --batch {b}",
     "facts": "fbr_facts.py --batch {b}",
-    "feedback": "fbr_feedback.py card --batch {b}，按 references/reviewer.md 调用指定验收模型后 fbr_feedback.py gate --batch {b}",
+    "feedback": "fbr_work.py next --batch {b} --wait，完成当前题验收后 fbr_work.py closeout --batch {b} --task <任务>",
 }
 LABEL = {"run": "运行", "collect": "收集", "commit": "提交", "record": "录屏", "facts": "取证",
          "feedback": "Feedback", "abandoned": "放弃"}
@@ -237,7 +237,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="solo11 批次进度、抽检预览、交付导出与平台提交")
     parser.add_argument("--root")
     sub = parser.add_subparsers(dest="command", required=True)
-    for name in ("status", "preview", "spotcheck", "upload", "repair", "export"):
+    for name in ("status", "preview", "spotcheck", "upload", "repair", "export", "closeout"):
         sub.add_parser(name).add_argument("--batch", required=True)
     sub.choices["preview"].add_argument("--tasks")
     upload = sub.choices["upload"]
@@ -245,12 +245,20 @@ def main() -> int:
     upload.add_argument("--limit", type=int)
     upload.add_argument("--execute", action="store_true")
     upload.add_argument("--confirm", default="")
+    upload.add_argument("--submit-interval", "--interval", "--delay", dest="submit_interval",
+                        type=float, default=None,
+                        help="两条平台写请求之间的最小间隔秒数，默认读取 settings")
     upload.add_argument("--json", action="store_true")
+    sub.choices["closeout"].add_argument("--tasks")
+    sub.choices["closeout"].add_argument("--json", action="store_true")
     repair = sub.choices["repair"]
     repair.add_argument("--tasks")
     repair.add_argument("--execute", action="store_true")
     repair.add_argument("--confirm", default="")
     repair.add_argument("--comment", default="")
+    repair.add_argument("--submit-interval", "--interval", "--delay", dest="submit_interval",
+                        type=float, default=None,
+                        help="两条返修写请求之间的最小间隔秒数，默认读取 settings")
     repair.add_argument("--json", action="store_true")
     check = sub.choices["spotcheck"]
     check.add_argument("--task", required=True)
@@ -273,15 +281,31 @@ def main() -> int:
             print(f"导出 {len(manifest['tasks'])} 题，排除 {len(manifest['excluded'])} 题；没有复制 workspace 或 .git")
             for row in manifest["excluded"]:
                 print(f"{row['task_id']}  未导出：{row['reason']}")
+        elif args.command == "closeout":
+            import fbr_attestation
+            result = fbr_attestation.batch_closeout(
+                root, args.batch, lib.settings(root), args.tasks, write=True)
+            if args.json:
+                print(json.dumps(result, ensure_ascii=False, indent=2))
+            else:
+                counts = result["counts"]
+                print(f"{result['state']}：选中 {counts['selected']} 题，"
+                      f"ready {counts['ready']}，blocked {counts['blocked']}；"
+                      f"{delivery.delivery_dir(root, args.batch) / 'batch-closeout.json'}")
+                for row in result["errors"][:10]:
+                    print(f"- {row.get('task_id')}：{row.get('error')}")
+            return 0 if result["state"] == "ready" else 1
         elif args.command == "repair":
             import fbr_submit
             result = fbr_submit.repair_batch(root, args.batch, tasks=args.tasks,
-                                             execute=args.execute, confirm=args.confirm, comment=args.comment)
+                                             execute=args.execute, confirm=args.confirm, comment=args.comment,
+                                             interval=args.submit_interval)
             print(fbr_submit.compact_result(result, full=args.json))
         else:
             import fbr_submit
             result = fbr_submit.run_batch(root, args.batch, tasks=args.tasks, limit=args.limit,
-                                          execute=args.execute, confirm=args.confirm)
+                                          execute=args.execute, confirm=args.confirm,
+                                          interval=args.submit_interval)
             print(fbr_submit.compact_result(result, full=args.json))
         return 0
     except lib.FbrError as exc:

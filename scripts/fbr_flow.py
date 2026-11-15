@@ -111,15 +111,25 @@ def facts_task(task, root, cfg):
 
 
 def review_task(task, root, cfg, options):
+    import fbr_attestation
     import fbr_feedback
     import fbr_reviewer
     import fbr_recover
-    if lib.stage_ok(task, 'feedback') and not fbr_feedback.gate_task(task,cfg)['errors']:
+    attested = fbr_attestation.validate(task, root, cfg)
+    if (lib.stage_ok(task, 'feedback') and attested['state'] != 'review_changed'
+            and not fbr_feedback.gate_task(task,cfg)['errors']):
         result = {'state':'already_valid'}
     else:
+        if attested['state'] == 'review_changed':
+            lib.set_stage(task, 'feedback', 'dry', reason=attested['reason'])
         fbr_feedback.card_one(task)
         gate=lib.load_json(task/'review/gate.json',default={})
-        result=fbr_recover.recover(task,repair_gate=gate.get('passed') is False,max_cycles=1,env_file=options.reviewer_env)
+        if attested['state'] == 'review_changed':
+            result=fbr_reviewer.prepare_task_agent(task)
+        else:
+            result=fbr_recover.recover(
+                task, repair_gate=gate.get('passed') is False,
+                max_cycles=1, env_file=options.reviewer_env)
     if result['state'] in ('needs_probes','repairing','needs_task_agent'):
         return {'task_id':task.name,**result}
     checked({**result,'state':'ok' if result['state']=='already_valid' else result['state']})
@@ -166,21 +176,34 @@ def submit_task(task, root, cfg, options):
     import fbr_submit
     try:
         result = fbr_submit.submit_ready(
-            root, options.batch, task.name, execute=True, confirm='SUBMIT')
+            root, options.batch, task.name, execute=True, confirm='SUBMIT',
+            interval=getattr(options, 'submit_interval', None),
+            context=getattr(options, 'submit_context', None))
     except (lib.FbrError, OSError, ValueError) as exc:
+        context = getattr(options, 'submit_context', None)
+        if context is not None:
+            context.reset_reads()
         receipt = lib.load_json(task / 'review/upload.json', default={})
         if receipt.get('state') in ('creating', 'verifying', 'uncertain'):
             return {'task_id': task.name, 'state': 'needs_attention',
                     'detail': f'平台提交结果待核对：{exc}'}
+        retry_after = getattr(exc, 'retry_after_seconds', 30)
         return {'task_id': task.name, 'state': 'retry',
-                'detail': f'平台提交暂时失败：{exc}', 'retry_after': time.time() + 30}
+                'detail': f'平台提交暂时失败：{exc}',
+                'retry_after': time.time() + max(float(retry_after), 1.0)}
     with options.delivery_lock:
         fbr_sheet.write_sheet(root, options.batch, cfg)
     if result.get('state') == 'confirmed':
         task_result = result.get('task_result') or {}
+        pacing_detail = ''
+        pacing = task_result.get('pacing')
+        if isinstance(pacing, dict):
+            waited = sum(float(row.get('seconds', 0)) for row in pacing.get('waits', [])
+                         if isinstance(row, dict))
+            pacing_detail = f"；写入等待 {waited:.1f} 秒"
         return {'task_id': task.name, 'state': 'ok',
                 'detail': f"已提交 #{task_result.get('submission_id', '')} / "
-                          f"{task_result.get('status', '待质检')}"}
+                          f"{task_result.get('status', '待质检')}{pacing_detail}"}
     errors = result.get('errors') or ['提交预检未通过']
     return {'task_id': task.name, 'state': 'submit_blocked',
             'detail': '提交预检未通过：' + '；'.join(str(item) for item in errors)}
@@ -220,6 +243,7 @@ def cleanup_task(task, root, cfg, options):
 
 
 def finish_review(task, root, cfg, options):
+    import fbr_attestation
     import fbr_sheet
     import fbr_common
     # Finish acceptance first, then proactively publish and re-read the snapshot before field audit.
@@ -258,6 +282,16 @@ def finish_review(task, root, cfg, options):
         if not repaired:
             raise lib.FbrError('交付核查仍有缺失，来源不足不能猜值：'+(reason or (row or {}).get('数据状态','缺少有效本地行')))
     history['state']='passed';lib.save_json(target,history)
+    state = fbr_attestation.validate(task, root, cfg)
+    if state['state'] == 'review_changed':
+        raise lib.FbrError(state['reason'])
+    if state['valid']:
+        attestation = state['attestation']
+    elif state['state'] in ('missing', 'delivery_changed'):
+        attestation = fbr_attestation.materialize(
+            task, root, cfg, force=state['state'] == 'delivery_changed')
+    else:
+        raise lib.FbrError(state['reason'])
     return {'task_id':task.name,'state':'ok','detail':'验收、快照推送及本地字段核查完成' if publishing else '本地验收完成（显式不发布）'}
 
 
@@ -269,6 +303,10 @@ def run_flow(root, args):
         cfg['_managed'] = True
         cfg['_single_attempt'] = True
         args.delivery_lock = threading.Lock()
+        import fbr_submit
+        args.submit_interval = fbr_submit.resolve_submit_interval(
+            root, getattr(args, 'submit_interval', None))
+        args.submit_context = fbr_submit.SubmitContext()
         if getattr(args,'publish',None) is None: args.publish=True
         if getattr(args, 'auto_submit', False) and not args.publish:
             raise lib.FbrError('滚动平台提交要求产物快照已发布，不能同时使用 --no-publish')
@@ -279,7 +317,8 @@ def run_flow(root, args):
         deadline = resolve_deadline(root, args.batch, cfg, saved)
         cfg.update(_deadline=deadline, _drain=str(directory / 'drain'))
         args.stopped = lambda: time.time() >= deadline or any((directory / f).exists() for f in ('pause', 'drain'))
-        plan = {k: v for k, v in vars(args).items() if k not in ('delivery_lock', 'stopped')}
+        plan = {k: v for k, v in vars(args).items()
+                if k not in ('delivery_lock', 'stopped', 'submit_context')}
         plan.update(deadline=deadline, root=str(root))
         lib.save_json(directory / 'plan.json', plan)
         lib.save_json(directory / 'process.json', {'pid': os.getpid(), 'identity': runtime.process_identity()})
@@ -346,11 +385,13 @@ def run_flow(root, args):
                         author_waiting.pop(name)
                 lib.save_json(directory / 'waiting.json', {'at':lib.now_iso(), 'state':'waiting_for_task_ai' if author_waiting else 'active',
                     'tasks':[{'task_id':task.name,'reason':'待当前任务 AI 完成产物验收、Feedback 或具体返修',
+                              'queued_at':lib.load_json(task/'review/task-agent-work.json',default={}).get('at',''),
                               'checkpoint':str(task/'review/task-agent-work.json'),
                               'brief':str(task/'review/task-agent-brief.md'),
                               'gate':str(task/'review/gate.json')} for task in author_waiting.values()],
+                    'backlog':len(author_waiting),
                     'platform': platform_summary(tasks),
-                    'next':'依据检查点真实补证/修正文并 finalize；不调用 reviewer.env 生成产物评价'})
+                    'next':'持续执行 fbr_work.py next --wait，依据检查点真实补证/修正文并 finalize；不调用 reviewer.env 生成产物评价'})
                 if args.stopped() and author_waiting:
                     rows.extend({'task_id':task.name,'state':'needs_task_agent','detail':'保留任务AI验收/返修检查点'} for task in author_waiting.values())
                     author_waiting.clear()
@@ -472,10 +513,10 @@ def spawn(root, args, watchdog=False):
             'watchdog' if watchdog else 'resume', '--batch', args.batch, '--execute']
     if not watchdog:
         argv += ['--confirm', 'FLOW']
-        for key in ('tasks', 'reviewer_env', 'submit_mode'):
+        for key in ('tasks', 'reviewer_env', 'submit_mode', 'submit_interval'):
             value = getattr(args, key, None)
-            if value:
-                argv += ['--' + key.replace('_', '-'), value]
+            if value not in (None, ""):
+                argv += ['--' + key.replace('_', '-'), str(value)]
         if getattr(args,'publish',None) is False: argv += ['--no-publish']
         if getattr(args, 'auto_cleanup', False):
             argv += ['--auto-cleanup', '--confirm-cleanup', 'CLEANUP',
@@ -535,6 +576,8 @@ def main():
         p.add_argument('--auto-submit', action='store_true')
         p.add_argument('--confirm-submit', default='')
         p.add_argument('--submit-mode', choices=('drain',), default='drain')
+        p.add_argument('--submit-interval', type=float, default=None,
+                       help='平台写请求之间的最小间隔秒数；默认读取 settings，未配置为 10 秒')
         p.add_argument('--auto-cleanup', action='store_true')
         p.add_argument('--confirm-cleanup', default='')
         p.add_argument('--cleanup-poll-seconds', type=int, default=60)

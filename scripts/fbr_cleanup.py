@@ -157,6 +157,7 @@ def _write_retention(root: Path, task_dir: Path, manifest: dict, task: dict,
     platform = artifact / "platform"
     platform.mkdir(parents=True, exist_ok=True)
     _write_copy(task_dir / "review/snapshot.json", platform / "snapshot.json")
+    _write_copy(task_dir / "review/attestation.json", platform / "attestation.json")
     _write_copy(task_dir / "review/upload.json", platform / "upload.json")
     _write_copy(task_dir / "review/submit-preflight.json", platform / "submit-preflight.json")
     _write_copy(task_dir / "review/diff.patch", artifact / "review/diff.patch")

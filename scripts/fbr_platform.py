@@ -19,6 +19,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 
 import fbrlib as lib
@@ -37,6 +39,34 @@ class PlatformError(lib.FbrError):
 
 class RequestNotSent(PlatformError):
     """TLS negotiation failed before HTTP bytes could be sent."""
+
+
+class PlatformHTTPError(PlatformError):
+    """Sanitized HTTP status with an optional Retry-After hint."""
+
+    def __init__(self, status: int, retry_after: str | None = None):
+        self.status = int(status)
+        self.retry_after_seconds = parse_retry_after(retry_after)
+        super().__init__(f"平台 HTTP {self.status}；未自动重试，写请求结果需核查")
+
+
+def parse_retry_after(value: str | None) -> float | None:
+    if not value:
+        return None
+    text = str(value).strip()
+    try:
+        seconds = float(text)
+    except ValueError:
+        try:
+            moment = parsedate_to_datetime(text)
+            if moment.tzinfo is None:
+                moment = moment.replace(tzinfo=timezone.utc)
+            seconds = (moment - datetime.now(timezone.utc)).total_seconds()
+        except (TypeError, ValueError, OverflowError):
+            return None
+    if seconds < 0 or seconds > 86400:
+        return None
+    return seconds
 
 
 def tls_before_http(exc: BaseException) -> bool:
@@ -228,8 +258,9 @@ class Client:
             raise
         except urllib.error.HTTPError as exc:
             code = exc.code
+            retry_after = exc.headers.get("Retry-After") if exc.headers else None
             exc.close()
-            raise PlatformError(f"平台 HTTP {code}；未自动重试，写请求结果需核查") from None
+            raise PlatformHTTPError(code, retry_after) from None
         except (urllib.error.URLError, OSError, TimeoutError, http.client.HTTPException, ValueError) as exc:
             if tls_before_http(exc):
                 raise RequestNotSent("平台TLS握手失败，HTTP请求尚未发送；未自动重试") from None

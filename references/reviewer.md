@@ -31,6 +31,8 @@ fbr_reviewer.py finalize --batch b1110-01 --task s11-000123 --candidate /绝对�
 
 `review` 先由 `fbr_evidence.py` 对每份原始轨迹做一次全量流式摄取，建立 SHA、行偏移、事件图和 `trace-check.json`；reviewer 读取 `trace/review-pack.json`，不直接整读 `trace/projects/*.jsonl`。模型需要写入结论的原文，只能通过精确行号和 block 定向获取。报告必须覆盖每份原始轨迹，含连续原文出处；事件包、facts 和模型自述只作导航。分析不负责产物评分或写 Feedback。保存 `review/trace-analysis.json` 后，生成 `review/task-agent-work.json`，返回 `needs_task_agent`。滚动调度保留此待办，当前任务 AI 必须主动处理，不能把这个返回视为完成。
 
+当前 AI 用 `fbr_work.py next --wait` 在 flow 运行期间持续领取最老一题。finalize 通过、快照发布和字段核查完成后生成 `review/attestation.json`；该凭证是后续提交期验证的唯一定点，不允许在提交时重新调用 AI 替代执行期评价。
+
 当前任务 AI 先读 `review/task-agent-brief.md`，再按需求查询相关 diff hunk、最终代码及调用链，复用已有录屏和实跑证据。不要整份读取 `facts.json`、`diff.patch`、原始轨迹或 `task-agent-history.json`。静态证据充分时无需重复启动；缺证据时按既有 probe 入口在任务镜像中补跑，不能直接在宿主机运行被审项目。补证后刷新 card/brief；若轨迹报告仍有效，可用 `prepare --batch … --task … --execute` 仅刷新检查点，不调用外部模型。
 
 默认作者输入是 compact `review/decision-input.json`，完整结构见 `review/candidate-schema.json`。当前 AI 只写需求语义、正文、claims、score_basis 和 quality_checks；`fbr_reviewer.py build` 展开为正式 candidate/verification。唯一轨迹摘录可自动补 locator，歧义位置必须失败。手工完整 candidate 仍可兼容，verification 须包含：

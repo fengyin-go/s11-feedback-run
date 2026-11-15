@@ -31,11 +31,14 @@ fbr_flow.py status --batch b1110-01
 fbr_flow.py wait --batch b1110-01 --events needs_task_agent --timeout 300
 fbr_flow.py drain --batch b1110-01 --execute
 fbr_flow.py resume --batch b1110-01 --execute --confirm FLOW --detach
-fbr_work.py next --batch b1110-01
+fbr_work.py next --batch b1110-01 --wait --timeout 300
 fbr_work.py closeout --batch b1110-01 --task s11-000123
+fbr_batch.py closeout --batch b1110-01
 ```
 
 阶段默认只读一份 `references/stage-briefs/{run,review,submit}.md`，不要同时加载全部 references。命令默认摘要模式只返回状态、阻断项、结果路径和下一条动作；`--json` 才输出完整对象。完整表格、平台 schema、errors 和 metrics 留在本地文件，定向查询，不整份回灌。
+
+滚动评价默认开启。`pre-submit` 启动后，当前 AI 立即进入 `fbr_work.py next --wait -> 当前题评价 -> finalize -> closeout` 循环；任务运行、录屏和取证继续并行。不能等整批跑完再领取评价待办。
 
 真跑默认在验收通过后主动推送 GitHub 产物快照并回读 SHA，再核查结果表；明确只做本地时加 `--no-publish`。平台提交另加 `--auto-submit --confirm-submit SUBMIT`，仍须单独获得用户明确授权。下列逐阶段命令仍可用于排错和补跑：
 
@@ -44,17 +47,19 @@ fbr_work.py closeout --batch b1110-01 --task s11-000123
 ```bash
 fbr_flow.py run --batch b1110-01 \
   --auto-submit --confirm-submit SUBMIT --submit-mode drain \
-  --execute --confirm FLOW --detach
+  --submit-interval 10 --execute --confirm FLOW --detach
 ```
 
-平台提交由独立单线程队列串行消费，不占用运行、录屏、取证和评价并发。每条本地完成后不能直接上传，必须先执行单题提交预检：
+平台提交由独立单线程队列串行消费，不占用运行、录屏、取证和评价并发。所有建单和返修写请求共用账号级最小间隔，默认 10 秒；间隔卡在 `POST /submissions` 或 `PUT /submissions/{id}` 之前，附件上传、预检和回读不计入。每条本地验收完成后立即生成 `review/attestation.json`。提交期不再重跑需求评审，只执行确定性的单题与批检：
 
-- 对当前题重新跑 `gate_batch(..., wanted=task_id)`，覆盖单题证据、人工抽检和当前已知批内/历史查重；
-- 刷新白名单交付投影，核对 Feedback、需求覆盖、18 个必填字段、快照和媒体；
+- 校验评审凭证绑定的题面、轨迹、事实、Feedback、质量回执、抽检、快照和媒体摘要；
+- 复核白名单交付投影、18 个必填字段、SessionID 和当前批内/历史查重；
 - 登录平台读取实时 schema、账号领域和已有 SessionID，但预检阶段不上传、不建单；
 - 结果写入 `review/submit-preflight.json`，绑定 `feedback_sha`、`source_digest`、`content_digest`、产物快照和 schema fingerprint。
 
-只有预检 `ready` 的单条才进入平台上传。正文、分数、抽检、轨迹、录屏、快照、平台表单或账号任一变化，原预检都失效并重跑。预检失败只阻断这一条，不停止其他题的生产和提交。人工 `fbr_batch.py upload` 继续保留“所选任务全部预检通过后才开始上传”的整批语义。
+只有预检 `ready` 的单条才进入平台上传。评审输入变化时该题回到当前 AI 重新评价；仅交付快照等交付字段变化时只重做交付冻结，不重新判断需求。平台表单、账号或附件变化会使预检失效。预检失败只阻断这一条，不停止其他题。人工整批提交先运行 `fbr_batch.py closeout`，批量检查通过后才允许开始上传。
+
+同一平台账号的上次写请求时间持久化在 `~/.codex/solo11/runtime/platform-write-pacing-<账号摘要>.json`。脚本退出、resume、换批次或手工补交后仍继续按上次时间计算。建单明确遇到 429 时优先使用 `Retry-After`，否则按 15、30、45 秒退避；每次重投前按 SessionID 回查，发现已建单就直接回读，不重复 POST。其他 5xx、超时和结果未知仍保留 `uncertain`，不自动重试。
 
 需要平台质检通过后立即回收过程目录时，显式增加清理授权：
 
@@ -62,7 +67,7 @@ fbr_flow.py run --batch b1110-01 \
 fbr_flow.py run --batch b1110-01 \
   --auto-submit --confirm-submit SUBMIT \
   --auto-cleanup --confirm-cleanup CLEANUP \
-  --submit-mode drain --execute --confirm FLOW --detach
+  --submit-mode drain --submit-interval 10 --execute --confirm FLOW --detach
 ```
 
 自动清理不是默认行为。启用后，每条只有同时满足以下条件才会删除：平台实时详情为 `QC_PASSED`、本地回执为 `confirmed`、当前正文/附件/轨迹摘要与回执一致、结果投影全部通过 SHA256 校验、任务没有活动进程。`QC_RUNNING` 会继续轮询；`PENDING_FIX`、`uncertain`、摘要漂移或活动任务只报阻塞，不删除。轮询间隔由 `--cleanup-poll-seconds` 控制，默认 60 秒。
@@ -126,6 +131,7 @@ fbr_cleanup.py prune --batch b1113-01 --execute --confirm CLEANUP
 - 持续有模型输出、思考增量或进行中工具时不按墙钟误杀；网关/基础设施错误单独计数，不消耗模型责任机会。
 - 正常结束且有代码改动才有效；零代码改动归档后恢复基线重跑，最多三次。跑得慢本身不是重跑理由。
 - 轨迹完整导出并核对 SessionID、PromptID、首轮和续写后才停止容器。
+- 首轮启动前清空容器内预置的跨会话 `projects`、`todos` 和 `history.jsonl`，只允许当前工作区、当前题面与本轮 session；续写只恢复本题同一 SessionID。
 - key 只通过 `--env-file` 进容器；轨迹出现 key 时保留原始证据并自动记录备注，不改写原始轨迹。
 - 授权、停止、恢复、尝试上限和容器清理细节全部以 `run-rules.md`/`runtime-flow.md` 为准。
 
@@ -224,6 +230,8 @@ Feedback 的硬底线：
 
 平台返修不是重新建单。`PENDING_FIX` 先用 `review/prepare/finalize --platform-repair` 重做当前 Feedback，再运行 `fbr_batch.py repair`；复用原记录和附件，只更新允许字段并在回读确认后重新质检。
 
+`PENDING_FIX` 不等于都可返修。平台失败项为 `problem_type=DOMAIN_MISMATCH`（以及题目难度本身被判废）时，即使 `editable=true` 也只能改非锁定字段，无法替换题面、Session 和附件；不得继续重写 Feedback 或反复 PUT。`repair` 会返回 `prompt_rebuild_required`，应保留 `qc_checks` 证据并回到 `s11-gsb-prompt-create` 更换主任务重出。
+
 ## 6. 抽检与结果表
 
 环境可复现等级必须逐字属于 `fbr_submit.py probe` 读取的平台 `repro_level.options`；不得填系统架构、安装或启动经过等自由文本。来源不在选项内时阻止交付，保留冻结 task.json，核实真实环境后通过有来源的字段修订处理，不猜测或静默降级。平台暂不可达时不能声称已核实最新选项；恢复后先重新读取 schema 再提交。
@@ -240,8 +248,9 @@ fbr_sheet.py --batch b1110-01 --watch-status
 fbr_sheet.py --batch b1110-01 --stop
 fbr_submit.py probe                                # 登录并只读读取当前平台配置
 fbr_submit.py preflight --batch b1110-01 --task s11-000123  # 只读预检，不上传
+fbr_batch.py closeout --batch b1110-01              # 结算全部评审凭证和批次字段，不连接平台
 fbr_batch.py upload --batch b1110-01 --limit 1       # 平台演练，校验字段与交付文件摘要
-fbr_batch.py upload --batch b1110-01 --limit 1 --execute --confirm SUBMIT
+fbr_batch.py upload --batch b1110-01 --limit 1 --submit-interval 10 --execute --confirm SUBMIT
 fbr_sheet.py --batch b1110-01                       # 确认回执后回填媒体/提交人/时间
 ```
 
@@ -255,7 +264,7 @@ fbr_sheet.py --batch b1110-01                       # 确认回执后回填媒�
 
 提交前只读 `references/stage-briefs/submit.md`，需要细节时再读 [references/platform-api.md](references/platform-api.md)。平台固定为 `https://solo2.jzxhnh.com`，默认使用本机保存的 `zouyonghong` 凭据，可用 `SOLO11_PLATFORM_ACCOUNT` 覆盖；每次登录、读取实时 schema/fingerprint、账号领域和历史 SessionID，遇到新增字段或类型变化就停止。账号以首次提交锁定领域，同账号不能跨领域提交。
 
-平台只收一个主会话 `.jsonl`，子会话保留在本地交付目录。轨迹和视频先上传，再用返回的附件信息建单，最后回读每个字段。预检和正式回执分别绑定当前来源摘要，存任务源目录的 `review/upload.json`；内容变动即失效。超时或结果未知时先回查 SessionID，不盲目重发。`confirmed` 只表示建单字段一致，不代表平台质检通过。
+平台只收一个主会话 `.jsonl`，子会话保留在本地交付目录。轨迹和视频先上传，再按账号级间隔建单，最后回读每个字段。预检和正式回执分别绑定当前来源摘要，存任务源目录的 `review/upload.json`；内容变动即失效。每次写请求的等待秒数、尝试次数和 429 退避记录在同一回执的 `pacing`。超时或结果未知时先回查 SessionID，不盲目重发。`confirmed` 只表示建单字段一致，不代表平台质检通过。
 
 ## 工作目录
 
@@ -266,7 +275,7 @@ fbr_sheet.py --batch b1110-01                       # 确认回执后回填媒�
     origin/                              新出题侧的初始克隆，main 固定在初始提交、保留依赖
     workspace/                           唯一运行克隆，main，模型在这里干活
     task-seed.json                       新出题侧的编号、类型、题位与仓库清单项
-    task.json  recording-plan.json       出题侧交接生成，不改
+    task.json  recording-plan.json review-contract.json       出题侧交接生成，不改
     state.json                           各阶段状态
     run/      prompt.txt stream.jsonl stderr.log attempts.json attempt-N/ git-config.before
     trace/    projects/<目录>/<SessionID>.jsonl  ids.json
@@ -275,12 +284,14 @@ fbr_sheet.py --batch b1110-01                       # 确认回执后回填媒�
     evidence/ facts.json audit.json probes.jsonl
     review/   snapshot.json diff.patch card.md task-agent-brief.md candidate-schema.json feedback.json
               model-review.json quality.json metrics.json task-agent-work.json task-closeout.json
+              attestation.json（当前有效评审凭证）
               decision-input.json candidate.json verification.json style-report.json validation-errors.json
               build-errors.json lint-errors.json upload-plan.json
               task-agent-history.json task-agent-history/objects/ probe-requests.json gate.json
               spotcheck.json submit-preflight.json upload.json
 <root>/results/b1110-01/
   delivery-manifest.json                 每个导出文件的字节数、SHA256 与源反馈版本
+  batch-closeout.json                    批次提交前的凭证、字段、SessionID、领域和查重结论
   result.xlsx  preview.html              最终表与人审预览
   s11-000123/
     task-summary.json                     题面/分类/初始快照/需求点，不含参考解元数据
@@ -304,7 +315,7 @@ API key 填在上述独立 env 文件的 `apikey=` 后面。`settings.json` 只�
 
 仅轨迹分析使用 `/Users/fengyin/.codex/solo11/reviewer.env`，填写 `base_url=`、`apikey=`，可配置 `model=` 与 `reasoning_effort=`；入口支持 `--env-file` 改路径。其他操作使用推进任务的当前 AI，不读取这份配置，不改 CC Switch 或全局 Codex 配置。详见 [references/reviewer.md](references/reviewer.md)。
 
-可调的配置都在 `_config/settings.json`，缺省值见 `scripts/fbrlib.py` 的 `DEFAULTS`（并发、超时、重跑次数、录屏规格、测试命令、闸门阈值）。`_config/` 里不放密钥。
+可调的配置都在 `_config/settings.json`，缺省值见 `scripts/fbrlib.py` 的 `DEFAULTS`（并发、超时、重跑次数、录屏规格、测试命令、闸门阈值和平台写入间隔）。滚动评价固定为默认流程；`submit.interval_seconds` 默认 10，`submit.rate_limit_retries` 默认 3，退避为 15、30、45 秒。`_config/` 里不放密钥。
 
 ## 自测
 

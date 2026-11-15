@@ -26,7 +26,7 @@ class Cleanup(SubmitCase):
         lib.save_json(task_dir / "run/attempts.json", [{"verdict": "ok"}])
         delivery.export_batch(self.root, BATCH, self.cfg)
         result = submit.submit_ready(
-            self.root, BATCH, task_dir.name, execute=True, confirm="SUBMIT", client=client)
+            self.root, BATCH, task_dir.name, execute=True, confirm="SUBMIT", client=client, interval=0)
         self.assertEqual(result["state"], "confirmed")
         client.records[0]["status"] = status
         (task_dir / "origin").mkdir(exist_ok=True)

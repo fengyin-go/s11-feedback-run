@@ -10,9 +10,11 @@
 fbr_submit.py probe
 fbr_submit.py schema-field --fingerprint <fingerprint> --field repro_level
 fbr_submit.py preflight --batch b1110-01 --task s11-000123
+fbr_batch.py closeout --batch b1110-01
 fbr_batch.py --root "<root>" upload --batch b1110-01 --tasks s11-000123 --limit 1
 # 用户明确授权本次平台提交后：
-fbr_batch.py --root "<root>" upload --batch b1110-01 --tasks s11-000123 --limit 1 --execute --confirm SUBMIT
+fbr_batch.py --root "<root>" upload --batch b1110-01 --tasks s11-000123 --limit 1 \
+  --submit-interval 10 --execute --confirm SUBMIT
 fbr_sheet.py --root "<root>" --batch b1110-01
 ```
 
@@ -20,15 +22,21 @@ fbr_sheet.py --root "<root>" --batch b1110-01
 
 默认输出只给状态、任务数、阻断摘要和结果路径，`--json` 才展开完整回执。`probe` 将完整 schema 写入 `_registry/platform-schema/<fingerprint>.json`；`preflight` 将完整计划写入 `review/upload-plan.json`。当前 AI 按 fingerprint、字段名或错误项定向查询，不整份回读 schema/plan/upload receipt。
 
-`fbr_submit.py preflight` 是单题只读门闸：重新跑当前题 Feedback/查重，刷新白名单交付投影，核对字段、媒体和历史 SessionID，再读取实时 schema 与账号领域。结果写 `review/submit-preflight.json`，包含当前 `feedback_sha`、`source_digest`、`content_digest`、产物快照、schema fingerprint 和错误清单；不包含凭据，也不上传附件或创建记录。滚动提交只有该文件状态为 `ready` 才进入上传，正式上传前仍由底层再次核对来源摘要和 schema。
+`fbr_submit.py preflight` 是单题只读门闸：验证执行期生成的 `review/attestation.json`、当前交付投影、字段、媒体和历史 SessionID，再读取实时 schema 与账号领域。它不重新调用 AI，不重新判断需求或重写 Feedback。结果写 `review/submit-preflight.json`，包含当前 `feedback_sha`、`source_digest`、`content_digest`、产物快照、schema fingerprint 和错误清单；不包含凭据，也不上传附件或创建记录。滚动提交只有该文件状态为 `ready` 才进入上传，正式上传前仍由底层再次核对来源摘要和 schema。
+
+`fbr_batch.py closeout` 是整批提交前的确定性检查：逐题验证评审凭证，检查 SessionID 重复、全批领域、跨批 Feedback 查重和交付摘要，结果写 `results/<批次>/batch-closeout.json`。人工整批上传要求 `state=ready`；某题失败不会被悄悄跳过。
 
 真实提交串行进行；人工批量提交时，所选任务先全部完成本地校验，再上传第一份文件。滚动模式每次只对一条执行同样的单条 all-or-nothing 预检，一条失败不会阻止其他题继续生产或提交。`--tasks` 逗号分隔，`--limit` 限制本次处理数。未传选择参数时检查整个批次；未就绪任务不被悄悄跳过。平台第一次提交会锁定该账号的领域，跨领域整批停止。首次提交属于哪个领域由用户确定，不由脚本替用户选择。
+
+所有建单和返修写请求共用账号级节流，默认最小间隔 10 秒。`--submit-interval` 是规范参数，`fbr_submit.py submit/repair` 与 `fbr_batch.py upload/repair` 同时兼容 `--interval`、`--delay`。计时点在 `POST /submissions` 或 `PUT /submissions/{id}` 发出前；上传附件、schema 获取、预检和详情回读不计入。节流状态持久化在 `~/.codex/solo11/runtime/platform-write-pacing-<账号摘要>.json`，进程重启、resume 或换批次后继续生效。
+
+建单明确返回 HTTP 429 时才自动重试：优先使用 `Retry-After`，否则按 15、30、45 秒退避。每次重投前重新读取平台记录并按 SessionID 查找；已存在则直接回读确认，不存在才重投。其他 5xx、超时、TLS 结果未知均保留 `uncertain`，不得自动重发 POST。
 
 ## 凭据和认证
 
 默认账号为 `gonghao`，可用环境变量 `SOLO11_PLATFORM_ACCOUNT` 覆盖。优先读取 `~/.codex/coding-agent-satisfaction/solo-qa-accounts/<账号>.json`，不存在时才读取 `~/.codex/coding-agent-satisfaction/solo-qa.json`。两者均要求普通文件、权限 600、`username` 恰为所选账号，密码只读到内存。优先文件损坏或不安全时不能悄悄退回备用文件。禁止打印文件、密码、Cookie、CSRF 或完整登录响应；凭据不放工作目录、仓库、回执或交付目录。
 
-登录：`POST /auth/login`，JSON 为 `username`、`password`。会话由内存 CookieJar 保存；写请求使用 `solo_qa_csrf` Cookie 解码后的值作为 `X-CSRF-Token`。不保存 Cookie 文件，不跟随跨 origin 重定向，不自动重试 POST。登录后 GET `/auth/me` 核对用户名和是否需要修改初始密码；需要改密码时停止。
+登录：`POST /auth/login`，JSON 为 `username`、`password`。会话由内存 CookieJar 保存；写请求使用 `solo_qa_csrf` Cookie 解码后的值作为 `X-CSRF-Token`。不保存 Cookie 文件，不跟随跨 origin 重定向；普通结果未知的 POST 不自动重试，只有建单明确返回 429 时按下方规则先回查再重投。登录后 GET `/auth/me` 核对用户名和是否需要修改初始密码；需要改密码时停止。
 
 ## 实时 schema 与映射
 
@@ -91,9 +99,11 @@ fbr_batch.py repair --batch b1110-01 --tasks s11-000123 \
   --comment "按平台打回原因重写 Feedback" --execute --confirm REPAIR
 ```
 
-`repair` 只更新非锁定字段，当前实现会保留平台附件值。演练必须显示实际变化字段；真实执行后重新 GET 详情，确认版本递增、字段一致且 `qc_running=true` 或 `stage=QC_RUNNING/QC_WAITING`。如果 PUT 已成功但回执尚未落盘，再次运行会按当前详情识别 `already_applied`，不得重复 PUT。返修完成后轮询详情，只有 `QC_PASSED` 才算通过；`PENDING_FIX` 要继续按新的 `qc_summary` 和失败 `qc_checks` 处理。
+`repair` 只更新非锁定字段，当前实现会保留平台附件值。返修 PUT 与建单共用账号级最小间隔。演练必须显示实际变化字段；真实执行后重新 GET 详情，确认版本递增、字段一致且 `qc_running=true` 或 `stage=QC_RUNNING/QC_WAITING`。如果 PUT 已成功但回执尚未落盘，再次运行会按当前详情识别 `already_applied`，不得重复 PUT。明确 429 时按同一退避规则先回查字段是否已生效，再决定是否重投。返修完成后轮询详情，只有 `QC_PASSED` 才算通过；`PENDING_FIX` 要继续按新的 `qc_summary` 和失败 `qc_checks` 处理。
 
 平台 `other_issues` 不从本地 `feedback.note` 复制，只根据原始轨迹自动生成两类事实：模型自行中断后已输入“继续”的次数及首轮标识说明；当前轨迹或运行输出确实出现起跑 key 时写固定短句“模型运行时读取了 apikey”。两类都存在时用中文分号连接。两项都没有时显式发送 `""`；重跑、Git 历史、录屏问题、修复说明等仍保留在本地证据中。
+
+`PENDING_FIX` 仍要区分可编辑字段失败和题目级失败。`qc_checks[].evidence.problem_type=DOMAIN_MISMATCH` 表示题面主体与所属领域不符；题面、Session 和附件不在可返修范围内，继续改 Feedback 或 PUT 不会改变结论。`repair_one` 遇到此类失败返回 `prompt_rebuild_required`，保留失败检查作为出题侧证据并转 `s11-gsb-prompt-create`，不得为了把状态推回 `QC_RUNNING` 而反复提交。
 
 ## 2026-11-12 首条实际建单后的接口兼容
 

@@ -447,8 +447,8 @@ class Status(SheetCase):
             "—— 都做完了 1 题，等运行 1 题，等取证 1 题，等Feedback 1 题",
             f"下一步（运行）：fbr_flow.py pre-submit --batch {BATCH} --detach",
             f"下一步（取证）：fbr_facts.py --batch {BATCH}",
-            f"下一步（Feedback）：fbr_feedback.py card --batch {BATCH}，按 references/reviewer.md 调用指定验收模型后 "
-            f"fbr_feedback.py gate --batch {BATCH}",
+            f"下一步（Feedback）：fbr_work.py next --batch {BATCH} --wait，完成当前题验收后 "
+            f"fbr_work.py closeout --batch {BATCH} --task <任务>",
             f"待推送：fbr_snapshot.py push --batch {BATCH}（演练；真推要用户明确同意后加 --execute --confirm PUBLISH）"])
 
     def test_all_done(self):
@@ -595,12 +595,15 @@ class Main(SheetCase):
         planned = {"execute": False, "tasks": [{"task_id": task_dir.name, "state": "dry"}]}
         with mock.patch("fbr_submit.run_batch", return_value=planned) as submit:
             code, out, err = self.run_cli("upload", "--batch", BATCH, "--json")
-        submit.assert_called_once_with(self.root, BATCH, tasks=None, limit=None, execute=False, confirm="")
+        submit.assert_called_once_with(self.root, BATCH, tasks=None, limit=None, execute=False,
+                                       confirm="", interval=None)
         self.assertEqual((code, json.loads(out), err), (0, planned, ""))
         with mock.patch("fbr_submit.run_batch", return_value={"execute": True}) as submit:
             code, out, err = self.run_cli("upload", "--batch", BATCH, "--tasks", task_dir.name,
-                                        "--limit", "1", "--execute", "--confirm", "SUBMIT", "--json")
-        submit.assert_called_once_with(self.root, BATCH, tasks=task_dir.name, limit=1, execute=True, confirm="SUBMIT")
+                                        "--limit", "1", "--submit-interval", "7",
+                                        "--execute", "--confirm", "SUBMIT", "--json")
+        submit.assert_called_once_with(self.root, BATCH, tasks=task_dir.name, limit=1, execute=True,
+                                       confirm="SUBMIT", interval=7.0)
         self.assertEqual((code, json.loads(out), err), (0, {"execute": True}, ""))
         code, out, err = self.run_cli("spotcheck", "--batch", BATCH, "--task", task_dir.name, "--state", "通过")
         self.assertEqual((code, out), (2, ""))

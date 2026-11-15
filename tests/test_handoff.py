@@ -126,6 +126,56 @@ class SingleProducer(Sandbox):
         lib.save_json(task.parent / "batch-manifest.json", self.manifest)
         self.assertEqual(lib.load_task(task), legacy)
 
+    def test_domain_gate_v2_requires_chain_and_anchors(self):
+        task, record = self.single_task()
+        contract = {
+            "version": 2,
+            "domain": record["domain"],
+            "subdirection": record["subdirection"],
+            "topic_id": "clipcut",
+            "main_task": "解析视频并生成独立分片数据集",
+            "business_result": "分片数据集保留来源视频和片段序号",
+            "domain_chain": {
+                "input": "视频数据",
+                "operation": "解析视频",
+                "output": "分片数据集",
+                "observable": "片段序号可追溯",
+            },
+            "prompt_main_request": "请解析视频数据并生成分片数据集。",
+            "domain_anchors": [
+                {"path": "src/clipcut/packer.py", "start_line": 1, "end_line": 1,
+                 "supports": "operation", "excerpt": "pack"},
+                {"path": "src/clipcut/packer.py", "start_line": 1, "end_line": 1,
+                 "supports": "output", "excerpt": "pack"},
+            ],
+            "genericization": {
+                "rewritten_with_generic_objects": "维护普通配置表",
+                "same_task_without_domain_semantics": False,
+            },
+            "source_evidence": ["src/clipcut/packer.py"],
+            "domain_objects": ["视频数据"],
+            "domain_results": ["分片数据集"],
+            "conclusion": "pass",
+        }
+        v2 = dict(record, domain_contract=contract, domain_gate_version=2)
+        v2["handoff_hash"] = lib.content_hash(lib.handoff_payload(
+            v2, lib.load_json(task / "recording-plan.json")
+        ))
+        lib.save_json(task / "task.json", v2)
+        self.manifest["tasks"][0]["handoff_hash"] = v2["handoff_hash"]
+        lib.save_json(task.parent / "batch-manifest.json", self.manifest)
+        self.assertEqual(lib.load_task(task), v2)
+        broken = copy.deepcopy(v2)
+        broken["domain_contract"].pop("domain_chain")
+        broken["handoff_hash"] = lib.content_hash(lib.handoff_payload(
+            broken, lib.load_json(task / "recording-plan.json")
+        ))
+        lib.save_json(task / "task.json", broken)
+        self.manifest["tasks"][0]["handoff_hash"] = broken["handoff_hash"]
+        lib.save_json(task.parent / "batch-manifest.json", self.manifest)
+        with self.assertRaisesRegex(lib.FbrError, "domain_chain"):
+            lib.load_task(task)
+
     def test_single_mode_and_path_drift_block(self):
         task, record = self.single_task()
         for field, value in (("execution_mode", "pairwise"), ("branch", "A"), ("workspace", "other/workspace"),

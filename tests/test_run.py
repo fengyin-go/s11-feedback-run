@@ -118,7 +118,12 @@ class RunOne(DockerCase):
         self.assertEqual((row["state"], row["detail"]), ("ok", "第 1 次运行算数"))
         command = self.docker.docker_calls("run", "-i")[0]
         self.assertEqual(command[-2:], [IMAGE, "infinity"])
-        self.assertEqual(self.docker.docker_calls("exec")[0][-2:], ["/usr/local/bin/entrypoint.sh", "print"])
+        first_exec = self.docker.docker_calls("exec")[0]
+        self.assertEqual(first_exec[-1], "fbr-first-run")
+        self.assertIn("/home/node/.claude/projects", first_exec[-2])
+        self.assertIn("/home/node/.claude/todos", first_exec[-2])
+        self.assertIn("/home/node/.claude/history.jsonl", first_exec[-2])
+        self.assertIn("exec /usr/local/bin/entrypoint.sh print", first_exec[-2])
         self.assertNotIn("--rm", command)
         self.assertEqual(command[command.index("--name") + 1], "s11-000001")
         self.assertEqual(command[command.index("--env-file") + 1], str(self.key_file))

@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from unittest import mock
 from test_sheet_batch import SheetCase
 import fbr_flow
+import fbr_attestation
 import fbr_feedback
 import fbr_snapshot
 import fbr_sheet
@@ -40,7 +41,11 @@ class DeliveryFields(SheetCase):
              mock.patch.object(fbr_snapshot,'push_one',side_effect=publish), \
              mock.patch.object(fbr_sheet,'write_sheet',side_effect=lambda *a: events.append('sheet')), \
              mock.patch.object(fbr_sheet,'build_row',return_value=({'数据状态':'可提交'},'')), \
-             mock.patch.object(fbr_sheet,'row_problems',return_value=[]):
+             mock.patch.object(fbr_sheet,'row_problems',return_value=[]), \
+             mock.patch.object(fbr_attestation,'validate',
+                               return_value={'valid':False,'state':'missing','reason':''}), \
+             mock.patch.object(fbr_attestation,'materialize',
+                               return_value={'state':'accepted'}):
             self.assertEqual(fbr_flow.review_task(task,self.root,self.cfg,options)['state'],'ok')
         self.assertEqual(events,['acceptance','sheet','push','sheet'])
 
@@ -75,6 +80,10 @@ class DeliveryFields(SheetCase):
              mock.patch.object(fbr_sheet,'write_sheet'), \
              mock.patch.object(fbr_sheet,'build_row',return_value=({'数据状态':'可提交'},'')), \
              mock.patch.object(fbr_sheet,'row_problems',return_value=[]), \
+             mock.patch.object(fbr_attestation,'validate',
+                               return_value={'valid':False,'state':'missing','reason':''}), \
+             mock.patch.object(fbr_attestation,'materialize',
+                               return_value={'state':'accepted'}), \
              mock.patch.object(fbr_snapshot,'Hub'), \
              mock.patch.object(fbr_snapshot,'push_one',return_value={'state':'ok'}) as push:
             self.assertEqual(fbr_flow.review_task(task,self.root,self.cfg,options)['state'],'repairing')

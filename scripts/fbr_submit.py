@@ -11,6 +11,7 @@ import json
 import os
 import re
 import sys
+import time
 import urllib.request
 from datetime import datetime
 from pathlib import Path
@@ -18,6 +19,7 @@ from urllib.parse import urljoin, urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import fbrlib as lib
+import fbr_runtime
 import fbr_style
 import fbr_trace
 import fbr_delivery as delivery
@@ -69,6 +71,124 @@ FIELD_TYPES = dict.fromkeys(FIELD_MAP, "text") | {
 }
 PREFLIGHT_VERSION = 1
 PREFLIGHT_FILE = "review/submit-preflight.json"
+SUBMIT_INTERVAL = 10.0
+RATE_LIMIT_RETRIES = 3
+RATE_LIMIT_BACKOFF = (15.0, 30.0, 45.0)
+WRITE_PACING_VERSION = 1
+
+
+class SubmitRateLimited(lib.FbrError):
+    """A 429 write remains pending after safe retries and session rechecks."""
+
+    def __init__(self, message: str, *, retry_after_seconds: float):
+        self.retry_after_seconds = max(0.0, float(retry_after_seconds))
+        super().__init__(message)
+
+
+def submit_policy(root: Path) -> tuple[float, int, tuple[float, ...]]:
+    raw = lib.settings(root).get("submit") or {}
+    interval = raw.get("interval_seconds", SUBMIT_INTERVAL)
+    retries = raw.get("rate_limit_retries", RATE_LIMIT_RETRIES)
+    delays = raw.get("rate_limit_backoff_seconds", list(RATE_LIMIT_BACKOFF))
+    if (isinstance(interval, bool) or not isinstance(interval, (int, float)) or interval < 0):
+        raise lib.FbrError("submit.interval_seconds 必须是非负数")
+    if type(retries) is not int or not 0 <= retries <= 5:
+        raise lib.FbrError("submit.rate_limit_retries 必须是 0 到 5 的整数")
+    if not isinstance(delays, list) or not delays:
+        raise lib.FbrError("submit.rate_limit_backoff_seconds 必须是非空列表")
+    values = []
+    for value in delays:
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+            raise lib.FbrError("submit.rate_limit_backoff_seconds 必须都是非负数")
+        values.append(float(value))
+    return float(interval), retries, tuple(values)
+
+
+def resolve_submit_interval(root: Path, value=None) -> float:
+    configured = submit_policy(root)[0]
+    if value is None:
+        return configured
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+        raise lib.FbrError("--submit-interval 必须是非负数秒数")
+    return float(value)
+
+
+def write_pacing_path() -> Path:
+    identity = hashlib.sha256(json.dumps(
+        [BASE_URL, ACCOUNT], ensure_ascii=False, separators=(",", ":")).encode()).hexdigest()[:24]
+    return fbr_runtime.runtime_home({}) / f"platform-write-pacing-{identity}.json"
+
+
+def _load_write_pacing(path: Path) -> dict:
+    if path.is_symlink():
+        raise lib.FbrError("平台写入节流状态不能是符号链接")
+    value = lib.load_json(path, default={})
+    if (not isinstance(value, dict) or value.get("version") != WRITE_PACING_VERSION
+            or value.get("platform") != BASE_URL or value.get("account") != ACCOUNT):
+        return {"version": WRITE_PACING_VERSION, "platform": BASE_URL, "account": ACCOUNT}
+    return value
+
+
+def wait_for_write_slot(root: Path, task_id: str, operation: str, interval: float) -> dict:
+    """Enforce one account-level minimum interval immediately before a write."""
+    path = write_pacing_path()
+    with lib.file_lock(path.with_suffix(".lock")):
+        state = _load_write_pacing(path)
+        now = time.time()
+        last = state.get("last_write_started_epoch")
+        last = float(last) if isinstance(last, (int, float)) and not isinstance(last, bool) else 0.0
+        if last > now + max(60.0, interval * 2):
+            last = 0.0
+        wait = max(0.0, last + interval - now)
+        previous_task_id = str(state.get("last_task_id") or "")
+        if wait > 0:
+            print(f"[submit] {task_id}：距上次平台写入不足 {interval:g} 秒，"
+                  f"等待 {wait:.1f} 秒", flush=True)
+            time.sleep(wait)
+        started = time.time()
+        state.update({
+            "version": WRITE_PACING_VERSION,
+            "platform": BASE_URL,
+            "account": ACCOUNT,
+            "last_write_started_epoch": started,
+            "last_task_id": task_id,
+            "last_operation": operation,
+            "last_outcome": "pending",
+        })
+        lib.save_json(path, state)
+        return {"task_id": task_id, "operation": operation,
+                "interval_seconds": interval, "waited_seconds": round(wait, 3),
+                "started_epoch": started, "previous_task_id": previous_task_id}
+
+
+def mark_write_outcome(task_id: str, operation: str, outcome: str, *,
+                       status: int | None = None) -> None:
+    path = write_pacing_path()
+    with lib.file_lock(path.with_suffix(".lock")):
+        state = _load_write_pacing(path)
+        state.update({
+            "version": WRITE_PACING_VERSION,
+            "platform": BASE_URL,
+            "account": ACCOUNT,
+            "last_task_id": task_id,
+            "last_operation": operation,
+            "last_outcome": outcome,
+            "last_outcome_epoch": time.time(),
+        })
+        if status is not None:
+            state["last_http_status"] = int(status)
+        lib.save_json(path, state)
+
+
+def pacing_summary(pacing: object) -> str:
+    if not isinstance(pacing, dict):
+        return ""
+    waited = sum(float(row.get("seconds", 0)) for row in pacing.get("waits", [])
+                 if isinstance(row, dict))
+    retries = len([row for row in pacing.get("rate_limit_waits", [])
+                   if isinstance(row, dict)])
+    return (f"尝试 {pacing.get('attempts', 0)} 次，等待 {waited:.1f} 秒"
+            + (f"，429 重试 {retries} 次" if retries else ""))
 
 
 def digest(value) -> str:
@@ -257,14 +377,17 @@ def _known_session_ids(root: Path, batch_id: str, task_id: str) -> dict[str, set
 
 
 def preflight_one(root: Path, batch_id: str, task_id: str, *, client=None,
-                  schema: dict | None = None, records: list[dict] | None = None) -> dict:
-    """Run the complete local and read-only platform gate for one task.
+                  schema: dict | None = None, records: list[dict] | None = None,
+                  authenticated: bool = False) -> dict:
+    """Verify the frozen review receipt and run the read-only platform gate.
 
     The result is persisted even when blocked. ``plan`` is returned in memory but
     is not written to the preflight file, so credentials and transient client
     state never enter the evidence tree.
     """
+    import fbr_attestation
     import fbr_feedback
+    import fbr_gate
     import fbr_sheet
 
     cfg = lib.settings(root)
@@ -288,24 +411,29 @@ def preflight_one(root: Path, batch_id: str, task_id: str, *, client=None,
     plan = None
     online_started = False
     try:
-        rows, _ = fbr_feedback.gate_batch(root, batch_id, cfg, task_id)
-        match = next((row for row in rows if row.get("task_id") == task_id), None)
-        if not match:
-            result["errors"].append("单题 Feedback 门闸没有返回结果")
-        elif match.get("state") != "ok":
-            result["errors"].extend(match.get("errors") or [f"Feedback 门闸状态为 {match.get('state')}"])
-            result["warnings"].extend(match.get("warnings") or [])
+        manifest = lib.load_json(
+            delivery.delivery_dir(root, batch_id) / "delivery-manifest.json",
+            default={"batch_id": batch_id, "tasks": [], "excluded": []},
+        )
+        attested = fbr_attestation.validate(task_dir, root, cfg, manifest=manifest)
+        if attested["state"] == "missing":
+            if not any(row.get("task_id") == task_id for row in manifest.get("tasks", [])):
+                manifest = delivery.export_batch(root, batch_id, cfg)
+            fbr_attestation.materialize(task_dir, root, cfg, manifest=manifest)
+            attested = fbr_attestation.validate(task_dir, root, cfg, manifest=manifest)
+        if not attested["valid"]:
+            result["errors"].append(attested["reason"])
         valid, reason = delivery.current_feedback(task_dir)
         if not valid:
             result["errors"].append(reason)
 
-        manifest = delivery.export_batch(root, batch_id, cfg)
         entry = next((row for row in manifest.get("tasks", []) if row.get("task_id") == task_id), None)
         if not entry:
             excluded = next((row for row in manifest.get("excluded", [])
                              if row.get("task_id") == task_id), None)
             raise lib.FbrError((excluded or {}).get("reason") or "任务未进入当前交付清单")
-        result["feedback_sha"] = str(entry.get("feedback_sha") or "")
+        result["feedback_sha"] = str(
+            (attested.get("attestation") or {}).get("feedback_sha") or "")
         result["source_digest"] = str(entry.get("source_digest") or "")
         row, build_reason = fbr_sheet.build_row(root, task_dir, cfg, delivery_manifest=manifest)
         if row is None:
@@ -318,12 +446,22 @@ def preflight_one(root: Path, batch_id: str, task_id: str, *, client=None,
         result["content_digest"] = plan["content_digest"]
         result["errors"].extend(platform_style_problems(
             str(plan["data"].get("feedback", "")), plan["data"].get("score_delivery")))
+        records_by_task = {}
+        for candidate in lib.task_dirs(root, batch_id):
+            candidate_feedback = lib.load_json(
+                candidate / "review/feedback.json", default={})
+            if str(candidate_feedback.get("feedback", "")).strip():
+                records_by_task[candidate.name] = str(candidate_feedback["feedback"])
+        duplicates, _ = fbr_gate.check_duplicates(
+            records_by_task, fbr_feedback.other_feedback(root, batch_id), cfg["feedback_gate"])
+        result["errors"].extend(duplicates.get(task_id, []))
 
         if client is None:
             from fbr_platform import Client
             client = Client(account=ACCOUNT)
         online_started = True
-        client.login()
+        if not authenticated:
+            client.login()
         me = client.me()
         user = me.get("user", me)
         if user.get("username") != ACCOUNT or user.get("must_change_password"):
@@ -597,6 +735,145 @@ def record_session(record: dict) -> str:
     return str(data.get("session_id") or record.get("session_id") or "")
 
 
+def _retry_delay(root: Path, retry_index: int, retry_after: float | None,
+                 interval: float) -> float:
+    _, _, delays = submit_policy(root)
+    fallback = delays[min(retry_index, len(delays) - 1)]
+    return max(float(retry_after if retry_after is not None else fallback), interval)
+
+
+def create_with_pacing(root: Path, client, data: dict, fingerprint: str, task_id: str,
+                       session_id: str, pacing: dict, on_rate_limit=None, on_attempt=None) -> dict:
+    """Create with account pacing and safe retry only after an explicit HTTP 429."""
+    from fbr_platform import PlatformHTTPError
+
+    _, retries, _ = submit_policy(root)
+    interval = resolve_submit_interval(root, pacing.get("interval_seconds"))
+    for retry_index in range(retries + 1):
+        slot = wait_for_write_slot(root, task_id, "create", interval)
+        pacing.setdefault("waits", []).append({
+            "operation": "create",
+            "attempt": retry_index + 1,
+            "seconds": slot["waited_seconds"],
+        })
+        pacing["attempts"] = int(pacing.get("attempts", 0)) + 1
+        if on_attempt:
+            on_attempt()
+        try:
+            created = client.create(data, fingerprint)
+        except PlatformHTTPError as exc:
+            mark_write_outcome(task_id, "create", "rate_limited" if exc.status == 429 else "http_error",
+                               status=exc.status)
+            if exc.status != 429:
+                raise
+            delay = _retry_delay(root, retry_index, exc.retry_after_seconds, interval)
+            if on_rate_limit:
+                on_rate_limit(delay)
+            try:
+                matches = [row for row in own_records(client)
+                           if record_session(row) == session_id]
+            except lib.FbrError as check_exc:
+                raise SubmitRateLimited(
+                    f"{task_id}：建单收到 429，且回查 SessionID 失败，稍后重试",
+                    retry_after_seconds=delay) from check_exc
+            if len(matches) > 1:
+                raise lib.FbrError(f"{task_id}：429 后回查出多个相同 SessionID，停止自动提交")
+            if matches:
+                pacing.setdefault("rate_limit_waits", []).append({
+                    "attempt": retry_index + 1, "seconds": delay,
+                    "recovered_existing": True,
+                })
+                pacing["recovered_after_rate_limit"] = True
+                mark_write_outcome(task_id, "create", "recovered_existing", status=429)
+                return matches[0]
+            if retry_index >= retries:
+                raise SubmitRateLimited(
+                    f"{task_id}：建单连续遇到 429，已等待并回查，仍未建单",
+                    retry_after_seconds=delay)
+            pacing.setdefault("rate_limit_waits", []).append({
+                "attempt": retry_index + 1, "seconds": delay,
+                "recovered_existing": False,
+            })
+            print(f"[submit] {task_id}：平台返回 429，等待 {delay:g} 秒后回查并重试",
+                  flush=True)
+            time.sleep(delay)
+            continue
+        except Exception:
+            mark_write_outcome(task_id, "create", "error")
+            raise
+        mark_write_outcome(task_id, "create", "created")
+        return created
+    raise lib.FbrError("建单重试状态异常")
+
+
+def _repair_applied(detail: dict, desired: dict) -> bool:
+    actual = remote_data(detail)
+    for key, value in desired.items():
+        if key in MEDIA_TYPES:
+            continue
+        if actual.get(key) != value and not (
+                key == "languages" and actual.get(key) == value.replace("；", ";")):
+            return False
+    return True
+
+
+def update_with_pacing(root: Path, client, submission_id, desired: dict, fingerprint: str,
+                       comment: str, task_id: str, pacing: dict) -> dict:
+    """Update one repair with pacing and safe 429 recovery."""
+    from fbr_platform import PlatformHTTPError
+
+    _, retries, _ = submit_policy(root)
+    interval = resolve_submit_interval(root, pacing.get("interval_seconds"))
+    for retry_index in range(retries + 1):
+        slot = wait_for_write_slot(root, task_id, "repair", interval)
+        pacing.setdefault("waits", []).append({
+            "operation": "repair",
+            "attempt": retry_index + 1,
+            "seconds": slot["waited_seconds"],
+        })
+        pacing["attempts"] = int(pacing.get("attempts", 0)) + 1
+        try:
+            updated = client.update(submission_id, desired, fingerprint, comment)
+        except PlatformHTTPError as exc:
+            mark_write_outcome(task_id, "repair", "rate_limited" if exc.status == 429 else "http_error",
+                               status=exc.status)
+            if exc.status != 429:
+                raise
+            delay = _retry_delay(root, retry_index, exc.retry_after_seconds, interval)
+            try:
+                current = client.detail(submission_id)
+            except lib.FbrError as check_exc:
+                raise SubmitRateLimited(
+                    f"{task_id}：返修收到 429，且回查改后字段失败，稍后重试",
+                    retry_after_seconds=delay) from check_exc
+            if _repair_applied(current, desired):
+                pacing.setdefault("rate_limit_waits", []).append({
+                    "attempt": retry_index + 1, "seconds": delay,
+                    "recovered_existing": True,
+                })
+                pacing["recovered_after_rate_limit"] = True
+                mark_write_outcome(task_id, "repair", "recovered_existing", status=429)
+                return current
+            if retry_index >= retries:
+                raise SubmitRateLimited(
+                    f"{task_id}：返修连续遇到 429，已等待并回查，仍未生效",
+                    retry_after_seconds=delay)
+            pacing.setdefault("rate_limit_waits", []).append({
+                "attempt": retry_index + 1, "seconds": delay,
+                "recovered_existing": False,
+            })
+            print(f"[submit] {task_id}：返修收到 429，等待 {delay:g} 秒后回查并重试",
+                  flush=True)
+            time.sleep(delay)
+            continue
+        except Exception:
+            mark_write_outcome(task_id, "repair", "error")
+            raise
+        mark_write_outcome(task_id, "repair", "updated")
+        return updated
+    raise lib.FbrError("返修重试状态异常")
+
+
 def locked_domain(me: dict, records: list[dict]) -> str:
     values = {str(me[key]) for key in ("locked_domain", "domain") if me.get(key)}
     for row in records:
@@ -613,13 +890,21 @@ def locked_domain(me: dict, records: list[dict]) -> str:
 
 
 def prepare(root: Path, batch_id: str, schema: dict, tasks: str | None = None, limit: int | None = None) -> list[dict]:
+    import fbr_attestation
     import fbr_sheet
     schema_fields(schema)
     cfg = lib.settings(root)
-    manifest = delivery.export_batch(root, batch_id, cfg)
     selected = lib.task_dirs(root, batch_id, tasks)[:limit]
     if not selected:
         raise lib.FbrError("没有选中的待提交任务")
+    manifest = delivery.export_batch(root, batch_id, cfg)
+    closeout = fbr_attestation.batch_closeout(
+        root, batch_id, cfg, ",".join(task.name for task in selected),
+        manifest=manifest, write=True)
+    if closeout["state"] != "ready":
+        details = "；".join(
+            f"{row.get('task_id')}：{row.get('error')}" for row in closeout.get("errors", [])[:8])
+        raise lib.FbrError("批量提交核查未通过：" + details)
     plans, errors = [], []
     for task_dir in selected:
         try:
@@ -703,7 +988,8 @@ def confirm_remote(client, plan: dict, receipt: dict, task_dir: Path, submission
             "status": receipt["remote_status"], "url": f"{BASE_URL}/app/submissions/{submission_id}"}
 
 
-def submit_one(root: Path, plan: dict, client, schema: dict, records: list[dict], *, execute: bool) -> dict:
+def submit_one(root: Path, plan: dict, client, schema: dict, records: list[dict], *, execute: bool,
+               interval: float | None = None) -> dict:
     task_dir = root / "batches" / plan["batch"] / plan["task_id"]
     path = task_dir / "review/upload.json"
     receipt = lib.load_json(path, default={})
@@ -769,27 +1055,91 @@ def submit_one(root: Path, plan: dict, client, schema: dict, records: list[dict]
     video_field = next(f for f in schema["fields"] if f.get("field_key") == "screencast")
     if video_field.get("max_length") and len(data["screencast"].encode("utf-16-le")) // 2 > video_field["max_length"]:
         raise lib.FbrError("上传视频地址超过平台字段长度限制，停止建单")
-    receipt.update(state="creating", requested_at=lib.now_iso(), schema_fingerprint=schema["fingerprint"])
+    interval_seconds = resolve_submit_interval(root, interval)
+    pacing = {"interval_seconds": interval_seconds, "attempts": 0,
+              "waits": [], "rate_limit_waits": []}
+    receipt.update(state="creating", requested_at=lib.now_iso(), schema_fingerprint=schema["fingerprint"],
+                   pacing=pacing)
     lib.save_json(path, receipt)
     try:
-        created = client.create(data, schema["fingerprint"])
+        def persist_rate_limit(delay: float) -> None:
+            receipt.update(state="uploaded", pacing=pacing, last_rate_limit_at=lib.now_iso(),
+                           rate_limit_retry_after_seconds=delay)
+            lib.save_json(path, receipt)
+
+        def persist_attempt() -> None:
+            receipt.update(state="creating", pacing=pacing, requested_at=lib.now_iso())
+            lib.save_json(path, receipt)
+
+        created = create_with_pacing(root, client, data, schema["fingerprint"], plan["task_id"],
+                                     plan["data"]["session_id"], pacing,
+                                     on_rate_limit=persist_rate_limit, on_attempt=persist_attempt)
+        receipt["pacing"] = pacing
         if not valid_id(created.get("id")):
             raise lib.FbrError("建单响应没有有效ID，提交结果待核对")
         receipt["submission_id"] = created["id"]
         lib.save_json(path, receipt)
-        return confirm_remote(client, plan, receipt, task_dir, created["id"])
+        result = confirm_remote(client, plan, receipt, task_dir, created["id"])
+        result["pacing"] = pacing
+        return result
     except (lib.FbrError, OSError) as exc:
         from fbr_platform import RequestNotSent
+        rate_limited = isinstance(exc, SubmitRateLimited)
         not_sent = isinstance(exc, RequestNotSent) and not valid_id(receipt.get("submission_id"))
         receipt["state"] = "uploaded" if not_sent else "uncertain"
-        if not_sent:
+        if not_sent or rate_limited:
             receipt["last_create_not_sent"] = lib.now_iso()
+        if rate_limited:
+            receipt.update(state="uploaded", last_rate_limit_at=lib.now_iso(),
+                           rate_limit_retry_after_seconds=exc.retry_after_seconds)
         lib.save_json(path, receipt)
         raise
 
 
+class SubmitContext:
+    """Reuse one authenticated platform read context across a rolling submit queue."""
+
+    def __init__(self):
+        self.client = None
+        self.schema = None
+        self.records = None
+
+    def ensure(self, root: Path, client=None):
+        if client is not None:
+            self.client = client
+        if self.client is None:
+            from fbr_platform import Client
+            self.client = Client(account=ACCOUNT)
+        if self.schema is None or self.records is None:
+            self.client.login()
+            me = self.client.me()
+            user = me.get("user", me)
+            if user.get("username") != ACCOUNT or user.get("must_change_password"):
+                raise lib.FbrError("登录账号不符或需要人工修改初始密码")
+            self.schema = self.client.schema()
+            self.records = own_records(self.client)
+        return self.client, self.schema, self.records
+
+    def remember(self, plan: dict, result: dict) -> None:
+        if result.get("state") != "confirmed" or not isinstance(self.records, list):
+            return
+        identifier = result.get("submission_id")
+        if any(str(row.get("id")) == str(identifier) for row in self.records):
+            return
+        self.records.append({
+            "id": identifier,
+            "data": {key: plan["data"].get(key) for key in FIELD_MAP},
+            "status": result.get("status"),
+        })
+
+    def reset_reads(self) -> None:
+        self.schema = None
+        self.records = None
+
+
 def submit_ready(root: Path, batch_id: str, task_id: str, *, execute: bool = False,
-                 confirm: str = "", client=None) -> dict:
+                 confirm: str = "", client=None, interval: float | None = None,
+                 context: SubmitContext | None = None) -> dict:
     """Preflight and submit one task under the account-level write lock.
 
     A blocked preflight returns without any upload or create request. Once the
@@ -798,37 +1148,63 @@ def submit_ready(root: Path, batch_id: str, task_id: str, *, execute: bool = Fal
     """
     if execute and confirm != "SUBMIT":
         raise lib.FbrError("真实平台提交需要 --execute --confirm SUBMIT")
-    if client is None:
-        from fbr_platform import Client
-        client = Client(account=ACCOUNT)
     with submit_lock(root):
-        client.login()
-        me = client.me()
-        user = me.get("user", me)
-        if user.get("username") != ACCOUNT or user.get("must_change_password"):
-            raise lib.FbrError("登录账号不符或需要人工修改初始密码")
-        schema, records = client.schema(), own_records(client)
+        if context is not None:
+            client, schema, records = context.ensure(root, client=client)
+        else:
+            if client is None:
+                from fbr_platform import Client
+                client = Client(account=ACCOUNT)
+            client.login()
+            me = client.me()
+            user = me.get("user", me)
+            if user.get("username") != ACCOUNT or user.get("must_change_password"):
+                raise lib.FbrError("登录账号不符或需要人工修改初始密码")
+            schema, records = client.schema(), own_records(client)
         preflight = preflight_one(root, batch_id, task_id, client=client,
-                                  schema=schema, records=records)
+                                  schema=schema, records=records,
+                                  authenticated=context is not None)
         output = {key: value for key, value in preflight.items() if key != "plan"}
         if preflight.get("state") == "retry":
             raise lib.FbrError("；".join(preflight.get("errors") or ["平台预检暂时失败"]))
         if not preflight.get("ready"):
             return output
         plan = preflight["plan"]
-        preview = submit_one(root, plan, client, schema, records, execute=False)
+        preview = submit_one(root, plan, client, schema, records, execute=False, interval=interval)
         if preview.get("state") == "confirmed":
             output.update(task_result=preview, state="confirmed")
+            if context is not None:
+                context.remember(plan, preview)
             return output
         if not execute:
             output.update(task_result=preview, state="ready")
             return output
-        submitted = submit_one(root, plan, client, schema, records, execute=True)
+        submitted = submit_one(root, plan, client, schema, records, execute=True, interval=interval)
         output.update(task_result=submitted, state="confirmed")
+        if context is not None:
+            context.remember(plan, submitted)
         return output
 
 
-def repair_one(root: Path, plan: dict, client, schema: dict, *, execute: bool, comment: str) -> dict:
+def non_repairable_prompt_checks(detail: dict) -> list[dict]:
+    """Return QC failures that cannot be fixed by editing the submitted fields."""
+    blocked: list[dict] = []
+    for check in detail.get("qc_checks") or []:
+        if not isinstance(check, dict) or check.get("passed") is not False:
+            continue
+        evidence = check.get("evidence") if isinstance(check.get("evidence"), dict) else {}
+        if evidence.get("problem_type") == "DOMAIN_MISMATCH":
+            blocked.append({
+                "check_key": check.get("check_key"),
+                "check_name": check.get("check_name"),
+                "summary": check.get("summary"),
+                "quote": evidence.get("quote"),
+            })
+    return blocked
+
+
+def repair_one(root: Path, plan: dict, client, schema: dict, *, execute: bool, comment: str,
+               interval: float | None = None) -> dict:
     task_dir = root / "batches" / plan["batch"] / plan["task_id"]
     path = task_dir / "review/upload.json"
     receipt = lib.load_json(path, default={})
@@ -841,6 +1217,16 @@ def repair_one(root: Path, plan: dict, client, schema: dict, *, execute: bool, c
     detail = client.detail(submission_id)
     if str(detail.get("session_id")) != str(plan["data"]["session_id"]):
         raise lib.FbrError(f"{plan['task_id']}：平台记录 SessionID 与当前交付不一致")
+    prompt_blockers = non_repairable_prompt_checks(detail)
+    if prompt_blockers:
+        return {
+            "task_id": plan["task_id"],
+            "state": "prompt_rebuild_required",
+            "submission_id": submission_id,
+            "status": detail.get("status"),
+            "blockers": prompt_blockers,
+            "detail": "题面主体与所属领域不符属于题目级失败；返修只能改字段，不能替换题面、会话或附件，需回到出题重做。",
+        }
     current = remote_data(detail)
     current_trace = detail.get("trace_file")
     if current_trace:
@@ -889,7 +1275,14 @@ def repair_one(root: Path, plan: dict, client, schema: dict, *, execute: bool, c
 
     history = task_dir / "review/platform-history" / (lib.now_iso().replace(":", "-") + "-before-repair.json")
     lib.save_json(history, receipt)
-    client.update(submission_id, desired, schema["fingerprint"], comment)
+    interval_seconds = resolve_submit_interval(root, interval)
+    pacing = {"interval_seconds": interval_seconds, "attempts": 0,
+              "waits": [], "rate_limit_waits": []}
+    receipt["pacing"] = pacing
+    lib.save_json(path, receipt)
+    update_with_pacing(root, client, submission_id, desired, schema["fingerprint"],
+                       comment, plan["task_id"], pacing)
+    receipt["pacing"] = pacing
     current_schema = client.schema()
     schema_fields(current_schema)
     if current_schema.get("fingerprint") != schema["fingerprint"]:
@@ -908,11 +1301,12 @@ def repair_one(root: Path, plan: dict, client, schema: dict, *, execute: bool, c
     save_receipt(updated, actual)
     return {"task_id": plan["task_id"], "state": "confirmed", "submission_id": submission_id,
             "status": updated.get("status"), "changed_fields": sorted(changes),
-            "url": f"{BASE_URL}/app/submissions/{submission_id}"}
+            "url": f"{BASE_URL}/app/submissions/{submission_id}", "pacing": pacing}
 
 
 def repair_batch(root: Path, batch_id: str, *, tasks: str | None = None,
-                 execute: bool = False, confirm: str = "", comment: str = "", client=None) -> dict:
+                 execute: bool = False, confirm: str = "", comment: str = "", client=None,
+                 interval: float | None = None) -> dict:
     if execute and confirm != "REPAIR":
         raise lib.FbrError("真实平台返修需要 --execute --confirm REPAIR")
     if client is None:
@@ -926,12 +1320,14 @@ def repair_batch(root: Path, batch_id: str, *, tasks: str | None = None,
             raise lib.FbrError("登录账号不符或需要人工修改初始密码")
         schema = client.schema()
         plans = prepare(root, batch_id, schema, tasks, None)
-        rows = [repair_one(root, plan, client, schema, execute=execute, comment=comment) for plan in plans]
+        rows = [repair_one(root, plan, client, schema, execute=execute, comment=comment,
+                           interval=interval) for plan in plans]
         return {"platform": BASE_URL, "account": ACCOUNT, "execute": execute, "tasks": rows}
 
 
 def run_batch(root: Path, batch_id: str, *, tasks: str | None = None, limit: int | None = None,
-              execute: bool = False, confirm: str = "", client=None) -> dict:
+              execute: bool = False, confirm: str = "", client=None,
+              interval: float | None = None) -> dict:
     if execute and confirm != "SUBMIT":
         raise lib.FbrError("真实平台提交需要 --execute --confirm SUBMIT")
     if limit is not None and limit < 1:
@@ -952,9 +1348,10 @@ def run_batch(root: Path, batch_id: str, *, tasks: str | None = None, limit: int
             raise lib.FbrError(f"账号已锁定领域 {domain}，本批领域不符，不上传")
         # Run the *same* receipt/duplicate/readback checks for every task before
         # the first mutation. A weaker separate precheck can miss later errors.
-        previews = [submit_one(root, plan, client, schema, records, execute=False) for plan in plans]
+        previews = [submit_one(root, plan, client, schema, records, execute=False,
+                               interval=interval) for plan in plans]
         rows = previews if not execute else [preview if preview["state"] == "confirmed" else
-            submit_one(root, plan, client, schema, records, execute=True)
+            submit_one(root, plan, client, schema, records, execute=True, interval=interval)
             for plan, preview in zip(plans, previews)]
         return {"platform": BASE_URL, "account": ACCOUNT, "execute": execute,
                 "locked_domain": domain or "尚未锁定；首次提交后锁定", "tasks": rows}
@@ -1004,6 +1401,9 @@ def compact_result(result: dict, *, full: bool = False) -> str:
         for row in rows[:10]:
             errors = row.get('errors') or []
             detail = "；".join(str(item) for item in errors[:3]) if errors else row.get('detail', '')
+            pacing = pacing_summary(row.get("pacing"))
+            if pacing:
+                detail = "；".join(filter(None, (detail, pacing)))
             lines.append(f"- {row.get('task_id')} {row.get('state')} {lib.clip(detail, 200)}".rstrip())
         if len(rows) > 10:
             lines.append(f"- 其余 {len(rows)-10} 条见完整回执")
@@ -1014,6 +1414,9 @@ def compact_result(result: dict, *, full: bool = False) -> str:
     state = result.get('state', 'ok')
     errors = result.get('errors') or []
     detail = result.get('detail') or result.get('submission_id') or result.get('status') or ''
+    pacing = pacing_summary(result.get("pacing"))
+    if pacing:
+        detail = "；".join(filter(None, (str(detail), pacing)))
     lines = [f"{task}\t{state}\t{lib.clip(detail, 200)}".rstrip()]
     if errors:
         lines.append(f"错误 {len(errors)} 项")
@@ -1031,7 +1434,7 @@ def schema_field(root: Path, fingerprint: str, name: str) -> dict | None:
                  and name in (row.get('field_key'), row.get('label'))), None)
 
 
-def main() -> int:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1049,14 +1452,25 @@ def main() -> int:
     p.add_argument("--limit", type=int)
     p.add_argument("--execute", action="store_true")
     p.add_argument("--confirm", default="")
+    p.add_argument("--submit-interval", "--interval", "--delay", dest="submit_interval",
+                   type=float, default=None,
+                   help="两条平台写请求之间的最小间隔秒数，默认读取 settings，未配置为 10 秒")
     r = sub.add_parser("repair", help="对待返修记录保存修正字段并重新质检")
     r.add_argument("--batch", required=True)
     r.add_argument("--tasks")
     r.add_argument("--execute", action="store_true")
     r.add_argument("--confirm", default="")
     r.add_argument("--comment", default="")
+    r.add_argument("--submit-interval", "--interval", "--delay", dest="submit_interval",
+                   type=float, default=None,
+                   help="两条返修写请求之间的最小间隔秒数，默认与提交间隔相同")
     for item in (probe_parser, pf, p, r):
         item.add_argument("--json", action="store_true")
+    return parser
+
+
+def main() -> int:
+    parser = build_parser()
     args = parser.parse_args()
     try:
         if args.command == "probe":
@@ -1069,10 +1483,12 @@ def main() -> int:
             result = preflight_one(lib.find_root(args.root), args.batch, args.task)
         elif args.command == "repair":
             result = repair_batch(lib.find_root(args.root), args.batch, tasks=args.tasks,
-                                  execute=args.execute, confirm=args.confirm, comment=args.comment)
+                                  execute=args.execute, confirm=args.confirm, comment=args.comment,
+                                  interval=args.submit_interval)
         else:
             result = run_batch(lib.find_root(args.root), args.batch, tasks=args.tasks,
-                               limit=args.limit, execute=args.execute, confirm=args.confirm)
+                               limit=args.limit, execute=args.execute, confirm=args.confirm,
+                               interval=args.submit_interval)
         if args.command == "schema-field":
             print(json.dumps(result, ensure_ascii=False, indent=2) if args.json
                   else f"{result.get('field_key')}\t{result.get('label')}\t"

@@ -92,6 +92,11 @@ DEFAULTS = {
         "five_ratio": 0.4,                        # 一批里 5 分占比超过就提示重看
         "min_counterexamples": 2,                 # 5 分至少要有这么多个实跑过的反例
     },
+    "submit": {
+        "interval_seconds": 10,
+        "rate_limit_retries": 3,
+        "rate_limit_backoff_seconds": [15, 30, 45],
+    },
 }
 
 
@@ -291,16 +296,55 @@ def validate_handoff(task_dir: Path, record: dict) -> None:
         raise FbrError(f"{task_dir.name}：不支持交接版本 {version}")
     if record.get("producer") == "s11-gsb-prompt-create" or manifest.get("producer") == "s11-gsb-prompt-create":
         validate_single_layout(task_dir, record, manifest)
+        review_contract = record.get("review_contract")
+        if manifest.get("review_contract_required") is True and review_contract is None:
+            raise FbrError(f"{task_dir.name}：批次要求 review_contract，但 task.json 缺失")
+        if review_contract is not None:
+            contract_path = task_dir / "review-contract.json"
+            if (
+                not isinstance(review_contract, dict)
+                or contract_path.is_symlink()
+                or not contract_path.is_file()
+            ):
+                raise FbrError(f"{task_dir.name}：review_contract 契约缺失或格式无效")
+            contract_doc = load_json(contract_path, default={})
+            if contract_doc != review_contract:
+                raise FbrError(f"{task_dir.name}：review-contract.json 与 task.json 不一致")
+            if content_hash(review_contract) != record.get("review_contract_sha256"):
+                raise FbrError(f"{task_dir.name}：review_contract 摘要不一致")
         if record.get("domain_gate_version") is not None:
             contract = record.get("domain_contract")
-            if record.get("domain_gate_version") != 1 or not isinstance(contract, dict):
+            gate_version = record.get("domain_gate_version")
+            if gate_version not in (1, 2) or not isinstance(contract, dict):
                 raise FbrError(f"{task_dir.name}：领域题位契约缺失或版本不支持")
-            for key in ("domain", "subdirection", "topic_id", "main_task", "business_result", "conclusion"):
+            required = ["domain", "subdirection", "topic_id", "main_task", "business_result", "conclusion"]
+            if gate_version == 2:
+                required += ["domain_chain", "prompt_main_request", "domain_anchors", "genericization"]
+            for key in required:
                 if not str(contract.get(key) or "").strip():
                     raise FbrError(f"{task_dir.name}：领域题位契约缺少 {key}")
             for key in ("source_evidence", "domain_objects", "domain_results"):
                 if not isinstance(contract.get(key), list) or not contract[key]:
                     raise FbrError(f"{task_dir.name}：领域题位契约缺少 {key}")
+            if gate_version == 2:
+                if contract.get("version") != 2:
+                    raise FbrError(f"{task_dir.name}：领域契约内部版本与 domain_gate_version 不一致")
+                chain = contract.get("domain_chain")
+                if not isinstance(chain, dict):
+                    raise FbrError(f"{task_dir.name}：领域契约 domain_chain 必须为对象")
+                for key in ("input", "operation", "output", "observable"):
+                    if not str(chain.get(key) or "").strip():
+                        raise FbrError(f"{task_dir.name}：领域契约 domain_chain 缺少 {key}")
+                anchors = contract.get("domain_anchors")
+                if not isinstance(anchors, list) or len(anchors) < 2:
+                    raise FbrError(f"{task_dir.name}：领域契约 domain_anchors 至少需要两条")
+                if any(not isinstance(anchor, dict) for anchor in anchors):
+                    raise FbrError(f"{task_dir.name}：领域契约 domain_anchors 条目必须为对象")
+                generic = contract.get("genericization")
+                if not isinstance(generic, dict) or not str(
+                    generic.get("rewritten_with_generic_objects") or ""
+                ).strip() or generic.get("same_task_without_domain_semantics") is not False:
+                    raise FbrError(f"{task_dir.name}：领域契约 genericization 不完整")
             if contract.get("conclusion") != "pass":
                 raise FbrError(f"{task_dir.name}：领域题位契约未通过")
             if contract.get("domain") != record.get("domain") or contract.get("subdirection") != record.get("subdirection"):

@@ -30,10 +30,11 @@ FILES = ("trace/ids.json", "record/recording.mp4", "record/recording.json", "evi
          "review/model-review.json", "review/quality.json", "review/field-revisions.json",
          "review/trace-analysis.json", "review/trace-check.json")
 GENERATED_TOP = {"delivery-manifest.json", "result.xlsx", "preview.html", "field-audit.json",
-                 "cleanup-manifest.json"}
+                 "cleanup-manifest.json", "batch-closeout.json"}
 RETAINED_TASK_FILES = {
     "task-seed.json", "state.json", "recording-plan.json", "recording-plan.override.json",
     "run/attempts.json", "review/diff.patch", "retention.json", "cleanup.json",
+    "review/attestation.json",
     "platform/snapshot.json", "platform/upload.json",
     "platform/submit-preflight.json",
 }
@@ -341,17 +342,24 @@ def _export_batch_locked(root: Path, target: Path, batch_id: str, cfg: dict) -> 
                 # 先核对所有会读的控制文件，避免先读入跨题链接。
                 for name in ("state.json", "task.json", *FILES, "review/spotcheck.json", "review/snapshot.json", "run/attempts.json"):
                     safe_file(source, source / name)
-                valid, reason = current_feedback(source)
-                if not valid:
-                    excluded.append({"task_id": source.name, "reason": reason})
-                    continue
+                import fbr_attestation
+                attested = fbr_attestation.validate(source, root, cfg, manifest=old_manifest)
+                if attested["valid"]:
+                    valid, reason = True, ""
+                    checked = {"ready": True, "errors": []}
+                else:
+                    valid, reason = current_feedback(source)
+                    if not valid:
+                        excluded.append({"task_id": source.name, "reason": reason})
+                        continue
+                    # Legacy tasks and changed drafts still receive the same
+                    # deterministic gate before a new projection is frozen.
+                    import fbr_feedback
+                    checked = fbr_feedback.gate_task(source, cfg)
                 import fbr_fields
                 record = fbr_fields.effective_record(source)
                 if not lib.TASK_ID_RE.fullmatch(source.name):
                     raise lib.FbrError("交付任务编号格式不合法")
-                # 不修改 gate 或状态；再用当前事实执行同一套单题证据规则。
-                import fbr_feedback
-                checked = fbr_feedback.gate_task(source, cfg)
                 if not checked.get("ready") or checked.get("errors"):
                     raise lib.FbrError("当前证据已不能通过 Feedback 闸门：" + "；".join(checked.get("errors", [])[:5]))
                 import fbr_run
