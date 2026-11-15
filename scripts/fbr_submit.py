@@ -18,11 +18,12 @@ from urllib.parse import urljoin, urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import fbrlib as lib
+import fbr_style
 import fbr_trace
 import fbr_delivery as delivery
 
 BASE_URL = "https://solo2.jzxhnh.com"
-ACCOUNT = os.environ.get("SOLO11_PLATFORM_ACCOUNT", "gonghao")
+ACCOUNT = os.environ.get("SOLO11_PLATFORM_ACCOUNT", "zouyonghong")
 FIELD_MAP = {
     "domain": "所属领域", "sub_direction": "子方向", "question_type": "任务类型",
     "difficulty": "任务难度", "languages": "语言/框架", "harness": "Harness",
@@ -460,7 +461,8 @@ def platform_style_problems(text: str, score: int | None = None) -> list[str]:
             break
     if score is not None and score <= 2 and not re.search(r"(?:问题|缺口|未实现|无法|不可用|失败)", text or ""):
         errors.append("2 分及以下的 Feedback 必须明确写出具体问题、缺口或不可用后果")
-    return errors
+    errors.extend(fbr_style.error_messages(text, score))
+    return list(dict.fromkeys(errors))
 
 
 def payload_with_media(plan: dict, uploads: dict) -> dict:

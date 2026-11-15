@@ -468,7 +468,7 @@ class Text(Case):
 
     def test_environment_words_from_the_task_are_allowed(self):
         prompt = "把 Docker 镜像的构建脚本拆成两段，并且在网关超时时重试。"
-        errors = self.check(TEXT4 + "镜像构建脚本拆成了两段，网关超时会重试，录屏没提到。", prompt)[0]
+        errors = self.check(TEXT4 + "镜像构建脚本已经拆开，网关超时会重试，录屏没提到。", prompt)[0]
         self.assertEqual(errors, ["出现运行环境或录屏现场的词（任务本身没提到）：录屏"])
 
     def test_voice(self):

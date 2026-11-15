@@ -6,12 +6,13 @@ fbr_reviewer.py review 仅通过 reviewer.env 分析轨迹并返回 needs_task_a
 
 现有 score、feedback、issues、process、note 保留；新增三项及 `process_audit` 仅供核对，不进入平台或结果表正文。
 
-默认作者格式是 `review/decision-input.json`：需求条目同时保留 `verdict/level/note/user_text/anchors`；`process[]` 可内嵌 `audit`；顶层 `claims[]` 按正文顺序保存逐句断言和原始来源；`quality_checks` 保存七项检查理由。`fbr_reviewer.py build` 只做结构展开：从需求生成 audit/requirements_status，从 claims 生成 claim_reviews，从 process.audit 生成 process_audit，从检查理由生成 verification。脚本不生成或修改评分、需求结论、过程判断和正文。
+默认作者格式是 `review/decision-input.json`：需求条目同时保留 `verdict/level/note/user_text/anchors`；`process[]` 可内嵌 `audit`；顶层 `claims[]` 按正文顺序保存逐句断言和原始来源；`quality_checks` 保存七项检查理由；`language_review` 保存最关键业务约束句、黑话改写和必要业务词。`fbr_reviewer.py build` 只做结构展开：从需求生成 audit/requirements_status，从 claims 生成 claim_reviews，从 process.audit 生成 process_audit，从检查理由生成 verification，并把 language_review 原样带入。脚本不生成或修改评分、需求结论、过程判断和正文。
 
 - requirements_status：逐项 {requirement_id, status, user_text, anchors}。status 为 completed、partial、missing、unverified，必须与 audit 的“做到/有问题/看不出来”及问题级别一致，并覆盖全部需求点。user_text 写用户能看到的完成能力、部分能力或具体缺口；results 的 requirement_ids 合起来也必须覆盖全部需求。
 - results：至少一条 {sentence, requirement_ids, anchors}。sentence 是正文中说明最终行为的连续原文，requirement_ids 指向真实需求；anchors 至少含产物文件、缺失文件、运行日志、probe、演示或失败用例证据。不能只填需求编号或过程步骤。
 - score_basis：{category, delivered, remaining, why_this_score, lowest_supported_score, lower_score_rejected, anchors}。category 为 delivery_issue、verification_gap、process_issue 或 complete；process_issue 只用于 4 分，表示最终交付没有已证实功能缺口，但模型过程出现真实错误验证、错判、实现返工或关键竞争未正确复核，因此不满足 5 分的一次性完美跑通。其余字段分别解释实际完成部分、真实残余问题或验证边界、为何处于该档。lowest_supported_score 必须等于 score；lower_score_rejected 至少 8 字，解释为什么不能更低（1 分说明已最低）；anchors 必须真实有效。确证前提下选择最低合理档位。
 - test_claims：正文有测试描述时逐处登记 {sentence, requirement_ids, behavior, source, output_excerpt, count, count_quote}，没有时为 []。sentence 要覆盖完整相关分句，不能只标出 make test 而漏掉后面的通过结论。behavior 说明检查的本题行为；output_excerpt 是该次执行真实输出中的连续摘录。
+- language_review：{reviewed, criterion_sentence, translated_terms, retained_terms, note}。criterion_sentence 必须逐字出现在正文并说明本轮最看重的业务约束；translated_terms 登记黑话到用户语言的改写；retained_terms 只登记确有必要保留的术语并逐项说明理由。
 
 source 仅用以下一种：{"kind":"trace","step":6}、{"kind":"probe","id":"P1"}、{"kind":"tests_after"}、{"kind":"demo","index":1}。都指向当前事实包记录的对应输出，不能拿另一次执行补计数。只有源码、没有输出则补充定向 probe 或不写通过断言。
 
@@ -30,7 +31,7 @@ process_audit 必须与 process 等长、同序、同句，每项为 {sentence, 
 | id | 核对内容 |
 | --- | --- |
 | result_and_process | 结果段先对照提示词说明哪些明示功能已完成、哪些未完成或仍有缺口；全部做到时直接陈述实际完成的能力，不写“未发现其他明确未完成功能”这类空泛完成度句。过程选择能说明结果或验证可信度，最多 3 句，只保留最有解释力的真实事件。存在首测失败、错误断言、并发校验写错、报错、返工或实现被推翻时，必须写清模型最初做了什么、问题为何出现、后来如何修正以及最终结果；只写未覆盖、未验证或末轮通过不算过程分析。全文“模型”最多出现一次，第一次点明主体后，后续动作改用“它”或直接省略主语。5 分正文不得出现上述真实过程问题；出现时最高 4 分，并用 process_issue 说明最终交付可用但过程不是一次性完美跑通 |
-| task_specific_voice | 事实决定句序，读起来是具体判断，没有空泛赞美、装饰细节或机械褒贬配额 |
+| task_specific_voice | 事实决定句序，读起来是具体判断，没有空泛赞美、装饰细节或机械褒贬配额；点明本轮最看重的业务约束，内部术语已翻成用户能理解的动作和结果 |
 | test_relevance | 每处测试描述对应本题行为，执行来源、成功状态、计数及结论范围一致 |
 | score_alignment | 分数、问题严重度、剩余工作一致，既拦无证据压分，也拦有证据却给高；纠正的过程失误不自动扣分；验证不足不伪装成缺陷 |
 | evidence_fidelity | 结果和过程原句均由相应证据支持，风险不升级成已发生事故，没有虚假实跑 |
@@ -41,7 +42,7 @@ process_audit 必须与 process 等长、同序、同句，每项为 {sentence, 
 
 正文不得直接写取证载体，也不能把模型过程写成无主语播报。`result_and_process` 复核时，要把“轨迹”“录屏”“录制”“素材卡”“事实卡”“原始会话”“工具返回”以及“证据显示/表明”视为来源口吻并要求改写；同时检查至少一句直接描述模型的行为链。只写“回归通过、构建完成”不够；只写“某边界没有覆盖”也不够。原始过程里存在失败、误判、错误断言或验证器本身写错时，要优先写模型当时的做法、暴露出的问题、修正动作和最终影响，例如“模型先用并发 curl 校验重复提交，却把多段响应拼在一起解析，报出 JSONDecodeError；改成五个独立线程分别读取后，才确认五次提交共用同一批次”。没有真实失败或返工时，才允许写成具体实现、验证策略和最终边界，不能用“额外边界没有问题”代替分析。内部记录仍保留原始路径和连续摘录，不能为了改正文删掉证据。
 
-无 AI 痕迹在执行中指消除可观察的套话与模板、保持自然和具体；不使用不可验证的作者来源断言作为通过条件。词表只拦确定的空泛短语，语义复核承担自然表达判断，不靠扩大禁词表代替。
+无 AI 痕迹在执行中指消除可观察的套话、公司黑话、名词化压缩和模板。确定性词表见 feedback-style-lexicon.json，语义复核仍要判断术语是否被真正翻译、关键业务约束是否写清；词表通过不能替代自然表达判断。
 
 ## 逐句回查，防止分析结论幻觉
 

@@ -44,6 +44,13 @@ fbr_reviewer.py finalize --batch b1110-01 --task s11-000123 --candidate /绝对�
               "reason": "原文依据", "later_check": "后续和最终状态",
               "sources": [{"path": "trace/projects/x.jsonl", "excerpt": "连续原文"}]}],
   "quality_checks": {"result_and_process": {"passed": true, "reason": "具体理由"}},
+  "language_review": {
+    "reviewed": true,
+    "criterion_sentence": "正文中说明本轮最关键业务约束的原句",
+    "translated_terms": [],
+    "retained_terms": [],
+    "note": "术语翻译和数字取舍"
+  },
   "process": [{"sentence": "过程句", "evidence": [], "audit": {"checks": {}, "note": ""}}],
   "results": [], "issues": [], "test_claims": [], "score_basis": {},
   "needs_probes": []
@@ -62,12 +69,14 @@ fbr_reviewer.py finalize --batch b1110-01 --task s11-000123 --candidate /绝对�
 
 正文先对照提示词说明功能完成度，已完成什么、未完成或仍有问题什么；全部做到时直接陈述实际完成的能力，不写“未发现其他明确未完成功能”这类空泛完成度句。之后再用最多 3 句写真实过程，只保留影响结论的一到三个事件。叙述要从证据提炼行为和结果，不把取证过程写进交付评价。不要写“轨迹显示”“录屏中”“素材卡里”“原始会话表明”或“证据显示”；改写成模型实际执行了什么、产物表现如何、哪些范围尚未覆盖。过程段至少一句必须是明确的模型行为句，但全文只在第一次点明主体时写一次“模型”，后续用“它”承接或直接省略主语，不能反复写“模型随后”“模型最后”。原始过程里出现首测失败、错误断言、验证器写错或返工时，先写模型当时的做法、失败结果、修正动作和最终影响；例如“模型先用并发 curl 校验重复提交，却把多段响应拼在一起解析，报出 JSONDecodeError；改成五个独立线程分别读取后，才确认五次提交共用同一批次”。不能只列脚本通过、构建完成和未覆盖边界，也不能用“额外边界没有问题”代替过程分析。
 
+正文语言先按 feedback-language-policy.md 写，再运行 build/lint。内部术语必须落到用户动作、条件或结果，例如写清“上次处理到哪条记录”“页面请求实际落到哪个接口”；不写公司黑话、抽象名词清单和“均已实现/完成”式收口。`language_review.criterion_sentence` 必须逐字出现在正文，词表命中由 `review/style-report.json` 给出，不能自动换词后跳过证据复核。
+
 每个 `process` 句先写真实 `steps` 和 `evidence`：工具 evidence 的 step 必须属于该句 steps，field 只能是 tool/target/output/error，excerpt 必须落在该步骤的真实字段中；没有工具的特殊会话使用 assistant evidence。之后还要在同序的 `process_audit` 中完成五项归因检查：`full_trace`、`baseline`、`timeline`、`source_boundary`、`scope`。验收 probe、录屏和当前 AI 的页面点击只能支撑结果或问题，不能接到模型主语链上；若轨迹中没有浏览器动作，过程句也不能写模型“点击”或“页面操作”。基线已有行为、后续修改造成的回归、绝对化范围表述和“收尾”等时序表述分别按 [process-attribution-audit.md](process-attribution-audit.md) 回查。
 
 评分与过程描述必须同向。5 分要求正文也呈现出接近一次性完美跑通；如果正文如实写了错误验证、错判、核心实现返工，或关键竞争没有真正复核，即使最后修好，也最高 4 分，并用 process_issue 说明最终交付可用但过程不完美。不要为了保 5 分删除这些真实经历。
 
 
 
-`finalize` 不加载配置、不调用模型；默认在通过后主动推送快照并回读，明确本地模式加 `--no-publish`。它核对绑定、证据契约、评分上限、查重、七项语义记录和逐句原文。失败保存候选、复核和错误到 task-agent-history.json，返回 repairing，由当前 AI 继续修复；不会采用失败候选。通过后保存 task-agent-v1 回执、归档旧版、执行门闸并立即刷新本地表。文件来源变化或规则变化会使回执失效，必须重新核实；不自动改稿或提交平台；发布失败保留验收结果，修复后补发布即可。人工 spotcheck 由真实审核人完成。
+`finalize` 不加载配置、不调用模型；默认在通过后主动推送快照并回读，明确本地模式加 `--no-publish`。它核对绑定、证据契约、评分上限、查重、七项语义记录、语言检查和逐句原文。失败保存候选、复核和错误到 task-agent-history.json，返回 repairing，由当前 AI 继续修复；不会采用失败候选。通过后保存 task-agent-v1 回执、语言策略版本、归档旧版、执行门闸并立即刷新本地表。文件来源变化或规则变化会使回执失效，必须重新核实；不自动改稿或提交平台；发布失败保留验收结果，修复后补发布即可。人工 spotcheck 由真实审核人完成。
 
 `task-agent-history.json` 只保存每次尝试的摘要和内容寻址引用，完整 candidate/verification 在 `review/task-agent-history/objects/` 中各存一份；相同内容不会重复追加。`review/metrics.json` 记录 reviewer 的 token usage、prompt/response 字节、轨迹包大小和证据访问统计。

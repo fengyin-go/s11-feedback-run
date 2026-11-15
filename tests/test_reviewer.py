@@ -148,8 +148,18 @@ class Review(FlowCase):
 
     def verification(self, task, candidate):
         report = json.loads(self.semantic(task))
+        text = str((candidate.get("feedback") or {}).get("feedback", ""))
+        criterion = next((item for item in ("超过一小时的输入没有做", "长时长这一项落空了")
+                          if item in text), "")
         report.update(task_agent='current_task_agent', candidate_sha=lib.content_hash(candidate),
-                      binding=lib.load_json(task/'review/task-agent-work.json')['binding'])
+                      binding=lib.load_json(task/'review/task-agent-work.json')['binding'],
+                      language_review={
+                          "reviewed": True,
+                          "criterion_sentence": criterion,
+                          "translated_terms": [],
+                          "retained_terms": [],
+                          "note": "正文使用用户可观察的切分、报错和缺失文档结果",
+                      })
         return report
 
     def test_review_only_analyzes_traces_then_returns_checkpoint(self):
@@ -190,6 +200,15 @@ class Review(FlowCase):
         styled['feedback']['feedback'] += '16 项后端测试通过。'
         errors = reviewer.lint_candidate(task, styled)['errors']
         self.assertTrue(any('测试总数' in error for error in errors))
+        styled = json.loads(json.dumps(candidate))
+        styled['feedback']['feedback'] += '主链路和水位均已落地。'
+        errors = reviewer.lint_candidate(task, styled)['errors']
+        self.assertTrue(any('企业黑话' in error for error in errors))
+        styled = json.loads(json.dumps(candidate))
+        verification = self.verification(task, styled)
+        verification.pop('language_review')
+        errors = reviewer.lint_candidate(task, styled, verification)['errors']
+        self.assertTrue(any('缺少 language_review' in error for error in errors))
 
     def test_semantic_rejection_keeps_old_candidate_and_can_be_repaired(self):
         task = self.agent_prepared()
@@ -259,6 +278,12 @@ class Review(FlowCase):
             result = reviewer.finalize(task, candidate, self.verification(task, candidate))
         self.assertEqual(result['state'], 'ok')
         self.assertEqual(reviewer.provenance_errors(task), [])
+        style_report = lib.load_json(task/'review/style-report.json')
+        self.assertEqual(style_report['state'], 'passed')
+        quality = lib.load_json(task/'review/quality.json')
+        self.assertEqual(quality['language_policy_version'], 1)
+        self.assertEqual(quality['language_review']['criterion_sentence'],
+                         '超过一小时的输入没有做')
         doc = lib.load_json(task/'review/feedback.json'); doc['note'] = '手改评价'
         lib.save_json(task/'review/feedback.json', doc)
         self.assertTrue(reviewer.provenance_errors(task))
@@ -346,6 +371,13 @@ class Review(FlowCase):
             "process": [{**row, "audit": doc["process_audit"][index]}
                         for index, row in enumerate(doc["process"])],
             "claims": claims,
+            "language_review": {
+                "reviewed": True,
+                "criterion_sentence": "超过一小时的输入没有做",
+                "translated_terms": [],
+                "retained_terms": [],
+                "note": "正文写清了长输入失败、短输入切分和缺失文档",
+            },
             "quality_checks": {name: "已按当前原始证据和最终产物核对该项"
                                for name in quality.CHECKS},
             "note": "", "needs_probes": [],
@@ -360,6 +392,8 @@ class Review(FlowCase):
                                if row["sentence"] == process_sentence)["sources"][0]
         self.assertNotIn("rebound_from", expanded_source)
         self.assertIn("start_line", expanded_source)
+        self.assertEqual(verification["language_review"]["criterion_sentence"],
+                         "超过一小时的输入没有做")
         self.assertEqual(reviewer.lint_candidate(task, candidate, verification)["state"], "ok")
 
     def test_work_wait_and_closeout_use_files_not_conversation_history(self):

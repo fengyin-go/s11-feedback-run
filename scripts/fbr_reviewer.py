@@ -18,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import fbrlib as lib
 import fbr_evidence
 import fbr_quality as quality
+import fbr_style
 
 MODEL = "gpt-6.1-sol"
 EFFORT = "high"
@@ -225,7 +226,18 @@ def provenance_errors(task: Path) -> list[str]:
         path = task/name
         if path.is_symlink() or not path.is_file() or file_sha(path) != digest:
             return ['逐句复核的原始来源已变化：'+name]
-    return quality.certificate_errors(task, receipt)
+    errors = quality.certificate_errors(task, receipt)
+    if errors:
+        return errors
+    cert = lib.load_json(task / "review/quality.json", default={})
+    if isinstance(cert, dict) and cert.get("language_policy_version"):
+        errors = fbr_style.provenance_errors(task)
+        if errors:
+            return errors
+        report = task / fbr_style.REPORT_FILE
+        if cert.get("style_report_sha") != file_sha(report):
+            return ["Feedback 语言检查报告在验收后被改动，须重新 lint/finalize"]
+    return []
 
 
 def analysis_errors(task: Path, expected_sha=None) -> list[str]:
@@ -303,8 +315,6 @@ def draft_errors(task: Path, audit: dict, feedback: dict, peers: list[dict]) -> 
                      gate.check_feedback(feedback, record, facts, audit, ev, cfg)):
         errors += found
     duplicates, _ = gate.check_duplicates({task.name: str(feedback.get("feedback", ""))}, peers, cfg)
-    import fbr_submit
-    errors += fbr_submit.platform_style_problems(str(feedback.get("feedback", "")), feedback.get("score"))
     return errors + duplicates.get(task.name, [])
 
 
@@ -321,8 +331,16 @@ def lint_candidate(task: Path, candidate: dict, verification: dict | None = None
         errors.append("候选仍请求补证，先执行 probe 并刷新材料")
     errors += draft_errors(task, audit, feedback, peer_feedback(task))
     if verification is not None:
+        report = fbr_style.write_report(
+            task, str(feedback.get("feedback", "")), feedback.get("score"),
+            verification.get("language_review"), require_review=True)
+        errors += [row["message"] for row in report["errors"]]
         errors += quality.report_errors(verification)
         errors += quality.claim_report_errors(verification, feedback, task)
+    else:
+        fbr_style.write_report(
+            task, str(feedback.get("feedback", "")), feedback.get("score"),
+            require_review=False)
     return {"task_id": task.name, "state": "ok" if not errors else "repairing",
             "errors": list(dict.fromkeys(errors)), "detail": "Feedback 候选本地预检通过" if not errors else
             "按 errors 修复后重新 lint；平台提交预检仍会实时核对 schema、附件和账号"}
@@ -346,6 +364,8 @@ def validation_report(task: Path, stage: str, result: dict) -> Path:
             key = "score_basis"
         elif any(word in error for word in ("查重", "模板", "骨架", "相同片段")):
             key = "duplicates"
+        elif any(word in error for word in ("黑话", "抽象", "语言", "数字", "精确值", "完成度", "AI 腔", "套话")):
+            key = "language_style"
         else:
             key = "structure"
         groups.setdefault(key, []).append(error)
@@ -450,6 +470,7 @@ def prepare_task_agent(task: Path, *, allow_platform_repair: bool = False) -> di
                   },
                   'verification_contract': {'task_agent': 'current_task_agent', 'binding': binding,
                       'candidate_sha': 'lib.content_hash(candidate)', 'checks': list(quality.CHECKS),
+                      'language_review': '填写 criterion_sentence、translated_terms、retained_terms；criterion_sentence 必须逐字出现在正文',
                       'process_evidence': '每个 process 句绑定真实 steps 及 tool/assistant evidence；复核引用同一原始摘录',
                       'claim_reviews': '按 public_units 完整逐句回查；trace 来源必须带 start_line、end_line、block 和原文'},
                   'detail': '当前任务 AI 检查产物、评分、撰写及复核 Feedback；本阶段不调用 reviewer.env'}
@@ -486,7 +507,12 @@ def finalize(task: Path, candidate: dict, verification: dict, *, publish=True,
     if not isinstance(audit, dict) or not isinstance(feedback, dict):
         raise lib.FbrError('候选缺少 audit 或 feedback')
     errors += draft_errors(task, audit, feedback, peer_feedback(task))
+    style_report = fbr_style.write_report(
+        task, str(feedback.get("feedback", "")), feedback.get("score"),
+        verification.get("language_review"), require_review=True)
+    errors += [row["message"] for row in style_report["errors"]]
     errors += quality.report_errors(verification) + quality.claim_report_errors(verification, feedback, task)
+    errors = list(dict.fromkeys(errors))
     history_path = task/'review/task-agent-history.json'
     history = lib.load_json(history_path, default={'attempts': []})
     attempt = {'at': lib.now_iso(), 'candidate': candidate, 'verification': verification, 'errors': errors}
@@ -560,6 +586,10 @@ def finalize(task: Path, candidate: dict, verification: dict, *, publish=True,
                'provider': 'current_task_agent', 'model': 'current_task_agent', 'reasoning_effort': 'session',
                'at': lib.now_iso(), 'source_inputs': source_inputs,
                'trace_check_sha': file_sha(task / fbr_evidence.CHECK),
+               'language_policy_version': fbr_style.VERSION,
+               'language_policy_sha': fbr_style.policy_sha(),
+               'language_review': verification.get('language_review'),
+               'style_report_sha': file_sha(task / fbr_style.REPORT_FILE),
                'audit_sha': file_sha(task/'evidence/audit.json'), 'feedback_sha': file_sha(task/'review/feedback.json')}
     lib.save_json(task/'review/quality.json', {**receipt, 'version': quality.VERSION, 'state': 'accepted',
                   'checks': verification['checks'], 'claim_reviews': verification['claim_reviews']})

@@ -15,6 +15,7 @@ import re
 from difflib import SequenceMatcher
 
 import fbrlib as lib
+import fbr_style
 
 VERDICTS = ("做到", "有问题", "看不出来")
 LEVELS = ("未实现", "明显", "细节")
@@ -306,7 +307,7 @@ def check_score(score, facts: dict, audit: dict, ev: dict, gate: dict) -> tuple[
 
 # ---------- Feedback 正文 ----------
 
-def check_text(text: str, prompt: str, gate: dict) -> tuple[list[str], list[str]]:
+def check_text(text: str, prompt: str, gate: dict, *, enforce_language: bool = True) -> tuple[list[str], list[str]]:
     errors, warnings = [], []
     body = (text or "").strip()
     if not body:
@@ -321,9 +322,21 @@ def check_text(text: str, prompt: str, gate: dict) -> tuple[list[str], list[str]
     def hits(words: list[str], skip_if_in_prompt: bool = False) -> list[str]:
         return [w for w in words if w in lowered and not (skip_if_in_prompt and w in prompt_low)]
 
+    if enforce_language:
+        style = fbr_style.review_text(body)
+        errors += [row["message"] for row in style["errors"]]
+        warnings += [row["message"] for row in style["warnings"]]
+    else:
+        for label, found in (
+            ("套话或 AI 腔的词", hits(AI_WORDS)),
+            ("没法核验的评价", hits(VAGUE_WORDS)),
+        ):
+            if found:
+                errors.append(f"出现{label}：" + " ".join(dict.fromkeys(found)))
+        if EMPTY_COMPLETENESS_RE.search(body):
+            errors.append("删除“未发现其他明确未完成功能”这类空泛完成度句；直接写完成了什么、没完成什么或仍有哪项问题")
+
     for label, found in (
-        ("套话或 AI 腔的词", hits(AI_WORDS)),
-        ("没法核验的评价", hits(VAGUE_WORDS)),
         ("内部口径词", hits(INTERNAL_WORDS)),
         ("指代题目的说法", hits(TOPIC_WORDS)),
         ("运行环境或录屏现场的词（任务本身没提到）", hits(HARNESS_WORDS, True)),
@@ -342,8 +355,6 @@ def check_text(text: str, prompt: str, gate: dict) -> tuple[list[str], list[str]
         errors.append("正文里不写验收人自己（我、我们、本人）")
     if body.count("模型") > 1:
         errors.append("正文里“模型”最多出现一次，第一次点明主体后改用“它”承接或省略主语")
-    if EMPTY_COMPLETENESS_RE.search(body):
-        errors.append("删除“未发现其他明确未完成功能”这类空泛完成度句；直接写完成了什么、没完成什么或仍有哪项问题")
     if not MODEL_PROCESS_RE.search(body):
         errors.append("正文缺少模型实现或验证过程的具体行为句")
     model_sentences = [sentence for sentence in sentences(body) if "模型" in sentence]

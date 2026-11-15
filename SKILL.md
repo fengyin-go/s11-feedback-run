@@ -171,13 +171,13 @@ fbr_record.py --batch b1110-01                       # --redo 重录
 
 ## 5. 打分与 Feedback
 
-先读 [references/reviewer.md](references/reviewer.md)、`references/scoring.md` 和 `references/feedback-writing.md`。**只有轨迹分析使用 `reviewer.env`（默认 `gpt-6.1-sol`）**。过程证据核查、需求完成判断、产物验收、交付完整性评分、Feedback 撰写、产物断言逐句复核、门闸修复均由推进任务的当前 AI 完成，不通过该配置调用其他模型，也不固定另一个产物验收模型。人工 spotcheck 仍由实际审核人完成。
+先读 [references/reviewer.md](references/reviewer.md)、`references/scoring.md`、`references/feedback-writing.md` 和 `references/feedback-language-policy.md`。**只有轨迹分析使用 `reviewer.env`（默认 `gpt-6.1-sol`）**。过程证据核查、需求完成判断、产物验收、交付完整性评分、Feedback 撰写、产物断言逐句复核、门闸修复均由推进任务的当前 AI 完成，不通过该配置调用其他模型，也不固定另一个产物验收模型。人工 spotcheck 仍由实际审核人完成。
 
 提交或平台返修前还要通过 [references/feedback-platform-style.md](references/feedback-platform-style.md) 的本地风格检查。4 分正文必须明确写出扣分对应的失败或返工后果，并留下至少一个真实文件、命令、对象或返回值；测试层级和总数不能代替具体行为验证。系统会拦截已知的业务速记、终端成功输出和过密精确数值。
 
 1. `fbr_feedback.py card` 汇集题面、需求点、测试对比、演示结果、改动与轨迹索引。
 2. `fbr_reviewer.py review` 自动先对全部主/子轨迹及获准续写做一次全量摄取，建立事件图和精确偏移；reviewer 只读事件包，并按行号/block 回查候选原文，保存带精确出处、完整后续状态和调用回执的 `review/trace-analysis.json`，随后返回 `needs_task_agent` 检查点。轨迹配置未填写 `model` / `reasoning_effort` 时沿用 `gpt-6.1-sol` / `high`；不可用时只暂停这一阶段，不伪造分析。
-3. 当前任务 AI 默认读取 `review/task-agent-brief.md`、当前阶段 brief、相关代码 hunk 和真实实跑材料，判需求完成情况与评分。先写 `review/decision-input.json`，再运行 `fbr_reviewer.py build` 展开并 lint；只有排错或迁移时才手写完整 candidate。代码已能确证的问题不重复跑服务；缺证据则用既有 probe 补齐后刷新 card 和检查点。5 分仍须至少两个不同的、题面未明说的有效边界 probe。
+3. 当前任务 AI 默认读取 `review/task-agent-brief.md`、当前阶段 brief、相关代码 hunk 和真实实跑材料，判需求完成情况与评分。先写 `review/decision-input.json`，同时填写 `language_review`：最关键业务约束原句、黑话改写和必要业务词；再运行 `fbr_reviewer.py build` 展开并 lint。只有排错或迁移时才手写完整 candidate。代码已能确证的问题不重复跑服务；缺证据则用既有 probe 补齐后刷新 card 和检查点。5 分仍须至少两个不同的、题面未明说的有效边界 probe。
 4. 当前任务 AI 另做产物与文字复核轮，按 `public_units` 逐句拆出断言，核对原始连续摘录、后续修正、最终影响，以及七项语义要求，保存绑定候选和检查点的 verification。每个 `process` 句除真实 `steps` 外还必须写 `evidence`，逐条指定 `kind=tool`、step、`target/output/error/tool` 字段和原始连续摘录；没有工具步骤时用 `kind=assistant` 绑定真实助手文本。`claim_reviews.sources` 中凡是 `trace/projects/*.jsonl`，必须同时写 `start_line`、`end_line`、`block` 和 `excerpt`。独立复核轮必须引用同一摘录，并通过 `fbr_evidence.py fetch/verify` 回查精确原始区间，不能复读整份原始轨迹。过程句还必须按 [模型过程归因审计](references/process-attribution-audit.md) 完成 `process_audit`：逐句确认主体是模型、基线行为没有被误归给模型、时间线覆盖后续修改、验收 probe/录屏没有混入模型动作，并对“只、仅、从未、收尾”等范围或时序表述扫描完整轨迹。不得将自报“通过”代替逐句证据，不得冒称另一个模型或独立审核人完成。细节见 [reviewer.md](references/reviewer.md) 和 [feedback-quality.md](references/feedback-quality.md)。
 5. `fbr_reviewer.py finalize` 只做确定性校验，不读取 `reviewer.env` 或调用外部模型；通过后保存 `audit.json`、`feedback.json`、`model-review.json` 与 `quality.json`，执行门闸、刷新本地表并主动推送快照，再核查交付字段；明确本地模式时使用 `--no-publish`。失败返回具体错误，由当前任务 AI 继续修复、补证和复验；材料、规则或正文变化须重新核实，不给旧记录补盖新回执。
 
@@ -190,13 +190,14 @@ fbr_evidence.py fetch  --task /absolute/path/to/batches/b1110-01/<任务目录> 
 fbr_reviewer.py review --batch b1110-01 --task s11-000123 --execute
 fbr_reviewer.py build --batch b1110-01 --task s11-000123 --decision /absolute/path/to/review/decision-input.json
 fbr_reviewer.py lint --batch b1110-01 --task s11-000123 --candidate /path/to/candidate.json
+fbr_style.py check --text '待检查的 Feedback 正文'
 fbr_feedback.py probe --batch b1110-01 --task s11-000123 --cmd 'node bin/cli.js pack fixtures/empty.mp4'
 fbr_score_audit.py scan --batch b1110-01
 fbr_score_audit.py probe --batch b1110-01 --task s11-000123 --cmd '<复现命令>' --side both
 fbr_feedback.py gate  --batch b1110-01
 ```
 
-候选 Feedback 必须先通过 `fbr_reviewer.py lint`。它提前执行 finalize 的确定性检查、平台已公开的 AI 文风检查及 `requirements_status` 需求覆盖检查；平台提交前仍会重新登录、读取实时 schema 并核对附件和账号，不能省略。
+候选 Feedback 必须先通过 `fbr_reviewer.py lint`。它提前执行 finalize 的确定性检查、统一语言策略、平台已公开的 AI 文风检查及 `requirements_status` 需求覆盖检查。语言命中和改写建议写入 `review/style-report.json`，正文变化即失效；平台提交前仍会重新登录、读取实时 schema 并核对附件和账号，不能省略。
 
 已有 4 分记录不得按比例降为 3。需要降 3 时，先用 `fbr_score_audit.py` 扫描候选并在初始基线和产物上跑同一 probe，保存结果或过程失败证据；`validate` 通过后，当前任务 AI 才能修改 audit 严重度、score、Feedback 并重新过闸。规范见 [4 分到 3 分的证据审计](references/downgrade-audit.md)。
 
@@ -216,7 +217,8 @@ Feedback 的硬底线：
 - 结果先按需求说明用户可观察的完成、部分完成、缺失和问题；过程最多 3 句，只保留最有解释力的真实失败、修正和最终影响。已修正的小问题不自动扣分，验证不足不等于功能失败。
 - 每个问题句和过程句必须有真实锚点。过程 evidence 必须落在指定步骤的真实输入/输出；逐句复核必须回到同一原始区间并检查完整后续和最终状态。
 - 5 分必须与正文呈现一致；正文若写出首测失败、错误断言、核心返工或关键竞争未验证，最高 4 分。
-- 正文自然、具体、避免固定骨架和字段拼句；测试数量必须绑定同次输出，不能拿全仓总数代替本题行为。
+- 正文自然、具体，不写公司黑话、抽象名词清单、空泛完成度和机器报告字段；统一规则见 `feedback-language-policy.md` 和 `feedback-style-lexicon.json`。测试数量必须绑定同次输出，不能拿全仓总数代替本题行为。
+- `language_review.criterion_sentence` 必须逐字出现在正文，说明本轮最看重的业务约束；词表命中必须改写后重新核对证据，不能自动换词。
 - `requirements_status` 必须覆盖全部需求，状态只能为 completed/partial/missing/unverified，并与 audit 一致。
 - 写作、评分、文风和查重细则分别以 `feedback-writing.md`、`scoring.md`、`feedback-platform-style.md` 和 `feedback-calibration.md` 为准。
 
@@ -273,7 +275,7 @@ fbr_sheet.py --batch b1110-01                       # 确认回执后回填媒�
     evidence/ facts.json audit.json probes.jsonl
     review/   snapshot.json diff.patch card.md task-agent-brief.md candidate-schema.json feedback.json
               model-review.json quality.json metrics.json task-agent-work.json task-closeout.json
-              decision-input.json candidate.json verification.json validation-errors.json
+              decision-input.json candidate.json verification.json style-report.json validation-errors.json
               build-errors.json lint-errors.json upload-plan.json
               task-agent-history.json task-agent-history/objects/ probe-requests.json gate.json
               spotcheck.json submit-preflight.json upload.json
@@ -288,7 +290,7 @@ fbr_sheet.py --batch b1110-01                       # 确认回执后回填媒�
     trace/    ids.json projects/...        原样复制主会话与子会话 JSONL
     record/   recording.mp4 recording.json
     evidence/ facts.json audit.json probes.jsonl
-    review/   feedback.json model-review.json quality.json gate.json spotcheck.json（仅当前正文版本）
+    review/   feedback.json model-review.json quality.json style-report.json gate.json spotcheck.json（仅当前正文版本）
 <root>/_registry/baseline-tests/<完整身份摘要>.json  基线、镜像、命令、架构与脚本版本绑定的缓存
 <root>/_registry/platform-schema/<fingerprint>.json  实时 schema 完整快照
 <root>/_registry/delivered-feedback.jsonl           已交付的 Feedback（查重用，每行 {task_id, feedback}）

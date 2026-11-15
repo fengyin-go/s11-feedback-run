@@ -24,6 +24,7 @@ import fbrlib as lib  # noqa: E402
 import fbr_evidence  # noqa: E402
 import fbr_gate as gate  # noqa: E402
 import fbr_reviewer as reviewer  # noqa: E402
+import fbr_style  # noqa: E402
 
 AUDIT_TEMPLATE = {
     "requirements": [{"id": "R1", "verdict": "做到 | 有问题 | 看不出来", "level": "未实现 | 明显 | 细节（只在有问题时写）",
@@ -100,6 +101,13 @@ def decision_template(task_dir: Path) -> dict:
             "lowest_supported_score": 4, "lower_score_rejected": "", "anchors": [],
         },
         "claims": [],
+        "language_review": {
+            "reviewed": False,
+            "criterion_sentence": "",
+            "translated_terms": [],
+            "retained_terms": [],
+            "note": "",
+        },
         "quality_checks": {name: {"passed": False, "reason": ""} for name in (
             "result_and_process", "task_specific_voice", "test_relevance",
             "score_alignment", "evidence_fidelity", "scope_discipline", "non_template")},
@@ -108,6 +116,7 @@ def decision_template(task_dir: Path) -> dict:
         "template_notes": {
             "trace_reference": "claims[].sources[] 写 path/excerpt；脚本只在摘录唯一时自动补行号和 block",
             "process_audit": "process[] 内写 audit:{checks:{full_trace,baseline,timeline,source_boundary,scope},note}",
+            "language_review": "criterion_sentence 必须逐字出现在正文；translated_terms 登记黑话改写，retained_terms 登记必须保留的业务词",
         },
     }
 
@@ -246,6 +255,7 @@ def expand_decision(task_dir: Path, decision: dict) -> tuple[dict, dict]:
         "binding": work.get("binding"),
         "candidate_sha": lib.content_hash(candidate),
         "checks": checks,
+        "language_review": decision.get("language_review") or {},
         "claim_reviews": [
             {key: row.get(key) for key in
              ("sentence", "assertions", "verdict", "reason", "later_check", "sources")}
@@ -359,7 +369,8 @@ def build_card(record: dict, facts: dict, probes: list[dict]) -> str:
     out += ["", "## 要写的两份文件", "", "evidence/audit.json：", "", "```json",
             json.dumps(AUDIT_TEMPLATE, ensure_ascii=False, indent=2), "```", "", "review/feedback.json：", "", "```json",
             json.dumps(FEEDBACK_TEMPLATE, ensure_ascii=False, indent=2), "```", "", ANCHOR_HELP, "",
-            "打分口径见 references/scoring.md，正文写法见 references/feedback-writing.md。"]
+            "打分口径见 references/scoring.md，正文写法见 references/feedback-writing.md，"
+            "企业黑话和机器报告感见 references/feedback-language-policy.md。"]
     return "\n".join(out) + "\n"
 
 
@@ -368,6 +379,7 @@ def build_brief(record: dict, facts: dict, probes: list[dict]) -> str:
     tests, changes, check, claims = facts["tests"], facts["changes"], facts["verification"], facts["claims"]
     out = [f"# {record['task_id']} 验收决策包", "",
            "原始轨迹、facts 和历史只用于定向查询，不整文件朗读。每条过程结论必须绑定原始 trace 的行号、block 和连续原文。", "",
+           "## 写 Feedback 前先过语言关", "", *fbr_style.generation_guidance(), "",
            "## 题面", "", record["prompt"].strip(), "", "## 需求", ""]
     for req in record["requirements"]:
         out.append(f"- {req['id']}：{req.get('text', '')}")
@@ -406,7 +418,8 @@ def build_brief(record: dict, facts: dict, probes: list[dict]) -> str:
             "- 事件包：`trace/review-pack.json`",
             "- 候选结构：`review/candidate-schema.json`",
             "- 完整 diff：只在需要核验具体改动时按文件和 hunk 查看，不整份朗读。",
-            "- 打分与写作口径：只读取当前阶段需要的规范，不重复加载其他阶段文档。"]
+            "- 打分与写作口径：只读取当前阶段需要的规范，不重复加载其他阶段文档。",
+            "- 语言检查：先写 `language_review`，再运行 build/lint；具体命中看 `review/style-report.json`。"]
     return "\n".join(out) + "\n"
 
 
@@ -485,12 +498,13 @@ def gate_task(task_dir: Path, cfg: dict) -> dict:
     conf = cfg["feedback_gate"]
     ev = gate.build_evidence(record, facts, audit, load_probes(task_dir))
     quality_receipt = lib.load_json(task_dir / "review/quality.json", default={})
+    enforce_language = bool(quality_receipt.get("language_policy_version"))
     if isinstance(quality_receipt.get("version"), int) and quality_receipt["version"] >= 12:
         out["errors"] += fbr_quality.requirements_status_errors(doc, record, audit, ev)
     for errors, warnings in (
         gate.check_audit(audit, record, ev),
         gate.check_score(doc.get("score"), facts, audit, ev, conf),
-        gate.check_text(out["text"], record["prompt"], conf),
+        gate.check_text(out["text"], record["prompt"], conf, enforce_language=enforce_language),
         gate.check_feedback(doc, record, facts, audit, ev, conf),
     ):
         out["errors"] += errors

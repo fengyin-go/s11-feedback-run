@@ -15,9 +15,11 @@ SUPPORTED_CERTIFICATE_VERSIONS = {12, 13}
 CHECKS = ("result_and_process", "task_specific_voice", "test_relevance", "score_alignment",
           "evidence_fidelity", "scope_discipline", "non_template")
 RULE_FILES = ("references/scoring.md", "references/feedback-writing.md", "references/feedback-calibration.md",
-              "references/feedback-quality.md", "references/process-attribution-audit.md",
+              "references/feedback-quality.md", "references/feedback-platform-style.md",
+              "references/feedback-language-policy.md", "references/feedback-style-lexicon.json",
+              "references/process-attribution-audit.md",
               "scripts/fbr_gate.py", "scripts/fbr_quality.py",
-              "scripts/fbr_feedback.py", "scripts/fbr_reviewer.py",
+              "scripts/fbr_feedback.py", "scripts/fbr_reviewer.py", "scripts/fbr_style.py",
               "scripts/fbr_trace_review.py", "scripts/fbr_sources.py", "scripts/fbr_evidence.py")
 TRACE_RULE_FILES = ("scripts/fbr_trace_review.py", "scripts/fbr_sources.py", "scripts/fbr_evidence.py")
 LEGACY_TRACE_POLICIES = {
@@ -25,6 +27,7 @@ LEGACY_TRACE_POLICIES = {
     "41e8cc299da551d1c8f22773ec0b0307262ddd13f5eb41cb2903b3bcc68d1e72",
 }
 LEGACY_FEEDBACK_POLICIES = {
+    "4f8b031762278016d5e63cb784fd04bc2b2f921b33b9a7dda52082fb1427f95e",
     "6a50956ab20e9c7567e9397be7e7be8d3183d84981786b9899809a6c016111d4",
     "e7f4586b18419b0ae217edcfc1e3c6a2f8192810d77b032c11b2e27378882ff2",
 }
@@ -512,7 +515,8 @@ def certificate_errors(task: Path, receipt: dict) -> list[str]:
     if receipt.get("policy_sha") not in allowed or cert.get("policy_sha") not in allowed:
         return ["Feedback 规则已更新，须按当前规则重新生成并复核"]
     keys = ["workflow", "trace-analysis_sha", "source_inputs", "model", "reasoning_effort",
-            "provider", "inputs", "audit_sha", "feedback_sha"]
+            "provider", "inputs", "audit_sha", "feedback_sha", "language_policy_version",
+            "language_policy_sha", "language_review", "style_report_sha"]
     if cert.get("version", 0) >= 13:
         keys.append("trace_check_sha")
     for key in keys:

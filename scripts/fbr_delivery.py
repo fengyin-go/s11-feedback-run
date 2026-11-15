@@ -160,6 +160,9 @@ def _session_file(task_dir: Path) -> str:
 
 def _source_files(task_dir: Path, feedback_sha: str) -> list[Path]:
     files = [task_dir / name for name in FILES if safe_file(task_dir, task_dir / name)]
+    style_report = task_dir / "review/style-report.json"
+    if style_report.is_file() and safe_file(task_dir, style_report):
+        files.append(style_report)
     revision_sources = task_dir / 'evidence/field-revisions'
     if revision_sources.is_symlink():
         raise lib.FbrError('字段修订证据目录不能是符号链接')

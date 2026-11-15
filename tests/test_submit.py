@@ -343,7 +343,7 @@ class PlatformStyle(unittest.TestCase):
         self.assertTrue(any("测试层级" in item for item in
                             submit.platform_style_problems("领域测试、服务层测试和生产构建全部通过。")))
         self.assertTrue(any("条数、次数和项数密度过高" in item for item in
-                            submit.platform_style_problems("保留两条、三条，重复两次，再跑两轮。")))
+                            submit.platform_style_problems("保留两条、三条、四条，重复两次，再跑两轮。")))
         self.assertTrue(any("精确数值过密" in item for item in
                             submit.platform_style_problems("等待 48 小时，保留 90 天，释放 280GB。")))
         self.assertTrue(any("终端成功输出" in item for item in

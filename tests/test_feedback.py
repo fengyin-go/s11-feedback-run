@@ -52,7 +52,8 @@ class Card(FlowCase):
             "- 回答里提到、产物里没有的文件：docs/usage.md",
             "还没有。验证需求点和试边界用 `fbr_feedback.py probe`",
             '{"type": "missing", "path": "docs/x.md"}',
-            "打分口径见 references/scoring.md，正文写法见 references/feedback-writing.md。",
+            "打分口径见 references/scoring.md，正文写法见 references/feedback-writing.md，"
+            "企业黑话和机器报告感见 references/feedback-language-policy.md。",
         ):
             self.assertIn(line, text)
         self.assertNotIn("产物上测试输出的末尾", text)
