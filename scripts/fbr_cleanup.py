@@ -278,7 +278,7 @@ def _task_active(task_dir: Path) -> str:
 
 
 def _cleanup_candidates(root: Path, task_dir: Path) -> list[Path]:
-    candidates = [task_dir / "origin", task_dir / "workspace"]
+    candidates = [task_dir / "origin", task_dir / "workspace", task_dir / "run-tree"]
     run_dir = task_dir / "run"
     if run_dir.is_dir():
         candidates.extend(path for path in sorted(run_dir.iterdir())

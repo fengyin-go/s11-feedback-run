@@ -128,15 +128,22 @@ class RunOne(DockerCase):
         self.assertEqual(command[command.index("--name") + 1], "s11-000001")
         self.assertEqual(command[command.index("--env-file") + 1], str(self.key_file))
         self.assertEqual(command[command.index("--mount") + 1],
-                         f"type=bind,src={(task_dir / 'workspace').resolve()},dst=/workspace")
+                         f"type=bind,src={(task_dir / 'run-tree').resolve()},dst=/workspace")
         for flag in ("--init", "--restart=no", "--cap-drop", "ALL", "--security-opt", "no-new-privileges"):
             self.assertIn(flag, command)
         self.assertFalse(any(KEY in part for call in self.docker.calls for part in call))   # key 不进命令行
         self.assertEqual(outcome["stdin"], PROMPT)
         self.assertEqual((task_dir / "run" / "prompt.txt").read_text(encoding="utf-8"), PROMPT)
         self.assertTrue((task_dir / "run" / "git-config.before").is_file())
+        self.assertFalse((task_dir / "run-tree" / ".git").exists())
+        self.assertTrue((task_dir / "run-tree" / "src/clipcut/packer.py").is_file())
+        self.assertEqual(sh(task_dir / "workspace", "status", "--porcelain", "--ignored"), "")
+        self.assertEqual(sh(task_dir / "workspace", "rev-parse", "HEAD"), lib.load_task(task_dir)["initial_commit"])
         info = lib.require_stage(task_dir, "run")
         self.assertEqual((info["attempts"], info["session_id"]), (1, SID))
+        current = lib.load_json(task_dir / "run" / "current.json")
+        self.assertEqual(current["workspace_source"], "git-free-run-tree")
+        self.assertEqual(current["workspace_mount"], str((task_dir / "run-tree").resolve()))
         attempts = lib.load_json(task_dir / "run" / "attempts.json")
         self.assertEqual(attempts[0]["verdict"], "accept")
         self.assertNotIn("key_scrubbed", attempts[0])
@@ -153,7 +160,7 @@ class RunOne(DockerCase):
         def half_done(ws):
             write(ws / "half.txt", "half\n")
             write(ws / ".env", "LEFTOVER=1\n")
-            sh(ws, "config", "alias.zz", "status")
+            write(ws / ".git" / "config", "[alias]\n\tzz = status\n")
 
         self.docker.outcomes = [
             {"stdout": stream_text(SID, with_result=False), "stderr": "API Error: 529 overloaded\n", "rc": 1,
@@ -166,6 +173,7 @@ class RunOne(DockerCase):
         self.assertIn("529", (archive / "stderr.log").read_text())
         self.assertTrue(any((archive / "projects").rglob("*.jsonl")))
         self.assertIn("half.txt", (archive / "diff.patch").read_text())
+        self.assertNotIn(".git", (archive / "diff.patch").read_text())
         self.assertFalse((workspace / "half.txt").exists())
         self.assertFalse((workspace / ".env").exists())
         self.assertNotIn("alias", (workspace / ".git" / "config").read_text())

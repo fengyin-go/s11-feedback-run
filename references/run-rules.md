@@ -31,6 +31,7 @@
 - 任务仓库已发布，`task.json` 里有初始环境快照地址。
 - `task.json` 的镜像、Harness 版本和当前配置一致。
 - workspace 的 HEAD 就是初始提交，`git status --ignored` 完全干净。
+- 新运行从初始提交生成无 `.git` 的 `run-tree/`；依赖缓存只复制到运行树，不向模型暴露宿主 Git 元数据。
 - workspace 的路径不带逗号（`--mount` 用逗号分隔字段）。
 - 没有未核验的同名容器。已有 current 记录时先 `recover`，核对 PID 起始身份、题面/基线/仓库摘要、容器归属标签和 ID。活 worker 继续等；归属不符或无匹配退出回执则保留现场阻塞，不能直接删掉重跑。
 - `--limit` 必须是正整数；首题验证用 `--limit 1`，实际工作线程数也不会超过待运行题数。
@@ -39,7 +40,7 @@
 
 ```
 docker run -i -d --init --restart=no --cap-drop ALL --security-opt no-new-privileges \
-  --name <任务编号> --label solo11.owner=<任务绝对路径摘要> --mount type=bind,src=<workspace>,dst=/workspace \
+  --name <任务编号> --label solo11.owner=<任务绝对路径摘要> --mount type=bind,src=<run-tree>,dst=/workspace \
   --env-file <key 文件> --entrypoint sleep <镜像> infinity
 docker exec -i <任务编号> bash -c \
   'rm -rf /home/node/.claude/projects /home/node/.claude/todos /home/node/.claude/history.jsonl; exec /usr/local/bin/entrypoint.sh print' \
@@ -51,10 +52,10 @@ docker exec -i <任务编号> bash -c \
   （禁用斜杠命令、禁用记忆、空 MCP、固定六个工具、流式 JSON 输出）。只有明确检测到模型
   自行中断且有有效 SessionID，脚本才在同一容器用相同参数加 `--resume <首轮SessionID>`，
   stdin 严格为“继续”。正常结束、任务做错或一行没改都不触发续写。
-- 只挂这道题的 workspace。不挂用户目录、不挂 Claude 或 Codex 的配置、不挂别的题。
+- 只挂这道题的无 Git 运行树。运行树从冻结初始提交导出，不含 `.git/config`、refs、objects、历史、hooks、远端或兄弟仓库线索。不挂用户目录、不挂 Claude 或 Codex 的配置、不挂别的题。
 - 不加 `--rm`：容器退出后轨迹还在容器里，要等导出。
 - 同一个容器只跑同一道题；中断续写是这道题的例外操作，不是新题。工程异常重跑仍须先导出旧容器，再停止、删除并新建容器。
-- 起跑前把 workspace 权限放开给容器里的用户（只动 workspace 自己，不动上级目录）。
+- 起跑前把 `run-tree/` 权限放开给容器里的用户（只动运行树自己，不动上级目录）。
 - 起跑前将 key 的 SHA256 指纹写入 `run/key-identity.json`，不保存 key 原文。收集时要求 key 文件仍可用、权限仍为 600、指纹与起跑一致；缺失、换 key、没有起跑指纹都拒绝收集，原件与容器保留。
 
 ## 什么情况重跑
@@ -76,7 +77,7 @@ docker exec -i <任务编号> bash -c \
 
 模型责任尝试含首次最多 3 次；物理运行编号独立递增。网关压力与基础设施故障不扣模型次数，分别最多 8 次和 3 次，达到相应上限转 deferred 并保留具体原因，不要求换题。未知历史故障保守计入模型次数，不凭曾有重试猜测归责。已明确授权的物理次数上限仍为硬限制。重跑次数和原因保留在内部 run/attempts.json 与 run/retry-ledger.json；备注只允许轨迹核实的中断后“继续”说明和“模型运行时读取了 apikey”。
 
-不算数的那次：流式输出、stderr、轨迹、当时的改动（`diff.patch`）整份归档到 `run/attempt-N/`，然后 workspace 恢复到初始提交（`reset --hard` + `clean -fdx`）。归档时轨迹导不出来就停下，容器留着，先解决导出的问题。
+不算数的那次：流式输出、stderr、轨迹、运行树改动（`diff.patch`）整份归档到 `run/attempt-N/`，然后删除本次 `run-tree/`，workspace 恢复到初始提交（`reset --hard` + `clean -fdx`）。归档时轨迹导不出来就停下，容器留着，先解决导出的问题。
 
 ## 收集（R2）
 
@@ -99,19 +100,20 @@ docker exec -i <任务编号> bash -c \
 
 ## 产物快照（R3）
 
-任务文档的口径：模型自己提交了多次就填最后一个，不要 squash；初始环境快照必须是它的祖先提交。
+任务文档的口径：新批次的模型运行目录不含 `.git`，模型提交数为 0；宿主机先把运行树的新增、修改、删除同步到 Git workspace，再生成快照提交。旧批次 workspace 里已有的模型提交继续按原口径保留，不 squash。初始环境快照必须是最终产物提交的祖先。
 
 1. 恢复 workspace 的 git 配置：`.git/config` 换回起跑前的备份（`run/git-config.before`），新出现的钩子挪走。没有备份就拒绝继续。之后宿主机上的 git 调用都带 `core.hooksPath=/dev/null`、`core.fsmonitor=false`。
    只接受独立 `.git` 目录；`.git` 链接或文件、`commondir`、`gitdir`、`worktrees`、`config.worktree`（包括悬空符号链接）均拒绝在宿主机执行 git，防止 Git 从别处加载未备份的配置。
-2. 扫描要进提交的文件：
+2. 把 `run-tree/` 同步到 workspace：以初始提交的跟踪文件清单为基线处理新增、修改和删除；新文件按冻结基线的 `.gitignore` 判定；运行树中的 `.git`、`.claude` 和依赖目录不进入交付。
+3. 扫描要进提交的文件：
    - 文件名像密钥的（`.env`、`*.pem`、`id_rsa`、`credentials*` 这一类）；
    - 内容里有网关 key 原文，或 token 形态的字符串；
    - 单个文件超过 50MB。
    命中就停，列出文件。确实是仓库本来就该带的样例（比如测试用的假证书），在 `review/secret-waivers.json` 写明路径和理由后重跑。真的是密钥就不要自己动手删改，那是在改模型的产物；把情况报给人决定这题怎么处理。
-3. 工作区里嵌套的 git 仓库不进快照，路径记进内部 `excluded`，不进入备注。
-4. 模型没提交的改动由宿主机补一个提交收走，作者用 `settings.json` 里的 `git_user_name` / `git_user_email`。模型自己的提交一个不动。
-5. 初始提交不是最终提交的祖先（模型 rebase、reset 或重建了仓库）时，用最终的文件树在初始提交上新建一个提交，`history_rewritten` 记真。
-6. 新运行必须先通过零代码改动检查；零改动不能进入新一轮评分交付。快照中的 `no_change` 仅保留对历史材料和独立快照工具的兼容，不能替代运行有效性门禁。
+4. 工作区里嵌套的 git 仓库不进快照，路径记进内部 `excluded`，不进入备注。运行树里由模型自行创建的 `.git` 只记录 `model_git_created`，不进入交付。
+5. 新批次由宿主机生成一次快照提交，作者用 `settings.json` 里的 `git_user_name` / `git_user_email`。旧批次仍保留原有模型提交。
+6. 初始提交不是最终提交的祖先（仅旧批次可能出现）时，用最终的文件树在初始提交上新建一个提交，`history_rewritten` 记真。
+7. 新运行必须先通过零代码改动检查；零改动不能进入新一轮评分交付。快照中的 `no_change` 仅保留对历史材料和独立快照工具的兼容，不能替代运行有效性门禁。
 
 推送（`fbr_snapshot.py push`）：
 
@@ -187,7 +189,7 @@ Web 工程必须录真实服务启动再到页面访问和功能操作；构建/
 
 ## S11 单份 main 交接
 
-`s11-gsb-prompt-create` 新批次先完成 `prepare_handoff.py`；运行脚本只用该批 task.json 的原文题面和同级 workspace。每题 origin 保留基准提交，workspace 在 main 的相同初始提交起跑，不创建 A/B 容器。origin 的预检依赖不挂到跑题容器，workspace 必须连忽略文件也没有。工程异常重跑与获准“继续”仍属于同一道题的记录，不能当成第二侧产物。产物推同一 main，初始快照使用 commit SHA。
+`s11-gsb-prompt-create` 新批次先完成 `prepare_handoff.py`；运行脚本只用该批 task.json 的原文题面和宿主 workspace，在运行前把同一初始提交导出成无 `.git` 的 run-tree。每题 origin 保留基准提交，workspace 在 main 的相同初始提交等待运行树回填，不创建 A/B 容器。origin 的预检依赖不挂到跑题容器，生成运行树时只把依赖缓存复制到运行树。工程异常重跑与获准“继续”仍属于同一道题的记录，不能当成第二侧产物。产物推同一 main，初始快照使用 commit SHA。
 
 ## 共享调度与证据版本
 

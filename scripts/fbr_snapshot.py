@@ -6,7 +6,8 @@
     fbr_snapshot.py push   --batch b1110-01 --execute --confirm PUBLISH       # 真推
 
 规则：
-- 模型自己的提交原样保留，不 squash、不 rebase、不强推；宿主机只在它后面补一个提交收走没提交的改动。
+- 新批次先把无 .git 运行树同步回宿主 Git workspace，再由宿主机生成快照提交。
+- 新批次的模型 Git 提交数固定为 0；旧批次 workspace 中已有的模型提交仍原样保留，不 squash、不 rebase、不强推。
 - 初始提交必须是产物提交的祖先。模型改写了历史时，用它最终的文件树在初始提交上另建一个提交，并记入内部快照证据，不进入对外备注。
 - 提交前扫密钥：网关 key 原文、.env 和各类密钥文件、token 形态的字符串。命中就停，等人看。
 - 推送的 token 只从 gh 登录态按账号取，走环境变量，不落盘、不打印；推完回读远端 SHA 和可见性。
@@ -26,6 +27,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import fbrlib as lib  # noqa: E402
+import fbr_run_tree  # noqa: E402
 
 COMMIT_MESSAGE = "snapshot: workspace state after the run"
 MAX_FILE_BYTES = 50 * 1024 * 1024
@@ -102,19 +104,27 @@ def commit_one(task_dir: Path, cfg: dict) -> dict:
     if lib.stage_ok(task_dir, "commit"):
         return {"task_id": name, "state": "skip", "detail": "已经提交过"}
     lib.require_stage(task_dir, "collect")
-    hygiene = lib.restore_git_config(task_dir)
+    integration = None
+    if fbr_run_tree.enabled(task_dir):
+        try:
+            integration = fbr_run_tree.integrate(task_dir, record, cfg)
+        except lib.FbrError as exc:
+            lib.set_stage(task_dir, "commit", "failed", problems=[str(exc)])
+            return {"task_id": name, "state": "blocked", "detail": str(exc)}
+    hygiene = integration.get("git_hygiene") if integration else lib.restore_git_config(task_dir)
     head = lib.git_out(workspace, "rev-parse", "HEAD")
     branch = lib.git(workspace, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
     rewritten = lib.git(workspace, "merge-base", "--is-ancestor", initial, head).returncode != 0
     model_commits = 0 if rewritten else int(lib.git_out(workspace, "rev-list", "--count", f"{initial}..{head}"))
 
     lib.git_out(workspace, "add", "-A")
-    excluded = []
+    excluded = list((integration or {}).get("excluded", []))
     for line in lib.git_out(workspace, "diff", "--cached", "--raw", "--no-abbrev", "HEAD").splitlines():
         parts = line.split("\t", 1)
         if len(parts) == 2 and parts[0].split()[1] == "160000":      # 工作区里嵌了别的 git 仓库
             lib.git_out(workspace, "rm", "--cached", "-f", "-q", "--", parts[1])     # 只退出暂存区，不删文件
             excluded.append(parts[1])
+    excluded = sorted(set(excluded))
     tree = lib.git_out(workspace, "write-tree")
     waived = {item["path"] for item in lib.load_json(task_dir / "review" / "secret-waivers.json", default=[])
               if isinstance(item, dict) and item.get("path") and item.get("reason")}
@@ -158,6 +168,9 @@ def commit_one(task_dir: Path, cfg: dict) -> dict:
         "model_commits": model_commits, "host_commit": host_commit, "history_rewritten": rewritten,
         "no_change": commit == initial, "changed_files": len(changed), "excluded": excluded,
         "git_hygiene": hygiene, "committed_at": lib.now_iso(), "pushed": False, "artifact_snapshot": "",
+        "workspace_source": "git-free-run-tree" if integration else "git-workspace",
+        "run_tree_files": (integration or {}).get("files", []),
+        "model_git_created": (integration or {}).get("model_git_created", False),
     }
     lib.save_json(review / "snapshot.json", snapshot)
     lib.set_stage(task_dir, "commit", "ok", commit=commit)

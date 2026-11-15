@@ -8,9 +8,10 @@
 
 边界：
 - 一题一个新容器，容器名就是任务编号；不加 --rm，轨迹导出并核对通过后才 docker rm（不带 -f）。
+- 模型只挂载从初始提交生成的无 .git 运行树；宿主 Git workspace 在运行期间不变。
 - key 只通过 --env-file 传入；输出或轨迹出现 key 时保留原始材料并记为“读取了 apikey”，允许交付。
 - 模型中断可在同一会话累计最多继续两次；工程异常和零代码改动归档重跑，含首次最多 max_attempts 次。
-- 重跑前把这次的轨迹和改动归档到 run/attempt-N/，导出失败就停下，不删容器。
+- 重跑前把这次的轨迹和运行树改动归档到 run/attempt-N/，导出失败就停下，不删容器。
 """
 
 from __future__ import annotations
@@ -36,6 +37,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import fbrlib as lib  # noqa: E402
 import fbr_trace  # noqa: E402
 import fbr_runtime as runtime
+import fbr_run_tree  # noqa: E402
 
 
 # ---------- R0 ----------
@@ -221,13 +223,19 @@ def ready_problems(task_dir: Path, record: dict, cfg: dict, *, prepared: bool = 
         problems += fbr_dependencies.snapshot_problems(workspace, record['initial_commit'])
     if not prepared and container_exists(record["task_id"]):
         problems.append(f"已有同名容器 {record['task_id']}：先确认它的轨迹导出过，再手动 docker rm")
+    if fbr_run_tree.enabled(task_dir):
+        try:
+            fbr_run_tree.validate(task_dir, record)
+        except lib.FbrError as exc:
+            problems.append(str(exc))
     return problems
 
 
 def run_command(task_dir: Path, record: dict, cfg: dict) -> list[str]:
+    source = fbr_run_tree.tree_dir(task_dir) if fbr_run_tree.enabled(task_dir) else task_dir / "workspace"
     return ["docker", "run", "-i", "-d", *lib.docker_hardening(), "--name", record["task_id"],
             "--label", "solo11.owner=" + lib.content_hash(str(task_dir.resolve())),
-            "--mount", lib.mount_arg(task_dir / "workspace"), "--env-file", str(lib.key_path(cfg)),
+            "--mount", lib.mount_arg(source), "--env-file", str(lib.key_path(cfg)),
             "--entrypoint", "sleep", record["image"], "infinity"]
 
 
@@ -268,17 +276,22 @@ def archive_attempt(task_dir: Path, record: dict, number: int, secret: str = "")
         removed = lib.run(["docker", "rm", name], timeout=60)
         if removed.returncode != 0:
             raise lib.FbrError(f"{name}：删除旧容器失败：{removed.stderr.strip()[:200]}")
-    lib.restore_git_config(task_dir)
-    lib.git(workspace, "add", "-A")
-    (target / "diff.patch").write_text(
-        lib.git(workspace, "diff", "--cached", record["initial_commit"]).stdout, encoding="utf-8")
-    lib.git_out(workspace, "reset", "--hard", record["initial_commit"])
-    lib.git_out(workspace, "clean", "-fdx")
+    if fbr_run_tree.enabled(task_dir):
+        fbr_run_tree.archive_patch(task_dir, record, target / "diff.patch")
+    else:
+        lib.restore_git_config(task_dir)
+        lib.git(workspace, "add", "-A")
+        (target / "diff.patch").write_text(
+            lib.git(workspace, "diff", "--cached", record["initial_commit"]).stdout, encoding="utf-8")
+        lib.git_out(workspace, "reset", "--hard", record["initial_commit"])
+        lib.git_out(workspace, "clean", "-fdx")
     lib.save_json(task_dir / "run/current.json", {"state": "archived", "attempt": number})
 
 
 def code_changes(task_dir: Path, record: dict) -> list[str]:
     """比较最终树；提交次数、改过又还原、缓存和文档均不能充作代码改动。"""
+    if fbr_run_tree.enabled(task_dir):
+        return fbr_run_tree.code_changes(task_dir, record)
     lib.restore_git_config(task_dir)
     workspace = task_dir / "workspace"
     lib.git_out(workspace, "add", "-A")
@@ -323,6 +336,19 @@ def prepared_problems(task_dir: Path, record: dict, cfg: dict, current: dict) ->
         + lib.TRACE_SRC + '").rglob("*"))))'], timeout=30)
     if sessions.returncode:
         return ['容器已有会话文件或无法检查会话，不能重新发送题面']
+    source = str((task_dir / 'workspace').resolve())
+    if current.get('workspace_source') == 'git-free-run-tree':
+        if not fbr_run_tree.enabled(task_dir):
+            return ['运行记录要求 Git-free 运行树，但运行树元数据缺失']
+        try:
+            fbr_run_tree.validate(task_dir, record)
+        except lib.FbrError as exc:
+            return [str(exc)]
+        source = str(fbr_run_tree.tree_dir(task_dir).resolve())
+    elif current.get('workspace_source') not in (None, 'git-workspace'):
+        return ['运行记录的 workspace_source 无法识别']
+    if current.get('workspace_mount') and current['workspace_mount'] != source:
+        return ['运行记录的挂载来源与当前运行树不一致']
     return ready_problems(task_dir, record, cfg, prepared=True)
 
 
@@ -530,7 +556,10 @@ def run_one(task_dir: Path, cfg: dict) -> dict:
         number = (resume or {}).get('attempt') or max([a.get('n', 0) for a in attempts] or [0]) + 1
         if legacy_grant and not use_legacy_progress_recovery(task_dir, number):
             return {"task_id": name, "state": "deferred", "detail": "进度恢复令牌已被消费"}
-        lib.open_permissions(task_dir / "workspace")
+        if not resume:
+            fbr_run_tree.prepare(task_dir, record, cfg)
+        source = fbr_run_tree.tree_dir(task_dir) if fbr_run_tree.enabled(task_dir) else task_dir / "workspace"
+        lib.open_permissions(source)
         started = lib.now_iso()
         lib.save_json(run_dir / "current.json", {**(resume or {}), "state": "starting", "attempt": number,
             "started_at": started, "owner_pid": os.getpid(), "owner_identity": runtime.process_identity(),
@@ -538,11 +567,10 @@ def run_one(task_dir: Path, cfg: dict) -> dict:
             "generation": lib.content_hash([record['prompt'], record['initial_commit'], record['task_repo_full']]),
             "script_sha": lib.content_hash({p.name: runtime.hashlib.sha256(p.read_bytes()).hexdigest()
                             for p in Path(__file__).parent.glob('*.py')}),
-            "image": record["image"], "image_id": cfg["image_id"], "continuations": (resume or {}).get('continuations', [])})
+            "image": record["image"], "image_id": cfg["image_id"], "continuations": (resume or {}).get('continuations', []),
+            "workspace_source": "git-free-run-tree" if fbr_run_tree.enabled(task_dir) else "git-workspace",
+            "workspace_mount": str(source.resolve())})
         if not resume:
-            import fbr_dependencies
-            if cfg.get('dependencies', {}).get('enabled'):
-                fbr_dependencies.seed(task_dir/'workspace', cfg, task=task_dir)
             created = lib.run(run_command(task_dir, record, cfg), timeout=120)
             if created.returncode != 0:
                 raise lib.FbrError("跑题容器启动失败，保留容器与证据供排查")
@@ -713,6 +741,12 @@ def collect_one(task_dir: Path, cfg: dict, keep_container: bool = False) -> dict
     if lib.stage_ok(task_dir, "collect"):
         return {"task_id": name, "state": "skip", "detail": "已经收集过"}
     run_info = lib.require_stage(task_dir, "run")
+    if fbr_run_tree.enabled(task_dir):
+        try:
+            fbr_run_tree.validate(task_dir, record)
+        except lib.FbrError as exc:
+            lib.set_stage(task_dir, "collect", "failed", problems=[str(exc)])
+            return {"task_id": name, "state": "failed", "detail": str(exc)}
     try:
         secret = bound_key(task_dir, cfg)
     except lib.FbrError as exc:
@@ -906,7 +940,8 @@ def main() -> int:
                 problems = ready_problems(task_dir, record, cfg)
                 blocked += bool(problems)
                 print(f"{record['task_id']}  " + ("不能跑：" + "；".join(problems) if problems else "可以跑"))
-            print("命令形如：" + " ".join(run_command(todo[0], lib.load_task(todo[0]), cfg)) + "；随后 docker exec -i <任务编号> /usr/local/bin/entrypoint.sh print < run/prompt.txt")
+            print("真跑会先由初始提交生成无 .git 的 run-tree；首轮随后执行 "
+                  "docker exec -i <任务编号> /usr/local/bin/entrypoint.sh print < run/prompt.txt")
             print(f"演练结束：待运行 {len(todo)} 个，其中 {blocked} 个没准备好。真跑加 --execute")
             return 1 if blocked else 0
         lib.active_github_account()

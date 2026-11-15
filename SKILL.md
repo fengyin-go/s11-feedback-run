@@ -121,7 +121,7 @@ fbr_cleanup.py prune --batch b1113-01 --execute --confirm CLEANUP
 
 ## 1. 运行与收集
 
-先按 [references/handoff-input.md](references/handoff-input.md) 接收出题侧批次。新批次会核对冻结基线、题面、需求点与录屏方案的交接摘要；发生变化需重新交接。每题独立起跑，不能接着上一题的代码跑。新出题侧每题只保留一个 `origin/` 和一个 `workspace/`，远端只有 `main`；同一提示词只执行一次首轮，不拆 A/B 两侧。`origin/` 保留冻结初始提交和出题预检依赖，唯一挂载的是干净的 `workspace/`。
+先按 [references/handoff-input.md](references/handoff-input.md) 接收出题侧批次。新批次会核对冻结基线、题面、需求点与录屏方案的交接摘要；发生变化需重新交接。每题独立起跑，不能接着上一题的代码跑。新出题侧每题只保留一个 `origin/` 和一个 `workspace/`，远端只有 `main`；同一提示词只执行一次首轮，不拆 A/B 两侧。`origin/` 保留冻结初始提交和出题预检依赖；`workspace/` 是宿主 Git 交付树，模型运行时不挂载它。
 
 运行基线：镜像 `adminfather/benzhi-claude-code2:20261110`，Claude Code `2.1.319`。Intel 与 Apple 芯片使用同一镜像名、同一组命令，由 Docker 自动选架构，不加 `--platform`。网关 `https://llm2.jzxhnh.com`、模型 `auto_model/urm` 和 Git 环境已配置在镜像内，不重复配置。镜像 Id 是本机所选架构的值，不能把另一架构的 Id 写死复用。
 
@@ -131,6 +131,8 @@ fbr_cleanup.py prune --batch b1113-01 --execute --confirm CLEANUP
 - 持续有模型输出、思考增量或进行中工具时不按墙钟误杀；网关/基础设施错误单独计数，不消耗模型责任机会。
 - 正常结束且有代码改动才有效；零代码改动归档后恢复基线重跑，最多三次。跑得慢本身不是重跑理由。
 - 轨迹完整导出并核对 SessionID、PromptID、首轮和续写后才停止容器。
+- 模型只挂载从冻结初始提交生成的 `run-tree/`；该目录不含 `.git`、远端、引用、对象和历史，依赖缓存可以单独复制进去。
+- 运行结束后由宿主机把 `run-tree/` 的新增、修改和删除同步回 `workspace/`，再生成 Git 快照。模型运行树里的 `.git` 或 Git 配置不进入交付。
 - 首轮启动前清空容器内预置的跨会话 `projects`、`todos` 和 `history.jsonl`，只允许当前工作区、当前题面与本轮 session；续写只恢复本题同一 SessionID。
 - key 只通过 `--env-file` 进容器；轨迹出现 key 时保留原始证据并自动记录备注，不改写原始轨迹。
 - 授权、停止、恢复、尝试上限和容器清理细节全部以 `run-rules.md`/`runtime-flow.md` 为准。
@@ -144,9 +146,9 @@ fbr_run.py collect --batch b1110-01
 
 ## 2. 产物快照
 
-`finalize --execute` 和完整流水线默认在验收通过后主动推送 GitHub 产物快照；明确本地模式时使用 `--no-publish`。执行顺序固定为：本地 commit → 录屏和取证 → 独立验收与 Feedback 闸门 → 立即落本地表 → 推送远程快照并回读 SHA/public → 再生成表格并核查全部必填字段。不得在独立验收前自动推送；推送失败保留验收结果，标记交付未通过并重试发布，不重新跑题。平台提交和 GitHub 发布分别遵守本次用户授权。
+`finalize --execute` 和完整流水线默认在验收通过后主动推送 GitHub 产物快照；明确本地模式时使用 `--no-publish`。执行顺序固定为：运行树同步到宿主 workspace → 本地 commit → 录屏和取证 → 独立验收与 Feedback 闸门 → 立即落本地表 → 推送远程快照并回读 SHA/public → 再生成表格并核查全部必填字段。不得在独立验收前自动推送；推送失败保留验收结果，标记交付未通过并重试发布，不重新跑题。平台提交和 GitHub 发布分别遵守本次用户授权。
 
-- 保留模型提交，不 squash/rebase/强推；宿主机只追加一个提交收走未提交改动。
+- 新批次的模型提交数为 0；宿主侧把无 Git 运行树同步成一次快照提交。旧批次 workspace 中已有的模型提交仍原样保留，不 squash/rebase/强推。
 - 初始提交必须是产物祖先；历史被改写时用最终文件在初始提交上重建，并只记内部 `review/snapshot.json`。
 - 提交前扫描 key、密钥文件、token、超大文件和保留的中间提交；命中即停。确属样例的仅可登记 `secret-waivers.json`，网关 key 原文永不免除。
 - 不要绕过脚本在 workspace 手敲 git；只推进同一 `main`，初始快照始终引用 `task.json.initial_commit`。
@@ -273,11 +275,13 @@ fbr_sheet.py --batch b1110-01                       # 确认回执后回填媒�
   tasks.xlsx  batch-manifest.json        出题侧铺的
   s11-000123/
     origin/                              新出题侧的初始克隆，main 固定在初始提交、保留依赖
-    workspace/                           唯一运行克隆，main，模型在这里干活
+    workspace/                           宿主 Git 交付克隆，main；模型不直接挂载
+    run-tree/                            从初始提交生成的无 .git 运行树，模型在这里干活
     task-seed.json                       新出题侧的编号、类型、题位与仓库清单项
     task.json  recording-plan.json review-contract.json       出题侧交接生成，不改
     state.json                           各阶段状态
     run/      prompt.txt stream.jsonl stderr.log attempts.json attempt-N/ git-config.before
+              run-tree.json integration.json dependencies.json
     trace/    projects/<目录>/<SessionID>.jsonl  ids.json
               manifest.json events.jsonl trace-check.json review-pack.json offsets/
     record/   recording.mp4 recording.json terminal.raw.log

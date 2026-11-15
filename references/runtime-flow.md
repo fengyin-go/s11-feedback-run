@@ -24,7 +24,7 @@ fbr_flow.py resume --batch b1110-01 --execute --confirm FLOW --detach
 
 GitHub 推送在独立验收和 Feedback 闸门通过、首次落表之后执行；推送后回读并再次落表核查全部必填字段。完整流水线默认主动发布，明确本地模式加 `--no-publish`；平台提交另加 `--auto-submit --confirm-submit SUBMIT`，不是默认模式。当前有效版本写 `review/attestation.json`，冻结评审输入、交付输入、Feedback、来源摘要、内容摘要和产物快照。滚动提交由独立的单线程队列串行消费 `ready_submit`，不占运行、录屏、取证或评价并发。每条提交前只验证凭证和实时平台条件，写 `review/submit-preflight.json`，不重新调用 AI 或重跑内容评审；失败只阻断当前题。人工整批提交先运行 `fbr_batch.py closeout`，检查所有凭证、字段、SessionID、领域和查重后再上传。平台单存在的任务冻结自动生产，返修需另行处理。产物尚未推送时本地仍可评价，但表格不会假报可提交。spotcheck 必须由真实审核人登记。
 
-显式开启 `--auto-cleanup --confirm-cleanup CLEANUP` 时，提交成功后进入独立 QC/清理轮询。只有实时详情为 `QC_PASSED`、本地回执 `confirmed`、结果包 SHA256 全部有效且任务无活动进程时，才写 `retention.json`、平台回执副本与 `cleanup.json`，然后删除 `origin/workspace/run` 大目录和该题 scratch。`QC_RUNNING` 继续等，`PENDING_FIX`、`uncertain`、摘要漂移和活动任务只报阻塞，不自动删除。该模式仍须显式授权，`pre-submit` 一律拒绝。
+显式开启 `--auto-cleanup --confirm-cleanup CLEANUP` 时，提交成功后进入独立 QC/清理轮询。只有实时详情为 `QC_PASSED`、本地回执 `confirmed`、结果包 SHA256 全部有效且任务无活动进程时，才写 `retention.json`、平台回执副本与 `cleanup.json`，然后删除 `origin/workspace/run-tree/run` 大目录和该题 scratch。`QC_RUNNING` 继续等，`PENDING_FIX`、`uncertain`、摘要漂移和活动任务只报阻塞，不自动删除。该模式仍须显式授权，`pre-submit` 一律拒绝。
 
 `pause --execute` 不发起新题，当前阶段完成后保留检查点；`drain --execute` 停止新跑题和新尝试，已经有效完成的题可继续下游。两种哨兵持久保留，只有显式 resume 清除。默认不设批次派发截止；只有显式配置有限 `run.batch_budget` 时才在到顶后停止继续投递。持续进展的已派发模型执行继续运行；已进入录屏/测试/评价的调用仍受各自超时约束，不中途破坏文件。
 
@@ -60,7 +60,7 @@ GitHub 推送在独立验收和 Feedback 闸门通过、首次落表之后执行
 
 ## 锁、恢复与看门狗
 
-批次流、任务操作、共享额度和同账号提交各有文件锁；任务锁跨线程和进程有效。运行 active 时不在宿主机对 workspace 执行 Git。运行前备份 Git 配置；接受产物前停容器冻结后台写入，再对比最终树。模型自身提交、改后还原、仅缓存/文档/日志的变动均不会误判为有效代码改动。
+批次流、任务操作、共享额度和同账号提交各有文件锁；任务锁跨线程和进程有效。运行 active 时不在宿主机对 workspace 执行 Git；模型只改无 Git 运行树。运行前备份 Git 配置；接受产物前停容器冻结后台写入，再比较运行树与冻结基线。模型自行创建 `.git`、改后还原、仅缓存/文档/日志的变动均不会进入交付，也不会误判为有效代码改动。
 
 `run/current.json` 持久化尝试、题面/初始提交/仓库摘要、容器 ID、归属标签、worker PID 起始身份及退出回执 ID。recover 的结果：活 worker 继续等待；匹配回执可收口；有合法中断且有剩余次数可恢复字面“继续”；工程失败先完整归档再用剩余次数重跑。同名容器归属不符、worker 已死但无匹配回执、预算/次数耗尽都保留现场阻塞，不能盲删或重新投题。轨迹中出现起跑 key 原文不再阻塞，收集时记录 `api_key_read` 并自动生成对外备注。
 
