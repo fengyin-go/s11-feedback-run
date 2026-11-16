@@ -100,8 +100,15 @@ def restore_frozen_projection(root: Path, batch_id: str, tasks: str | None = Non
     for task_dir in lib.task_dirs(root, batch_id, tasks):
         if task_dir.name in entries:
             continue
-        if not (task_dir / "review/upload.json").is_file():
-            blocked.append({"task_id": task_dir.name, "reason": "没有平台提交回执"})
+        cleanup = lib.load_json(task_dir / "cleanup.json", default={})
+        snapshot = lib.load_json(task_dir / "review/snapshot.json", default={})
+        local_sealed = (
+            cleanup.get("state") in ("local_compacted", "cleaned")
+            and snapshot.get("pushed") is True
+            and bool(snapshot.get("artifact_snapshot"))
+        )
+        if not (task_dir / "review/upload.json").is_file() and not local_sealed:
+            blocked.append({"task_id": task_dir.name, "reason": "没有平台回执或已推送的本地封存"})
             continue
         found = None
         for snapshot in snapshots:
@@ -386,12 +393,22 @@ def compact_local_task(root: Path, batch_id: str, task_dir: Path, cfg: dict,
         return {"task_id": task_dir.name, "state": "skip", "bytes_removed": 0, "reason": "已经清理"}
     manifest = lib.load_json(
         delivery.delivery_dir(root, batch_id) / "delivery-manifest.json", default={})
+    if not manifest.get("batch_id"):
+        return {
+            "task_id": task_dir.name,
+            "state": "blocked",
+            "bytes_removed": 0,
+            "reason": "缺少交付清单，拒绝为清理重新导出",
+        }
     try:
-        if not manifest.get("batch_id"):
-            raise lib.FbrError("缺少交付清单")
-        _verify_result_task(root, manifest, task_dir.name)
-    except lib.FbrError:
-        manifest = delivery.export_batch(root, batch_id, cfg)
+        _task_entry(manifest, task_dir.name)
+    except lib.FbrError as exc:
+        return {
+            "task_id": task_dir.name,
+            "state": "blocked",
+            "bytes_removed": 0,
+            "reason": f"{exc}，拒绝为清理重新导出",
+        }
     problems = _local_seal_problems(root, batch_id, task_dir, manifest, cfg)
     if problems:
         return {

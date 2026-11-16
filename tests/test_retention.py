@@ -6,6 +6,7 @@ import hashlib
 import os
 import shutil
 import time
+from unittest import mock
 
 from fixtures import BATCH, KEY, Sandbox, sh, write
 from test_submit import SubmitCase
@@ -61,6 +62,39 @@ class LocalCompaction(SubmitCase):
         self.assertEqual(result["state"], "blocked")
         self.assertTrue((task / "workspace").is_dir())
         self.assertTrue((task / "origin").is_dir())
+
+    def test_compaction_never_re_exports_a_stale_manifest(self):
+        task = self.sealed()
+        manifest_path = delivery.delivery_dir(self.root, BATCH) / "delivery-manifest.json"
+        manifest = lib.load_json(manifest_path)
+        manifest["tasks"] = []
+        lib.save_json(manifest_path, manifest)
+        with mock.patch.object(delivery, "export_batch") as exported:
+            result = fbr_cleanup.compact_local_task(
+                self.root, BATCH, task, self.cfg)
+        exported.assert_not_called()
+        self.assertEqual(result["state"], "blocked")
+        self.assertIn("拒绝为清理重新导出", result["reason"])
+        self.assertTrue((task / "workspace").is_dir())
+
+    def test_local_compacted_projection_restores_without_upload_receipt(self):
+        task = self.sealed()
+        self.assertEqual(
+            fbr_cleanup.compact_local_task(self.root, BATCH, task, self.cfg)["state"],
+            "ok",
+        )
+        target = delivery.delivery_dir(self.root, BATCH)
+        snapshot = self.root / "_verification/delivery-history" / f"{BATCH}-local"
+        shutil.copytree(target, snapshot)
+        manifest = lib.load_json(target / "delivery-manifest.json")
+        manifest["tasks"] = []
+        lib.save_json(target / "delivery-manifest.json", manifest)
+        shutil.rmtree(target / task.name)
+        self.assertFalse((task / "review/upload.json").exists())
+        result = fbr_cleanup.restore_frozen_projection(
+            self.root, BATCH, task.name)
+        self.assertEqual(len(result["restored"]), 1)
+        self.assertTrue((target / task.name / "retention.json").is_file())
 
     def test_disabled_policy_never_deletes(self):
         task = self.sealed()
