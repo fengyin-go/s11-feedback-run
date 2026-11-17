@@ -35,6 +35,8 @@
 - workspace 的路径不带逗号（`--mount` 用逗号分隔字段）。
 - 没有未核验的同名容器。已有 current 记录时先 `recover`，核对 PID 起始身份、题面/基线/仓库摘要、容器归属标签和 ID。活 worker 继续等；归属不符或无匹配退出回执则保留现场阻塞，不能直接删掉重跑。
 - `--limit` 必须是正整数；首题验证用 `--limit 1`，实际工作线程数也不会超过待运行题数。
+- S11 新批次先核对 `repo-topic-map.json`、H3 v3 八项假取舍守卫和 `workload_design`；
+  缺项或预期有效工具调用低于 55 时不派发模型，直接回出题侧。
 
 ## 容器怎么起
 
@@ -89,6 +91,11 @@ docker exec -i <任务编号> bash -c \
 - 子代理的会话（`isSidechain`）不算轮次。
 - 流式输出、stderr、导出的主会话或子会话任何地方含当前起跑 key 原文时，按甲方补充口径视为可交付数据：原始文件和轨迹不改写、不脱敏，收集阶段记录 `api_key_read=true`，备注自动写“模型运行时读取了 apikey”，随后继续快照、录屏、取证和交付。key 不决定运行是否有效，也不因命中而重跑。
 - key 备注由当前运行/轨迹中的起跑 key 原文自动检测，不能从反馈 note 或人工备注复制。检测时只记录布尔事实和命中文件清单，不在错误、表格备注或反馈正文里输出 key 原文。
+- 收集后的平台规则预检扫描 `review-pack.json` 中 `Read/Bash/Grep/Glob` 的 target 和返回摘要。
+  访问 `.claude/projects`、`.claude/todos`、`.claude/sessions`、`.claude/history.jsonl` 或
+  `.claude/memory` 时
+  标记 `runtime_rerun_required`，不进入平台提交。具体流程见
+  [platform-policy-preflight.md](platform-policy-preflight.md)。
 
 ## key
 

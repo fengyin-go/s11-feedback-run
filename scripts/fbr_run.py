@@ -185,6 +185,13 @@ def bound_key(task_dir: Path, cfg: dict, *, start: bool = False) -> str:
 def ready_problems(task_dir: Path, record: dict, cfg: dict, *, prepared: bool = False) -> list[str]:
     workspace = task_dir / "workspace"
     problems = []
+    if record.get("producer") == "s11-gsb-prompt-create":
+        import fbr_platform_rules
+        prompt_errors, _ = fbr_platform_rules.prompt_contract_problems(task_dir)
+        problems.extend(
+            f"出题风险：{item.get('message') or item.get('code')}"
+            for item in prompt_errors
+        )
     current = lib.load_json(task_dir / "run/current.json", default={})
     if current.get("state") in ("running", "starting") and not prepared:
         return ["存在未收口运行，先执行 recover；不在活跃工作区执行宿主机 Git"]

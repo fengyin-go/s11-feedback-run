@@ -54,10 +54,17 @@ fbr_flow.py run --batch b1110-01 \
 
 - 校验评审凭证绑定的题面、轨迹、事实、Feedback、质量回执、抽检、快照和媒体摘要；
 - 复核白名单交付投影、18 个必填字段、SessionID 和当前批内/历史查重；
+- 复核出题 H3/工作量清单、A-5 查重结论、实际有效工具调用数和私有会话读取；命中 P5/P6、
+  A-5 或 memory 风险时只阻断当前题，不进入附件上传和建单；
 - 登录平台读取实时 schema、账号领域和已有 SessionID，但预检阶段不上传、不建单；
 - 结果写入 `review/submit-preflight.json`，绑定 `feedback_sha`、`source_digest`、`content_digest`、产物快照和 schema fingerprint。
 
 只有预检 `ready` 的单条才进入平台上传。评审输入变化时该题回到当前 AI 重新评价；仅交付快照等交付字段变化时只重做交付冻结，不重新判断需求。平台表单、账号或附件变化会使预检失效。预检失败只阻断这一条，不停止其他题。人工整批提交先运行 `fbr_batch.py closeout`，批量检查通过后才允许开始上传。
+
+本地平台规则预检读取 `review-pack.json` 的有界工具索引，不整读原始轨迹。低于 50 次有效工具
+调用、读取 `.claude/projects/todos/sessions/history.jsonl/memory`、A-5 未通过或 H3 v3/workload 契约
+缺失时写入 `review/platform-rules.json` 并阻断。归属边界见
+[platform-policy-preflight.md](references/platform-policy-preflight.md)。
 
 同一平台账号的上次写请求时间持久化在 `~/.codex/solo11/runtime/platform-write-pacing-<账号摘要>.json`。脚本退出、resume、换批次或手工补交后仍继续按上次时间计算。建单明确遇到 429 时优先使用 `Retry-After`，否则按 15、30、45 秒退避；每次重投前按 SessionID 回查，发现已建单就直接回读，不重复 POST。其他 5xx、超时和结果未知仍保留 `uncertain`，不自动重试。
 
@@ -237,7 +244,11 @@ Feedback 的硬底线：
 
 平台返修不是重新建单。`PENDING_FIX` 先用 `review/prepare/finalize --platform-repair` 重做当前 Feedback，再运行 `fbr_batch.py repair`；复用原记录和附件，只更新允许字段并在回读确认后重新质检。
 
-`PENDING_FIX` 不等于都可返修。平台失败项为 `problem_type=DOMAIN_MISMATCH`（以及题目难度本身被判废）时，即使 `editable=true` 也只能改非锁定字段，无法替换题面、Session 和附件；不得继续重写 Feedback 或反复 PUT。`repair` 会返回 `prompt_rebuild_required`，应保留 `qc_checks` 证据并回到 `s11-gsb-prompt-create` 更换主任务重出。
+`PENDING_FIX` 不等于都可返修。平台失败项为 `problem_type=DOMAIN_MISMATCH`、P5 难度、P6
+工作量、A-5 查重或 memory 读取时，即使 `editable=true` 也只能改非锁定字段，无法替换题面、
+Session 和附件；不得继续重写 Feedback 或反复 PUT。memory 读取返回
+`runtime_rerun_required`，其余题目级失败返回 `prompt_rebuild_required`。保留 `qc_checks`
+证据并回到出题或运行侧重建。
 
 ## 6. 抽检与结果表
 

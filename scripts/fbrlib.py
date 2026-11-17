@@ -262,14 +262,14 @@ def task_dirs(root: Path, batch_id: str, wanted: str | None = None) -> list[Path
     return [p for p in found if not names or p.name in names]
 
 
-def load_task(task_dir: Path) -> dict:
+def load_task(task_dir: Path, *, validate_layout: bool = True) -> dict:
     record = load_json(Path(task_dir) / "task.json")
     for key in ("task_id", "prompt", "initial_commit", "image", "requirements"):
         if not record.get(key):
             raise FbrError(f"{task_dir.name}/task.json 缺少 {key}")
     if record["task_id"] != Path(task_dir).name:
         raise FbrError(f"task.json 的编号 {record['task_id']} 和目录名 {Path(task_dir).name} 不一致")
-    validate_handoff(Path(task_dir), record)
+    validate_handoff(Path(task_dir), record, validate_layout=validate_layout)
     return record
 
 
@@ -294,7 +294,12 @@ def handoff_payload(
     return {"task": {key: record.get(key) for key in keys}, "recording": recording}
 
 
-def validate_handoff(task_dir: Path, record: dict) -> None:
+def validate_handoff(
+    task_dir: Path,
+    record: dict,
+    *,
+    validate_layout: bool = True,
+) -> None:
     """新批次核对冻结的出题输入；旧批次继续使用原来的逐阶段检查。"""
     version = record.get("handoff_version", 1)
     manifest = load_json(task_dir.parent / "batch-manifest.json", default={})
@@ -305,7 +310,8 @@ def validate_handoff(task_dir: Path, record: dict) -> None:
     if version != 2:
         raise FbrError(f"{task_dir.name}：不支持交接版本 {version}")
     if record.get("producer") == "s11-gsb-prompt-create" or manifest.get("producer") == "s11-gsb-prompt-create":
-        validate_single_layout(task_dir, record, manifest)
+        if validate_layout:
+            validate_single_layout(task_dir, record, manifest)
         review_contract = record.get("review_contract")
         if manifest.get("review_contract_required") is True and review_contract is None:
             raise FbrError(f"{task_dir.name}：批次要求 review_contract，但 task.json 缺失")

@@ -63,6 +63,22 @@ class LocalCompaction(SubmitCase):
         self.assertTrue((task / "workspace").is_dir())
         self.assertTrue((task / "origin").is_dir())
 
+    def test_cleaned_task_can_load_frozen_record_for_workspace_hydration(self):
+        task = self.sealed()
+        self.assertEqual(
+            fbr_cleanup.compact_local_task(self.root, BATCH, task, self.cfg)["state"],
+            "ok",
+        )
+        with self.assertRaisesRegex(lib.FbrError, "缺少独立 origin 克隆"):
+            lib.load_task(task)
+        frozen = lib.load_task(task, validate_layout=False)
+        self.assertEqual(frozen["task_id"], task.name)
+        self.assertEqual(frozen["handoff_hash"],
+                         lib.content_hash(lib.handoff_payload(
+                             frozen,
+                             lib.load_json(task / "recording-plan.json"),
+                         )))
+
     def test_compaction_never_re_exports_a_stale_manifest(self):
         task = self.sealed()
         manifest_path = delivery.delivery_dir(self.root, BATCH) / "delivery-manifest.json"

@@ -130,6 +130,44 @@ class Rules(unittest.TestCase):
         self.assertEqual(len(blockers), 1)
         self.assertEqual(blockers[0]["check_key"], "llm_desc_domain_mismatch_0")
 
+    def test_p5_dedup_and_p6_are_prompt_rebuild_failures(self):
+        detail = {
+            "status": "PENDING_FIX",
+            "qc_checks": [
+                {"check_key": "trace_complexity_floor", "passed": False,
+                 "summary": "H3 不成立", "evidence": {}},
+                {"check_key": "dedup", "passed": False,
+                 "summary": "A-5 公共长片段", "evidence": {}},
+                {"check_key": "trace_tool_call_floor", "passed": False,
+                 "summary": "42 < 50", "evidence": {}},
+            ],
+        }
+        blockers = submit.non_repairable_prompt_checks(detail)
+        self.assertEqual(
+            [row["check_key"] for row in blockers],
+            ["trace_complexity_floor", "dedup", "trace_tool_call_floor"],
+        )
+        self.assertTrue(all(
+            row["owner"] == "s11-gsb-prompt-create"
+            and row["action"] == "prompt_rebuild_required"
+            for row in blockers
+        ))
+
+    def test_memory_read_is_runtime_rerun_failure(self):
+        detail = {
+            "status": "PENDING_FIX",
+            "qc_checks": [{
+                "check_key": "trace_memory",
+                "passed": False,
+                "summary": "读取 .claude/projects",
+                "evidence": {},
+            }],
+        }
+        blockers = submit.non_repairable_prompt_checks(detail)
+        self.assertEqual(len(blockers), 1)
+        self.assertEqual(blockers[0]["owner"], "s11-feedback-run")
+        self.assertEqual(blockers[0]["action"], "runtime_rerun_required")
+
 
 class BindingDrift(SubmitCase):
     def test_source_change_during_upload_blocks_create(self):

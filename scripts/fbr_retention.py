@@ -285,7 +285,10 @@ def ensure_workspace(task_dir: Path) -> dict:
     workspace = task_dir / "workspace"
     if (workspace / ".git").is_dir():
         return {"state": "skip", "path": str(workspace)}
-    record = lib.load_task(task_dir)
+    # A cleaned task intentionally has no origin/workspace/run-tree. The
+    # immutable task.json still carries the prompt, baseline and handoff hash;
+    # validate those while deferring the live layout check until after restore.
+    record = lib.load_task(task_dir, validate_layout=False)
     snapshot = lib.load_json(task_dir / "review" / "snapshot.json", default={})
     commit = str(snapshot.get("commit") or "")
     if snapshot.get("pushed") is not True or not snapshot.get("artifact_snapshot"):

@@ -388,6 +388,7 @@ def preflight_one(root: Path, batch_id: str, task_id: str, *, client=None,
     import fbr_attestation
     import fbr_feedback
     import fbr_gate
+    import fbr_platform_rules
     import fbr_sheet
 
     cfg = lib.settings(root)
@@ -426,6 +427,16 @@ def preflight_one(root: Path, batch_id: str, task_id: str, *, client=None,
         valid, reason = delivery.current_feedback(task_dir)
         if not valid:
             result["errors"].append(reason)
+        local_rules = fbr_platform_rules.evaluate(task_dir)
+        lib.save_json(task_dir / "review/platform-rules.json", local_rules)
+        result["errors"].extend(
+            str(item.get("message") or item.get("code"))
+            for item in local_rules.get("errors") or []
+        )
+        result["warnings"].extend(
+            str(item.get("message") or item.get("code"))
+            for item in local_rules.get("warnings") or []
+        )
 
         entry = next((row for row in manifest.get("tasks", []) if row.get("task_id") == task_id), None)
         if not entry:
@@ -1188,17 +1199,39 @@ def submit_ready(root: Path, batch_id: str, task_id: str, *, execute: bool = Fal
 
 def non_repairable_prompt_checks(detail: dict) -> list[dict]:
     """Return QC failures that cannot be fixed by editing the submitted fields."""
+    import fbr_platform_rules
+
     blocked: list[dict] = []
     for check in detail.get("qc_checks") or []:
         if not isinstance(check, dict) or check.get("passed") is not False:
             continue
         evidence = check.get("evidence") if isinstance(check.get("evidence"), dict) else {}
+        key = str(check.get("check_key") or "")
         if evidence.get("problem_type") == "DOMAIN_MISMATCH":
             blocked.append({
-                "check_key": check.get("check_key"),
+                "check_key": key,
                 "check_name": check.get("check_name"),
                 "summary": check.get("summary"),
                 "quote": evidence.get("quote"),
+                "owner": "s11-gsb-prompt-create",
+                "action": "replace_main_task",
+            })
+        elif key in fbr_platform_rules.NON_REPAIRABLE_QC_CHECKS:
+            runtime_check = (
+                key.startswith("trace_")
+                and key not in {"trace_complexity_floor", "trace_tool_call_floor"}
+            )
+            blocked.append({
+                "check_key": key,
+                "check_name": check.get("check_name"),
+                "summary": check.get("summary"),
+                "quote": evidence.get("quote"),
+                "owner": (
+                    "s11-feedback-run" if runtime_check else "s11-gsb-prompt-create"
+                ),
+                "action": (
+                    "runtime_rerun_required" if runtime_check else "prompt_rebuild_required"
+                ),
             })
     return blocked
 
@@ -1219,13 +1252,25 @@ def repair_one(root: Path, plan: dict, client, schema: dict, *, execute: bool, c
         raise lib.FbrError(f"{plan['task_id']}：平台记录 SessionID 与当前交付不一致")
     prompt_blockers = non_repairable_prompt_checks(detail)
     if prompt_blockers:
+        runtime_only = bool(prompt_blockers) and all(
+            item.get("owner") == "s11-feedback-run"
+            for item in prompt_blockers
+        )
         return {
             "task_id": plan["task_id"],
-            "state": "prompt_rebuild_required",
+            "state": (
+                "runtime_rerun_required"
+                if runtime_only
+                else "prompt_rebuild_required"
+            ),
             "submission_id": submission_id,
             "status": detail.get("status"),
             "blockers": prompt_blockers,
-            "detail": "题面主体与所属领域不符属于题目级失败；返修只能改字段，不能替换题面、会话或附件，需回到出题重做。",
+            "detail": (
+                "平台失败项来自运行轨迹或私有会话读取；返修只能改字段，不能替换会话或附件，需重新运行。"
+                if runtime_only
+                else "平台失败项属于题目难度、查重、工作量或领域主体；返修只能改字段，不能替换题面、会话或附件，需回到出题重做。"
+            ),
         }
     current = remote_data(detail)
     current_trace = detail.get("trace_file")
