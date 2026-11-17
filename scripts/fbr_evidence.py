@@ -12,7 +12,7 @@ from typing import Any
 
 import fbrlib as lib
 
-VERSION = 1
+VERSION = 2
 TRACE_PREFIX = "trace/projects/"
 OFFSET_DIR = "trace/offsets"
 MANIFEST = "trace/manifest.json"
@@ -309,13 +309,8 @@ def _build_pack(task: Path, events: list[dict], sources: list[dict]) -> dict:
         "sources": sources,
         "summary": {
             "assistant_texts": len(text_events),
-            "logical_tool_uses": len(tools),
-            "raw_tool_use_blocks": sum(1 for event in events if event.get("type") == "tool_use"),
-            "errors": len(errors),
-            "checks": len(checks),
-            "edits": len(edits),
             "last_edit_line": last_edit,
-            "checks_after_last_edit": len(checks_after),
+            "checked_after_last_edit": bool(checks_after),
             "high_risk": high_risk,
         },
         "assistant_text": [
@@ -326,7 +321,8 @@ def _build_pack(task: Path, events: list[dict], sources: list[dict]) -> dict:
         "tool_events": [
             {"event_id": event["id"], "source": event["source"], "line": event["line"],
              "block": event["block"], "tool": event.get("tool"), "kind": event.get("kind"),
-             "target": event.get("target"), "answered": event.get("answered", False),
+             "target": event.get("target"), "mutates": event.get("mutates", False),
+             "answered": event.get("answered", False),
              "is_error": event.get("result_is_error", False),
              "result_line": event.get("result_line"), "result_block": event.get("result_block"),
              "result_preview": lib.clip(event.get("result_preview", ""), 1200)}
@@ -391,10 +387,6 @@ def ingest(task: Path, *, force: bool = False) -> dict:
     _pair_tools(events)
     event_ids = {event["id"] for event in events}
     source_lines = {(event["source"], event["line"]) for event in events}
-    raw_tools = [event for event in events if event.get("type") == "tool_use"]
-    results = [event for event in events if event.get("type") == "tool_result"]
-    logical = _logical_tools(events)
-    paired = [event for event in logical if event.get("answered")]
     check = {
         "version": VERSION,
         "task_id": task.name,
@@ -409,15 +401,6 @@ def ingest(task: Path, *, force: bool = False) -> dict:
             "blocks": sum(source["blocks"] for source in sources),
             "events": len(events),
             "unique_events": len(event_ids),
-            "tool_uses": len(raw_tools),
-            "logical_tools": len(logical),
-            "duplicate_tool_uses": len(raw_tools) - len(logical),
-            "tool_results": len(results),
-            "paired_tools": len(paired),
-            "unpaired_tools": len(logical) - len(paired),
-            "tool_errors": sum(1 for event in results if event.get("is_error")),
-            "edits": sum(1 for event in logical if event.get("kind") == "edit" or event.get("mutates")),
-            "checks": sum(1 for event in logical if event.get("kind") in ("test", "build")),
         },
         "problems": [],
     }

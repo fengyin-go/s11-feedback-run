@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import json
 import unittest
 
 from fixtures import BATCH, IMAGE, KEY, PROMPT
@@ -26,7 +27,18 @@ class Card(FlowCase):
         task_dir = self.evidenced()
         text = self.card(task_dir)
         brief = (task_dir / "review/task-agent-brief.md").read_text(encoding="utf-8")
+        capsule = lib.load_json(task_dir / "review/review-capsule.json")
         self.assertLess(len(brief.encode("utf-8")), len(text.encode("utf-8")))
+        self.assertLess(len(brief.encode("utf-8")), 6000)
+        self.assertLess(len(json.dumps(capsule, ensure_ascii=False).encode("utf-8")), 7000)
+        self.assertEqual(capsule["version"], 2)
+        self.assertEqual(capsule["task_id"], task_dir.name)
+        self.assertEqual(capsule["tests"]["after"]["test_rc"], 0)
+        self.assertEqual(brief.count("- probe P1："), 1 if capsule["probes"] else 0)
+        self.assertEqual(brief.count("## 测试"), 1)
+        self.assertEqual(brief.count("## 改动"), 1)
+        self.assertNotIn("## 证据候选", brief)
+        self.assertNotIn("## 交付结果", brief)
         self.assertNotIn("要写的两份文件", brief)
         self.assertNotIn('{"type":"file"', brief)
         for line in (
@@ -44,7 +56,6 @@ class Card(FlowCase):
             "  - A src/clipcut/segment.py (+2 / -0)\n",
             "- 新增的 TODO 或占位：src/clipcut/packer.py：# TODO: 一小时以上的输入",
             "- 完整 diff 在 review/diff.patch",
-            "- 共 4 步，其中报错 0 步，改文件 2 步",
             "- 模型自己跑过测试：是；最后一次改动在第 4 步，之后没有再验证；最后一次检查通过",
             "  - 第 3 步 test：`make test` → 通过",
             "    3 Bash   make test",
@@ -58,6 +69,8 @@ class Card(FlowCase):
             self.assertIn(line, text)
         self.assertNotIn("产物上测试输出的末尾", text)
         self.assertNotIn("这次没改的文件", text)
+        self.assertNotIn("共 4 步", text)
+        self.assertNotIn("工具 4 步", brief)
         self.assertNotIn(KEY, text)
 
     def test_failed_tests_show_the_output(self):
@@ -67,6 +80,27 @@ class Card(FlowCase):
         self.assertIn("- 结论口径：产物测试不通过，跑得起来，算在这次改动头上", text)
         self.assertIn("产物上测试输出的末尾：", text)
         self.assertIn("FAILED (failures=1)", text)
+
+    def test_capsule_inlines_contract_and_keeps_operational_evidence(self):
+        record = gate_task()
+        record["review_contract"] = {
+            "version": 1,
+            "key_business_constraint": "同一输入只能得到一个有效结果",
+            "business_checks": [{"requirement_id": "R1", "behavior": "分片结果可读"}],
+        }
+        facts = gate_facts()
+        facts["demo"]["steps"][0]["tail"] = "server ready on :3000"
+        capsule = fbr_feedback.build_capsule(record, facts, [{
+            "id": "P1", "cmd": "make demo", "rc": 1, "setup_rc": 0,
+            "tail": "boom", "output_file": "evidence/command-logs/probes/P1.log",
+        }])
+        brief = fbr_feedback.render_capsule(capsule)
+        self.assertEqual(capsule["contract"]["key_business_constraint"],
+                         "同一输入只能得到一个有效结果")
+        self.assertEqual(capsule["demo"]["steps"][0]["tail"], "server ready on :3000")
+        self.assertEqual(capsule["probes"][0]["tail"], "boom")
+        self.assertIn("## Review Contract", brief)
+        self.assertIn("evidence/command-logs/probes/P1.log", brief)
 
     def test_no_change(self):
         text = self.card(self.evidenced(change=False))
@@ -382,7 +416,7 @@ class Main(FlowCase):
         self.written()
         code, out, err = self.run_cli("gate", "--batch", BATCH)
         self.assertEqual((code, err), (0, ""))
-        self.assertEqual(out.splitlines(), ["s11-000001  通过  分数 3", "共 1 题，通过 1 题"])
+        self.assertEqual(out.splitlines(), ["gate ok tasks=1"])
 
     def test_gate_lists_problems(self):
         self.evidenced()

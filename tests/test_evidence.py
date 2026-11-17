@@ -41,10 +41,10 @@ class EvidenceStore(Sandbox):
         self.assertTrue(check["all_lines_accounted"])
         self.assertEqual(check["counts"]["source_files"], 1)
         self.assertEqual(check["counts"]["lines"], 3)
-        self.assertEqual(check["counts"]["tool_uses"], 1)
-        self.assertEqual(check["counts"]["tool_results"], 1)
-        self.assertEqual(check["counts"]["paired_tools"], 1)
-        self.assertEqual(check["counts"]["tool_errors"], 1)
+        self.assertFalse({
+            "tool_uses", "tool_results", "paired_tools", "logical_tools",
+            "unpaired_tools", "duplicate_tool_uses",
+        } & set(check["counts"]))
         self.assertTrue((task / fbr_evidence.MANIFEST).is_file())
         self.assertTrue((task / fbr_evidence.EVENTS).is_file())
         self.assertTrue((task / fbr_evidence.PACK).is_file())
@@ -55,9 +55,11 @@ class EvidenceStore(Sandbox):
         self.assertEqual(pack["final_answer"]["line"], 3)
         self.assertIn("tool_errors", pack["summary"]["high_risk"])
         prompt = fbr_trace_review.prompt_pack(task)
-        self.assertEqual(len(prompt["tool_events"]), check["counts"]["tool_uses"])
-        self.assertEqual(len(prompt["assistant_text"]), check["counts"]["events"] - 2)
-        self.assertEqual(prompt["columns"]["tool_events"][0], "source_id")
+        self.assertNotIn("tool_events", prompt)
+        self.assertIn("不统计、不补算工具调用总数", prompt["process_policy"])
+        self.assertEqual(len(prompt["assistant_text"]), 1)
+        self.assertEqual(prompt["edits"], [])
+        self.assertEqual(prompt["columns"]["edits"][0], "source_id")
         self.assertEqual(source.read_bytes(), before)
 
     def test_batch_fetch_deduplicates_ranges_and_opens_each_source_once(self):
@@ -80,6 +82,33 @@ class EvidenceStore(Sandbox):
         access = fbr_evidence.access_summary(task)
         self.assertEqual(access["full_reads"], 0)
         self.assertEqual(access["file_opens"], 1)
+
+    def test_reviewer_pack_keeps_relevant_process_events_without_tool_counts(self):
+        task = self.make_task()
+        path = task / "trace/projects/-workspace/session.jsonl"
+        rows = [
+            {"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": "r1", "name": "Read", "input": {"file_path": "src/app.py"}}]}},
+            {"type": "user", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "r1", "content": "source"}]}},
+            {"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": "e1", "name": "Edit",
+                 "input": {"file_path": "src/app.py", "old_string": "a", "new_string": "b"}}]}},
+            {"type": "user", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "e1", "content": "updated"}]}},
+            {"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "make test"}}]}},
+            {"type": "user", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": "OK"}]}},
+        ]
+        write(path, "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows))
+        fbr_evidence.ingest(task)
+        prompt = fbr_trace_review.prompt_pack(task)
+        self.assertNotIn("tool_events", prompt)
+        self.assertEqual(len(prompt["edits"]), 1)
+        self.assertEqual(len(prompt["checks"]), 1)
+        self.assertNotIn("logical_tool_uses", prompt["summary"])
+        self.assertNotIn("paired_tools", prompt["summary"])
 
     def test_exact_locator_rejects_quote_from_another_line(self):
         task, _ = self.task()
@@ -147,11 +176,7 @@ class EvidenceStore(Sandbox):
         ]
         write(path, "".join(json.dumps(row) + "\n" for row in rows))
         check = fbr_evidence.ingest(task)
-        self.assertEqual(check["counts"]["tool_uses"], 2)
-        self.assertEqual(check["counts"]["logical_tools"], 1)
-        self.assertEqual(check["counts"]["duplicate_tool_uses"], 1)
-        self.assertEqual(check["counts"]["paired_tools"], 1)
-        self.assertEqual(check["counts"]["unpaired_tools"], 0)
+        self.assertNotIn("logical_tools", check["counts"])
         self.assertEqual(len(lib.load_json(task / fbr_evidence.PACK)["tool_events"]), 1)
 
 

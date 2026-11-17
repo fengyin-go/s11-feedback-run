@@ -112,9 +112,7 @@ class Steps(Sandbox):
         self.assertEqual(steps[0]["target"], "src/clipcut/packer.py")
         self.assertEqual(steps[2]["target"], "make test")
         self.assertIn("Ran 1 test", steps[2]["output_tail"])
-        self.assertEqual(info["counts"]["tools"], 4)
-        self.assertEqual(info["counts"]["edits"], 2)
-        self.assertEqual(info["counts"]["errors"], 0)
+        self.assertNotIn("counts", info)
         self.assertEqual(info["final_answer"], "分片打包已实现。")
         self.assertTrue(info["started_at"] < info["ended_at"])
 
@@ -144,7 +142,7 @@ class Steps(Sandbox):
         self.assertEqual(check["last_edit_step"], 2)
         self.assertEqual(check["tests_failed"], 1)
         self.assertFalse(check["checks"][0]["passed"])
-        self.assertEqual(info["counts"]["errors"], 1)
+        self.assertTrue(steps[0]["is_error"])
 
     def test_api_error_message_is_not_the_answer(self):
         rows = trace_rows(SID, tools=TOOLS, answer="改完了。")

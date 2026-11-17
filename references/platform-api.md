@@ -101,6 +101,9 @@ fbr_sheet.py --root "<root>" --batch b1110-01
 本地修复顺序：
 
 ```bash
+# 先只读分类：平台失败只能靠改题面通过时，这一步直接写本地废弃凭证
+fbr_batch.py repair --batch b1110-01 --tasks s11-000123
+# 仅未标记本地废弃的题继续准备原字段返修
 fbr_reviewer.py review --batch b1110-01 --task s11-000123 --platform-repair --execute
 fbr_reviewer.py prepare --batch b1110-01 --task s11-000123 --platform-repair --execute
 # 修改 candidate / verification 后
@@ -111,11 +114,23 @@ fbr_batch.py repair --batch b1110-01 --tasks s11-000123 \
   --comment "按平台打回原因重写 Feedback" --execute --confirm REPAIR
 ```
 
-`repair` 只更新非锁定字段，当前实现会保留平台附件值。返修 PUT 与建单共用账号级最小间隔。演练必须显示实际变化字段；真实执行后重新 GET 详情，确认版本递增、字段一致且 `qc_running=true` 或 `stage=QC_RUNNING/QC_WAITING`。如果 PUT 已成功但回执尚未落盘，再次运行会按当前详情识别 `already_applied`，不得重复 PUT。明确 429 时按同一退避规则先回查字段是否已生效，再决定是否重投。返修完成后轮询详情，只有 `QC_PASSED` 才算通过；`PENDING_FIX` 要继续按新的 `qc_summary` 和失败 `qc_checks` 处理。
+`repair` 只更新非锁定字段，当前实现会保留平台附件值。返修前强制核对
+`review/upload.json` 中绑定的原 `user_prompt`；只要 `task.json.prompt` 或 `prompt.txt`
+变化就停止，绝不允许修改提示词后重跑。返修 PUT 与建单共用账号级最小间隔。演练必须显示
+实际变化字段；真实执行后重新 GET 详情，确认版本递增、字段一致且 `qc_running=true` 或
+`stage=QC_RUNNING/QC_WAITING`。如果 PUT 已成功但回执尚未落盘，再次运行会按当前详情识别
+`already_applied`，不得重复 PUT。明确 429 时按同一退避规则先回查字段是否已生效，再决定是否
+重投。返修完成后轮询详情，只有 `QC_PASSED` 才算通过；新的 `PENDING_FIX` 仍按原字段返修
+硬规则处理。
 
 平台 `other_issues` 不从本地 `feedback.note` 复制，只根据原始轨迹自动生成两类事实：模型自行中断后已输入“继续”的次数及首轮标识说明；当前轨迹或运行输出确实出现起跑 key 时写固定短句“模型运行时读取了 apikey”。两类都存在时用中文分号连接。两项都没有时显式发送 `""`；重跑、Git 历史、录屏问题、修复说明等仍保留在本地证据中。
 
-`PENDING_FIX` 仍要区分可编辑字段失败和题目级失败。`qc_checks[].evidence.problem_type=DOMAIN_MISMATCH` 表示题面主体与所属领域不符；题面、Session 和附件不在可返修范围内，继续改 Feedback 或 PUT 不会改变结论。`repair_one` 遇到此类失败返回 `prompt_rebuild_required`，保留失败检查作为出题侧证据并转 `s11-gsb-prompt-create`，不得为了把状态推回 `QC_RUNNING` 而反复提交。
+`PENDING_FIX` 仍要区分可编辑字段失败和题目级失败。
+`qc_checks[].evidence.problem_type=DOMAIN_MISMATCH` 表示题面主体与所属领域不符；P3/P4/P5
+难度、P6 工作量、A-5 查重、memory 或私有会话读取也无法通过替换锁定附件来返修。
+`DISCARDED` 以及 `PENDING_FIX + editable=false` 同样不可返修。`repair_one` 遇到这些情况
+返回 `discarded`，写入 `review/platform-deprecated.json` 并保留失败检查；该终态不修改提示词、
+不重跑、不转回出题侧、不继续 PUT。重复调用 `repair` 只回读本地废弃凭证，不登录平台。
 
 ## 2026-11-12 首条实际建单后的接口兼容
 

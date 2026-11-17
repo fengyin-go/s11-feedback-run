@@ -22,12 +22,13 @@ def stage_brief(task: Path) -> Path:
     return skill/'references/stage-briefs'/name
 
 
-def _task_packet(task: Path) -> dict | None:
+def _task_packet(task: Path, *, include_capsule: bool = False) -> dict | None:
+    if lib.platform_deprecated(task):
+        return None
     work_path = task / "review/task-agent-work.json"
     if not work_path.is_file() or lib.stage_ok(task, "feedback"):
         return None
     work = lib.load_json(work_path)
-    check = lib.load_json(task / fbr_evidence.CHECK, default={})
     packet = {
         "task_id": task.name,
         "task_path": str(task),
@@ -39,25 +40,35 @@ def _task_packet(task: Path) -> dict | None:
         "candidate_schema": str(task / "review/candidate-schema.json"),
         "decision_input": str(task / "review/decision-input.json"),
         "stage_brief": str(stage_brief(task)),
-        "counts": check.get("counts", {}),
         "repair_errors": work.get("repair_errors", [])[:20],
         "next_steps": work.get("next_steps", []),
         "evidence_rule": "只读 brief 和事件包；原始轨迹用 fbr_evidence.py fetch 按行/block查询，不整文件读取",
     }
     contract = task / "review-contract.json"
-    if contract.is_file() and not contract.is_symlink():
+    if not include_capsule and contract.is_file() and not contract.is_symlink():
         packet["review_contract"] = str(contract)
         packet["review_contract_rule"] = (
             "结果和测试句落到业务行为映射；环境噪声不作为模型扣分依据；"
             "key_business_constraint 用于语言复核"
         )
+    if include_capsule:
+        capsule_path = task / "review/review-capsule.json"
+        capsule = lib.load_json(capsule_path, default={})
+        if capsule:
+            packet["capsule_path"] = str(capsule_path)
+            packet["capsule"] = capsule
+        else:
+            brief = task / "review/task-agent-brief.md"
+            if not brief.is_file():
+                raise lib.FbrError(f"{task.name}：缺少 review capsule 和 task-agent brief")
+            packet["brief_text"] = brief.read_text(encoding="utf-8")
     return packet
 
 
-def pending(root: Path, batch: str) -> list[dict]:
+def pending(root: Path, batch: str, *, include_capsule: bool = False) -> list[dict]:
     rows = []
     for task in lib.task_dirs(root, batch):
-        packet = _task_packet(task)
+        packet = _task_packet(task, include_capsule=include_capsule)
         if packet:
             rows.append(packet)
     rows.sort(key=lambda row: (
@@ -68,10 +79,11 @@ def pending(root: Path, batch: str) -> list[dict]:
     return rows
 
 
-def next_task(root: Path, batch: str, *, wait: bool = False, timeout: int = 300) -> dict:
+def next_task(root: Path, batch: str, *, wait: bool = False, timeout: int = 300,
+              inline: bool = False) -> dict:
     deadline = time.time() + max(1, timeout)
     while True:
-        rows = pending(root, batch)
+        rows = pending(root, batch, include_capsule=inline)
         if rows:
             return {"state": "ok", "task": rows[0], "backlog": len(rows)}
         if not wait or time.time() >= deadline:
@@ -82,7 +94,7 @@ def next_task(root: Path, batch: str, *, wait: bool = False, timeout: int = 300)
             {"needs_task_agent", "completed", "blocked", "budget", "paused"},
             timeout=remaining)
         if event["state"] in ("completed", "blocked", "budget", "paused"):
-            more = pending(root, batch)
+            more = pending(root, batch, include_capsule=inline)
             if more:
                 return {"state": "ok", "task": more[0], "backlog": len(more)}
             return {"state": "empty", "task": None, "backlog": 0,
@@ -155,17 +167,28 @@ def main() -> int:
         command.add_argument("--batch", required=True)
     subs.choices["next"].add_argument("--wait", action="store_true")
     subs.choices["next"].add_argument("--timeout", type=int, default=300)
+    subs.choices["next"].add_argument(
+        "--inline", action="store_true",
+        help="直接返回去重 review capsule，避免再读取 brief/contract")
     subs.choices["wait"].add_argument("--events", default="needs_task_agent")
     subs.choices["wait"].add_argument("--timeout", type=int, default=300)
     close = subs.add_parser("closeout")
     close.add_argument("--batch", required=True)
     close.add_argument("--task", required=True)
+    close.add_argument("--json", action="store_true")
     args = parser.parse_args()
     try:
         root = lib.find_root(args.root)
         if args.command == "closeout":
             result = closeout(root, args.batch, args.task)
-            print(json.dumps(result, ensure_ascii=False, indent=2))
+            if args.json:
+                print(json.dumps(result, ensure_ascii=False, indent=2))
+            else:
+                print(
+                    f"{result['task_id']} closed gate={result['gate_state']} "
+                    f"score={result.get('score')} requirements={len(result.get('requirements', []))} "
+                    f"process={len(result.get('process_claims', []))}"
+                )
             return 0
         if args.command == "wait":
             result = wait_for_event(root, args.batch,
@@ -175,13 +198,17 @@ def main() -> int:
             return 0 if result['state'] != 'timeout' else 1
         rows = pending(root, args.batch)
         if args.command == "next":
-            result = next_task(root, args.batch, wait=args.wait, timeout=args.timeout)
+            result = next_task(root, args.batch, wait=args.wait, timeout=args.timeout,
+                               inline=args.inline)
         else:
             result = {"state": "ok", "count": len(rows),
                       "tasks": [{key: row.get(key) for key in
                                  ("task_id", "task_path", "brief", "checkpoint")}
                                 for row in rows]}
-        print(json.dumps(result, ensure_ascii=False, indent=2))
+        if args.command == "next" and args.inline:
+            print(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
+        else:
+            print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0
     except lib.FbrError as exc:
         print("错误：" + str(exc))

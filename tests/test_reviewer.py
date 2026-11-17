@@ -9,7 +9,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from flow import FlowCase, audit, feedback, mock_claim_reviews
+from flow import FlowCase, audit, feedback, mock_claim_reviews, run_main
 import fbr_feedback
 import fbr_delivery
 import fbr_reviewer as reviewer
@@ -171,6 +171,21 @@ class Review(FlowCase):
         self.assertEqual(result['state'], 'needs_task_agent')
         analysis.assert_called_once()
 
+    def test_platform_repair_checkpoint_rejects_prompt_changes(self):
+        task = self.agent_prepared()
+        original = lib.load_json(task / 'task.json')['prompt']
+        lib.save_json(task / 'review/upload.json', {
+            'submission_id': 1,
+            'binding': {'data': {'user_prompt': original}},
+        })
+        changed = original + '\n追加要求后重跑'
+        record = lib.load_json(task / 'task.json')
+        record['prompt'] = changed
+        lib.save_json(task / 'task.json', record)
+        (task / 'prompt.txt').write_text(changed, encoding='utf-8')
+        with self.assertRaisesRegex(lib.FbrError, '绝对禁止修改提示词'):
+            reviewer.prepare_task_agent(task, allow_platform_repair=True)
+
     def test_acceptance_and_process_recheck_use_current_ai_without_model_config(self):
         task = self.agent_prepared()
         candidate = json.loads(self.candidate()[0])
@@ -321,17 +336,92 @@ class Review(FlowCase):
         verification['checks'][0]['passed'] = False
         verification['checks'][0]['reason'] = '本句缺少原始轨迹中的直接支持'
         first = reviewer.finalize(task, candidate, verification)
-        second = reviewer.finalize(task, candidate, verification)
+        with mock.patch.object(reviewer.lib, 'now_iso', return_value='2099-01-01T00:00:00+0800'):
+            second = reviewer.finalize(task, candidate, verification)
         self.assertEqual(first['state'], 'repairing')
         self.assertEqual(second['state'], 'repairing')
+        self.assertTrue(second['idempotent_reuse'])
         self.assertIn('不要重复 finalize', second['detail'])
         history = lib.load_json(task/'review/task-agent-history.json')
         self.assertEqual(len(history['attempts']), 1)
         attempt = history['attempts'][0]
+        self.assertEqual(attempt['reuse_count'], 1)
         self.assertTrue((task/attempt['candidate_ref']).is_file())
         self.assertTrue((task/attempt['verification_ref']).is_file())
         self.assertNotIn('candidate', attempt)
         self.assertNotIn('verification', attempt)
+
+    def test_accepted_finalize_is_idempotent_and_does_not_republish(self):
+        task = self.agent_prepared()
+        candidate = json.loads(self.candidate()[0])
+        verification = self.verification(task, candidate)
+        first = reviewer.finalize(task, candidate, verification, defer_delivery=True)
+        with mock.patch('fbr_sheet.write_sheet') as sheet, \
+             mock.patch('fbr_feedback.gate_batch',
+                        side_effect=AssertionError('idempotent finalize must not re-gate')):
+            second = reviewer.finalize(task, candidate, verification, defer_delivery=True)
+        self.assertEqual(first['state'], 'ok')
+        self.assertEqual(second['state'], 'ok')
+        self.assertTrue(second['idempotent_reuse'])
+        sheet.assert_not_called()
+        history = lib.load_json(task/'review/task-agent-history.json')
+        self.assertEqual(len(history['attempts']), 1)
+        self.assertEqual(len(history['accepted_versions']), 1)
+        self.assertEqual(history['attempts'][0]['reuse_count'], 1)
+        self.assertEqual(history['attempts'][0]['result_state'], 'ok')
+
+    def test_spotcheck_rejection_invalidates_accepted_idempotency(self):
+        task = self.agent_prepared()
+        candidate = json.loads(self.candidate()[0])
+        verification = self.verification(task, candidate)
+        reviewer.finalize(task, candidate, verification, defer_delivery=True)
+        feedback_sha = lib.load_state(task)['stages']['feedback']['feedback_sha']
+        lib.save_json(task/'review/spotcheck.json', {
+            'task_id': task.name, 'state': '退回', 'feedback_sha': feedback_sha,
+            'note': '正文第 2 句需要重查', 'by': '复核人',
+        })
+        lib.set_stage(task, 'feedback', 'failed', problems=['抽检退回'])
+        second = reviewer.finalize(task, candidate, verification, defer_delivery=True)
+        self.assertEqual(second['state'], 'repairing')
+        self.assertFalse(second.get('idempotent_reuse'))
+
+    def test_prompt_file_change_invalidates_deferred_idempotency(self):
+        task = self.agent_prepared()
+        candidate = json.loads(self.candidate()[0])
+        verification = self.verification(task, candidate)
+        reviewer.finalize(task, candidate, verification, defer_delivery=True)
+        prompt = task / 'prompt.txt'
+        prompt.write_text(prompt.read_text(encoding='utf-8') + '\nchanged', encoding='utf-8')
+        with self.assertRaisesRegex(lib.FbrError, 'prompt.txt'):
+            reviewer.finalize(task, candidate, verification, defer_delivery=True)
+
+    def test_legacy_array_history_is_normalized_before_idempotent_append(self):
+        task = self.agent_prepared()
+        lib.save_json(task/'review/task-agent-history.json', [{
+            'at': '2026-11-01T00:00:00+0800', 'attempt_sha': 'legacy',
+            'candidate_sha': 'old', 'verification_sha': 'old', 'errors': [],
+        }])
+        candidate = json.loads(self.candidate()[0])
+        verification = self.verification(task, candidate)
+        verification['checks'][0]['passed'] = False
+        result = reviewer.finalize(task, candidate, verification)
+        self.assertEqual(result['state'], 'repairing')
+        history = lib.load_json(task/'review/task-agent-history.json')
+        self.assertIsInstance(history, dict)
+        self.assertEqual(history['version'], 2)
+        self.assertEqual(len(history['attempts']), 2)
+        self.assertEqual(history['attempts'][0]['attempt_sha'], 'legacy')
+        self.assertIn('attempt_key', history['attempts'][1])
+
+    def test_success_output_is_one_line_without_generated_paths(self):
+        task = self.agent_prepared()
+        text = reviewer.compact_result(task, 'build', {
+            'task_id': task.name, 'state': 'ok', 'detail': 'Feedback 候选本地预检通过',
+            'candidate': '/tmp/candidate.json', 'verification': '/tmp/verification.json',
+        })
+        self.assertEqual(len(text.splitlines()), 1)
+        self.assertIn('Feedback 候选本地预检通过', text)
+        self.assertNotIn('/tmp/candidate.json', text)
 
     def test_work_queue_returns_one_compact_packet_not_full_materials(self):
         task = self.agent_prepared()
@@ -497,3 +587,17 @@ class Review(FlowCase):
         self.assertEqual(saved['version'], 1)
         self.assertTrue(Path(saved['path']).is_file())
         self.assertTrue(Path(fbr_work.stage_brief(task)).is_file())
+        code, stdout, stderr = run_main(
+            fbr_work, '--root', str(self.root), 'closeout',
+            '--batch', task.parent.name, '--task', task.name,
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(stderr, '')
+        self.assertEqual(len(stdout.splitlines()), 1)
+        self.assertIn(f"{task.name} closed gate=", stdout)
+        code, stdout, _ = run_main(
+            fbr_work, '--root', str(self.root), 'closeout',
+            '--batch', task.parent.name, '--task', task.name, '--json',
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(stdout)["task_id"], task.name)

@@ -541,8 +541,6 @@ def build_card(record: dict, facts: dict, probes: list[dict]) -> str:
     out.append("- 完整 diff 在 review/diff.patch")
 
     out += ["", "## 过程（轨迹）", "",
-            f"- 共 {facts['trace']['counts']['tools']} 步，其中报错 {facts['trace']['counts']['errors']} 步，"
-            f"改文件 {facts['trace']['counts']['edits']} 步",
             f"- 模型自己跑过测试：{'是' if check['tests_run'] else '否'}；最后一次改动在第 {check['last_edit_step']} 步，"
             f"之后{'又验证过' if check['verified_after_last_edit'] else '没有再验证'}；"
             f"最后一次检查{'通过' if check['last_check_passed'] else '没通过' if check['checks'] else '不存在'}"]
@@ -582,86 +580,273 @@ def build_card(record: dict, facts: dict, probes: list[dict]) -> str:
     return "\n".join(out) + "\n"
 
 
-def build_brief(record: dict, facts: dict, probes: list[dict]) -> str:
-    """Compact decision packet; full card and raw facts remain queryable references."""
-    tests, changes, check, claims = facts["tests"], facts["changes"], facts["verification"], facts["claims"]
-    out = [f"# {record['task_id']} 验收决策包", "",
-           "原始轨迹、facts 和历史只用于定向查询，不整文件朗读。每条过程结论必须绑定原始 trace 的行号、block 和连续原文。", "",
-           "## 写 Feedback 前先过语言关", "", *fbr_style.generation_guidance(), "",
-           "## 题面", "", record["prompt"].strip(), "", "## 需求", ""]
-    for req in record["requirements"]:
-        out.append(f"- {req['id']}：{req.get('text', '')}")
-    out += [
-        "", "## build 自动派生",
-        "- requirements_status、process_audit、score_basis 缺省项由 requirements/process/claims 生成，不要重复手填。",
-        "- process.evidence 会自动定位原始轨迹并合并到同一句 claim.sources。",
-        "- score_basis.anchors 优先从 requirements 和 results 的 anchors 取；没有有效锚点时仍会阻断。",
-        "", "## 证据候选",
-    ]
-    for row in probes:
-        out.append(f"- probe {row.get('id')}：`{lib.clip(row.get('cmd'), 160)}` → 退出码 {row.get('rc')}")
-    for row in changes["files"][:20]:
-        out.append(f"- file {row.get('path')}")
-    for index, row in enumerate(facts["demo"]["steps"][:10], 1):
-        out.append(f"- demo {index}：`{lib.clip(row.get('cmd'), 160)}`")
-    out += ["", "## 交付结果",
-            f"- 测试：初始 `{tests['before']['test_rc']}` / 产物 `{tests['after']['test_rc']}`；"
-            f"产物 {'通过' if tests['after_ok'] else '不通过'}，新增失败 {'、'.join(tests['new_failures']) or '无'}",
-            f"- 改动：{changes['totals']['files']} 文件，+{changes['totals']['added']} / -{changes['totals']['deleted']}"]
-    for item in changes["files"][:40]:
-        out.append(f"  - {item['status']} {item['path']} (+{item['added']} / -{item['deleted']})")
-    for index, step in enumerate(facts["demo"]["steps"], 1):
-        state = "没跑到" if step.get("skipped") else f"退出码 {step.get('rc')}"
-        out.append(f"- 演示 {index}：`{lib.clip(step['cmd'], 180)}` → {state}；{step.get('show') or '未写'}")
-        if step.get("tail"):
-            out.append("  " + lib.clip(step["tail"][-600:].replace("\n", " / "), 600))
-    if facts["demo"].get("coverage_declared"):
-        pages = facts["demo"].get("pages", [])
-        out.append(
-            "- Web 页面覆盖："
-            + ("完整" if facts["demo"].get("coverage_complete") else "不完整")
-            + f"；{len(pages)} 个声明页面，缺失 "
-            + ("、".join(facts["demo"].get("missing_pages", [])) or "无")
-        )
-    for error in facts["demo"].get("action_errors", [])[:3]:
-        out.append("- 页面动作实际报错：" + lib.clip(error, 500))
-    out += ["", "## 模型过程摘要",
-            f"- 工具 {facts['trace']['counts']['tools']} 步，报错 {facts['trace']['counts']['errors']}，"
-            f"编辑 {facts['trace']['counts']['edits']}；最后编辑第 {check['last_edit_step']} 步，"
-            f"之后{'有验证' if check['verified_after_last_edit'] else '没有验证'}"]
-    for row in check["checks"][-10:]:
-        out.append(f"  - 第 {row['step']} 步 {row['kind']}：`{lib.clip(row['cmd'], 120)}` → "
-                   f"{'通过' if row['passed'] else '没通过'}")
+def build_capsule(record: dict, facts: dict, probes: list[dict]) -> dict:
+    """Build one deduplicated review packet; full facts remain queryable on disk."""
+    tests, changes, check, claims = (
+        facts["tests"], facts["changes"], facts["verification"], facts["claims"]
+    )
+    demo = facts["demo"]
     errors = [step for step in facts["trace"]["steps"] if step.get("is_error")]
-    for step in errors[-10:]:
-        out.append(f"  - 第 {step['step']} 步错误：`{lib.clip(step.get('target', ''), 120)}` → "
-                   f"{lib.clip(step.get('error', ''), 220)}")
+    return {
+        "version": 2,
+        "task_id": record["task_id"],
+        "guidance": fbr_style.generation_guidance(),
+        "build_contract": [
+            "requirements_status、process_audit、score_basis 缺省项由 requirements/process/claims 生成，不要重复手填。",
+            "process.evidence 会自动定位原始轨迹并合并到同一句 claim.sources。",
+            "score_basis.anchors 优先从 requirements 和 results 的 anchors 取；没有有效锚点时仍会阻断。",
+        ],
+        "prompt": record["prompt"].strip(),
+        "requirements": [
+            {"id": req.get("id"), "text": req.get("text", ""), "check": req.get("check", "")}
+            for req in record["requirements"]
+        ],
+        "contract": record.get("review_contract") or {},
+        "tests": {
+            "setup_cmd": tests.get("setup_cmd"),
+            "test_cmd": tests.get("test_cmd"),
+            "before": {
+                key: tests["before"].get(key)
+                for key in ("setup_rc", "test_rc", "passed", "failed")
+            },
+            "after": {
+                key: tests["after"].get(key)
+                for key in ("setup_rc", "test_rc", "passed", "failed")
+            },
+            "new_failures": tests.get("new_failures", []),
+            "fixed": tests.get("fixed", []),
+            "after_ok": tests.get("after_ok"),
+            "after_runnable": tests.get("after_runnable"),
+            "regression": tests.get("regression"),
+            "failure_tail": (
+                lib.clip(tests["after"].get("test_tail", "")[-1800:], 1800)
+                or lib.clip(tests["after"].get("setup_tail", ""), 1200)
+            ) if not tests.get("after_ok") else "",
+        },
+        "changes": {
+            "totals": changes.get("totals", {}),
+            "model_commits": changes.get("model_commits", 0),
+            "history_rewritten": bool(changes.get("history_rewritten")),
+            "no_change": bool(changes.get("no_change")),
+            "files": [
+                {key: row.get(key) for key in
+                 ("status", "path", "added", "deleted", "is_test")}
+                for row in changes.get("files", [])[:40]
+            ],
+            "tests_deleted": changes.get("tests_deleted", []),
+            "tests_weakened": changes.get("tests_weakened", []),
+            "skips_added": changes.get("skips_added", [])[:10],
+            "placeholders": changes.get("placeholders", [])[:10],
+        },
+        "demo": {
+            "setup_ok": demo.get("setup_ok"),
+            "setup_tail": (
+                lib.clip(demo.get("setup_tail"), 300)
+                if not demo.get("setup_ok") else ""
+            ),
+            "coverage_declared": bool(demo.get("coverage_declared")),
+            "coverage_complete": bool(demo.get("coverage_complete")),
+            "pages": demo.get("pages", []),
+            "missing_pages": demo.get("missing_pages", []),
+            "action_errors": [
+                lib.clip(value, 500) for value in demo.get("action_errors", [])[:3]
+            ],
+            "steps": [
+                {
+                    "index": index,
+                    "cmd": lib.clip(row.get("cmd"), 180),
+                    "show": row.get("show") or "",
+                    "rc": row.get("rc"),
+                    "skipped": bool(row.get("skipped")),
+                    "cut": bool(row.get("cut")),
+                    "page": row.get("page"),
+                    "tail": lib.clip((row.get("tail") or "")[-600:], 600),
+                }
+                for index, row in enumerate(demo.get("steps", []), 1)
+            ],
+        },
+        "probes": [
+            {
+                "id": row.get("id"),
+                "cmd": lib.clip(row.get("cmd"), 180),
+                "rc": row.get("rc"),
+                "setup_rc": row.get("setup_rc"),
+                "tail": lib.clip((row.get("tail") or "")[-500:], 500),
+                "output_file": row.get("output_file", ""),
+            }
+            for row in probes
+        ],
+        "process": {
+            "last_edit_step": check.get("last_edit_step"),
+            "verified_after_last_edit": check.get("verified_after_last_edit"),
+            "last_check_passed": check.get("last_check_passed"),
+            "checks": [
+                {
+                    key: lib.clip(row.get(key), 120) if key in ("cmd", "error") else row.get(key)
+                    for key in ("step", "kind", "cmd", "passed", "error")
+                }
+                for row in check.get("checks", [])[-10:]
+            ],
+            "errors": [
+                {
+                    "step": row.get("step"),
+                    "target": lib.clip(row.get("target"), 120),
+                    "error": lib.clip(row.get("error"), 220),
+                }
+                for row in errors[-10:]
+            ],
+        },
+        "final_answer": lib.clip(claims.get("final_answer"), 2000),
+        "mentioned_missing": claims.get("mentioned_missing", []),
+        "mentioned_unchanged": claims.get("mentioned_unchanged", []),
+        "queries": {
+            "facts": "evidence/facts.json",
+            "card": "review/card.md",
+            "diff": "review/diff.patch",
+            "trace_pack": "trace/review-pack.json",
+            "candidate_schema": "review/candidate-schema.json",
+            "recording": "record/recording.json",
+            "pages": "record/pages/",
+            "exact_trace": (
+                "fbr_evidence.py fetch --task <task-dir> "
+                "--ref '<path/start_line/end_line/block/excerpt>'"
+            ),
+        },
+    }
+
+
+def render_capsule(capsule: dict) -> str:
+    out = [
+        f"# {capsule['task_id']} 验收决策包",
+        "",
+        "本包去重展示判断材料；完整 facts、diff、日志、事件包和原始轨迹只用于定向查询。",
+        "每条过程结论必须绑定原始 trace 的行号、block 和连续原文。",
+        "",
+        "## 写 Feedback 前先过语言关",
+        "",
+        *capsule.get("guidance", []),
+        "",
+        "## Build 自动派生",
+        "",
+        *[f"- {value}" for value in capsule.get("build_contract", [])],
+        "",
+        "## 题面",
+        "",
+        capsule.get("prompt", ""),
+        "",
+        "## 需求",
+        "",
+    ]
+    for req in capsule.get("requirements", []):
+        check = f"（怎么验：{req['check']}）" if req.get("check") else ""
+        out.append(f"- {req.get('id')}：{req.get('text', '')}{check}")
+    contract = capsule.get("contract") or {}
+    if contract:
+        out += ["", "## Review Contract", "", "```json",
+                json.dumps(contract, ensure_ascii=False, indent=2), "```"]
+    tests = capsule.get("tests", {})
+    before, after = tests.get("before", {}), tests.get("after", {})
+    out += [
+        "", "## 测试", "",
+        f"- 命令：`{tests.get('setup_cmd')}` 然后 `{tests.get('test_cmd')}`",
+        f"- 初始：setup {before.get('setup_rc')} / test {before.get('test_rc')} / "
+        f"通过 {before.get('passed')} / 失败 {before.get('failed')}",
+        f"- 产物：setup {after.get('setup_rc')} / test {after.get('test_rc')} / "
+        f"通过 {after.get('passed')} / 失败 {after.get('failed')}",
+        f"- 结论：产物{'通过' if tests.get('after_ok') else '不通过'}，"
+        f"{'可运行' if tests.get('after_runnable') else '不可运行'}，"
+        f"新增失败 {'、'.join(tests.get('new_failures', [])) or '无'}，"
+        f"新修好 {'、'.join(tests.get('fixed', [])) or '无'}",
+    ]
+    if tests.get("failure_tail"):
+        out += ["", "```", tests["failure_tail"], "```"]
+    changes = capsule.get("changes", {})
+    totals = changes.get("totals", {})
+    out += [
+        "", "## 改动", "",
+        f"- {totals.get('files', 0)} 个文件，+{totals.get('added', 0)} / "
+        f"-{totals.get('deleted', 0)}；模型提交 {changes.get('model_commits', 0)} 次"
+        + ("；历史被改写" if changes.get("history_rewritten") else "")
+        + ("；相对初始提交没有改动" if changes.get("no_change") else ""),
+    ]
+    for item in changes.get("files", []):
+        out.append(f"- {item.get('status')} {item.get('path')} "
+                   f"(+{item.get('added', 0)} / -{item.get('deleted', 0)})"
+                   + (" [测试]" if item.get("is_test") else ""))
+    for label, key in (("被删测试", "tests_deleted"), ("削弱测试", "tests_weakened")):
+        if changes.get(key):
+            out.append(f"- {label}：{'、'.join(changes[key])}")
+    for label, key in (("新跳过", "skips_added"), ("新占位", "placeholders")):
+        for row in changes.get(key, []):
+            out.append(f"- {label}：{row.get('file')}：{row.get('line')}")
+    demo = capsule.get("demo", {})
+    out += ["", "## 演示", ""]
+    if not demo.get("setup_ok"):
+        out.append(f"- 准备失败：{demo.get('setup_tail', '')}")
+    for row in demo.get("steps", []):
+        state = "没跑到" if row.get("skipped") else f"退出码 {row.get('rc')}"
+        out.append(f"- 演示 {row.get('index')}：`{row.get('cmd')}` → {state}；"
+                   f"{row.get('show') or '未写'}")
+        if row.get("tail"):
+            out.append("  " + row["tail"].replace("\n", " / "))
+    if demo.get("coverage_declared"):
+        out.append(
+            "- Web 覆盖：" + ("完整" if demo.get("coverage_complete") else "不完整")
+            + f"；声明 {len(demo.get('pages', []))} 个页面，缺失 "
+            + ("、".join(demo.get("missing_pages", [])) or "无")
+        )
+    for error in demo.get("action_errors", []):
+        out.append("- 页面动作报错：" + error)
+    process = capsule.get("process", {})
+    out += [
+        "", "## 模型过程", "",
+        f"- 最后编辑第 {process.get('last_edit_step')} 步；之后"
+        f"{'有验证' if process.get('verified_after_last_edit') else '没有验证'}；"
+        f"最后一次检查"
+        f"{'通过' if process.get('last_check_passed') else '没通过' if process.get('checks') else '不存在'}",
+    ]
+    for row in process.get("checks", []):
+        out.append(f"- 第 {row.get('step')} 步 {row.get('kind')}："
+                   f"`{row.get('cmd')}` → {'通过' if row.get('passed') else '没通过'}")
+    for row in process.get("errors", []):
+        out.append(f"- 第 {row.get('step')} 步错误：`{row.get('target')}` → {row.get('error')}")
+    probes = capsule.get("probes", [])
+    if probes:
+        out += ["", "## 实跑", ""]
+        for row in probes:
+            out.append(f"- {row.get('id')}：`{row.get('cmd')}` → 退出码 {row.get('rc')}")
+            if row.get("tail"):
+                out.append("  " + row["tail"].replace("\n", " / "))
+            if row.get("output_file"):
+                out.append(f"  output: `{row['output_file']}`")
     out += ["", "## 最终回答（自述，不是完成证据）", "", "```",
-            lib.clip(claims["final_answer"], 2000), "```"]
-    if claims["mentioned_missing"]:
-        out.append("- 回答提到但产物没有：" + "、".join(claims["mentioned_missing"]))
-    out += ["", "## 实跑"]
-    for row in probes:
-        out.append(f"- {row['id']}：`{lib.clip(row['cmd'], 180)}` → 退出码 {row['rc']}；"
-                   f"{lib.clip((row.get('tail') or '')[-500:].replace(chr(10), ' / '), 500)}")
-    out += ["", "## 定向查询",
-            "- 精确轨迹：`fbr_evidence.py fetch --task <task-dir> --ref '<path/start_line/end_line/block/excerpt>'`",
-            "- 事件包：`trace/review-pack.json`",
-            "- 候选结构：`review/candidate-schema.json`",
-            "- 完整 diff：只在需要核验具体改动时按文件和 hunk 查看，不整份朗读。",
-            "- 打分与写作口径：只读取当前阶段需要的规范，不重复加载其他阶段文档。",
-            "- 语言检查：先写 `language_review`，再运行 build/lint；具体命中看 `review/style-report.json`。"]
+            capsule.get("final_answer", ""), "```"]
+    if capsule.get("mentioned_missing"):
+        out.append("- 回答提到但产物没有：" + "、".join(capsule["mentioned_missing"]))
+    if capsule.get("mentioned_unchanged"):
+        out.append("- 回答提到但这次没改：" + "、".join(capsule["mentioned_unchanged"]))
+    out += ["", "## 定向查询", ""]
+    for key, value in capsule.get("queries", {}).items():
+        out.append(f"- {key}：`{value}`")
     return "\n".join(out) + "\n"
+
+
+def build_brief(record: dict, facts: dict, probes: list[dict]) -> str:
+    """Render the version-2 capsule for compatibility and human inspection."""
+    return render_capsule(build_capsule(record, facts, probes))
 
 
 @lib.task_locked
 def card_one(task_dir: Path) -> dict:
     record, facts = load_evidence(task_dir)
-    text = build_card(record, facts, load_probes(task_dir))
+    probes = load_probes(task_dir)
+    text = build_card(record, facts, probes)
+    capsule = build_capsule(record, facts, probes)
     (task_dir / "review").mkdir(exist_ok=True)
     (task_dir / "review" / "card.md").write_text(text, encoding="utf-8")
+    lib.save_json(task_dir / "review" / "review-capsule.json", capsule)
     (task_dir / "review" / "task-agent-brief.md").write_text(
-        build_brief(record, facts, load_probes(task_dir)), encoding="utf-8")
+        render_capsule(capsule), encoding="utf-8")
     return {"task_id": record["task_id"], "state": "ok", "detail": "review/card.md"}
 
 
@@ -850,6 +1035,11 @@ def main() -> int:
         if args.json:
             print(json.dumps({"rows": rows, "notes": notes}, ensure_ascii=False, indent=2))
             return 0 if all(row["state"] == "ok" for row in rows) else 1
+        if rows and all(row["state"] == "ok" for row in rows):
+            print(f"gate ok tasks={len(rows)}")
+            for line in notes:
+                print(f"提示：{line}")
+            return 0
         for row in rows:
             label = {"ok": "通过", "failed": "没过", "todo": "待写"}[row["state"]]
             print(f"{row['task_id']}  {label}  分数 {row['score']}")

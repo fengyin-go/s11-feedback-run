@@ -75,6 +75,19 @@ SUBMIT_INTERVAL = 10.0
 RATE_LIMIT_RETRIES = 3
 RATE_LIMIT_BACKOFF = (15.0, 30.0, 45.0)
 WRITE_PACING_VERSION = 1
+PROMPT_LEVEL_CHECK_RE = re.compile(
+    r"(?:^|_)(?:difficulty|complexity|workload|tool_call|dedup|duplicate|"
+    r"domain|memory|skill|standard_leak|docker_call)(?:_|$)",
+    re.I,
+)
+PROMPT_LEVEL_PROBLEM_TYPES = {
+    "DOMAIN_MISMATCH",
+    "TASK_TOO_EASY",
+    "DIFFICULTY_MISMATCH",
+    "INSUFFICIENT_WORKLOAD",
+    "DEDUP",
+    "MEMORY_ACCESS",
+}
 
 
 def configure_account(root: Path) -> str:
@@ -916,9 +929,10 @@ def prepare(root: Path, batch_id: str, schema: dict, tasks: str | None = None, l
     import fbr_sheet
     schema_fields(schema)
     cfg = lib.settings(root)
-    selected = lib.task_dirs(root, batch_id, tasks)[:limit]
+    selected = [task for task in lib.task_dirs(root, batch_id, tasks)
+                if not lib.platform_deprecated(task)][:limit]
     if not selected:
-        raise lib.FbrError("没有选中的待提交任务")
+        raise lib.FbrError("没有可处理的待提交任务；本地废弃任务不参与提交或返修")
     manifest = delivery.export_batch(root, batch_id, cfg)
     closeout = fbr_attestation.batch_closeout(
         root, batch_id, cfg, ",".join(task.name for task in selected),
@@ -1209,80 +1223,138 @@ def submit_ready(root: Path, batch_id: str, task_id: str, *, execute: bool = Fal
 
 
 def non_repairable_prompt_checks(detail: dict) -> list[dict]:
-    """Return QC failures that cannot be fixed by editing the submitted fields."""
+    """Return failures that make the existing platform record locally undeliverable.
+
+    Platform repair is limited to non-locked fields on the original record. A
+    prompt/session change followed by a rerun is explicitly outside that path.
+    """
     import fbr_platform_rules
 
     blocked: list[dict] = []
+    status = str(detail.get("status") or "")
+    if status == "DISCARDED":
+        blocked.append({
+            "check_key": "platform_discarded",
+            "check_name": "平台已判定题目废弃",
+            "summary": detail.get("qc_summary") or "平台记录状态为 DISCARDED",
+            "quote": "",
+            "owner": "s11-feedback-run",
+            "action": "discard_locally",
+            "requires_prompt_change": False,
+        })
+    elif status == "PENDING_FIX" and detail.get("editable") is not True:
+        blocked.append({
+            "check_key": "platform_record_not_editable",
+            "check_name": "平台待返修记录不可编辑",
+            "summary": "status=PENDING_FIX editable=false",
+            "quote": "",
+            "owner": "s11-feedback-run",
+            "action": "discard_locally",
+            "requires_prompt_change": False,
+        })
     for check in detail.get("qc_checks") or []:
         if not isinstance(check, dict) or check.get("passed") is not False:
             continue
         evidence = check.get("evidence") if isinstance(check.get("evidence"), dict) else {}
         key = str(check.get("check_key") or "")
-        if evidence.get("problem_type") == "DOMAIN_MISMATCH":
+        problem_type = str(evidence.get("problem_type") or "")
+        if problem_type == "DOMAIN_MISMATCH":
             blocked.append({
                 "check_key": key,
                 "check_name": check.get("check_name"),
                 "summary": check.get("summary"),
                 "quote": evidence.get("quote"),
-                "owner": "s11-gsb-prompt-create",
-                "action": "replace_main_task",
+                "owner": "s11-feedback-run",
+                "action": "discard_locally",
+                "requires_prompt_change": True,
             })
-        elif key in fbr_platform_rules.NON_REPAIRABLE_QC_CHECKS:
+        elif (key in fbr_platform_rules.NON_REPAIRABLE_QC_CHECKS
+              or problem_type in PROMPT_LEVEL_PROBLEM_TYPES
+              or PROMPT_LEVEL_CHECK_RE.search(key)):
             runtime_check = (
-                key.startswith("trace_")
-                and key not in {"trace_complexity_floor", "trace_tool_call_floor"}
+                problem_type == "MEMORY_ACCESS"
+                or (
+                    key.startswith("trace_")
+                    and key not in {"trace_complexity_floor", "trace_tool_call_floor"}
+                )
             )
             blocked.append({
                 "check_key": key,
                 "check_name": check.get("check_name"),
                 "summary": check.get("summary"),
                 "quote": evidence.get("quote"),
-                "owner": (
-                    "s11-feedback-run" if runtime_check else "s11-gsb-prompt-create"
-                ),
-                "action": (
-                    "runtime_rerun_required" if runtime_check else "prompt_rebuild_required"
-                ),
+                "owner": "s11-feedback-run",
+                "action": "discard_locally",
+                "requires_prompt_change": not runtime_check,
             })
     return blocked
+
+
+def discard_platform_task(task_dir: Path, detail: dict, blockers: list[dict], *,
+                          reason: str = "") -> dict:
+    requires_prompt_change = any(
+        item.get("requires_prompt_change") is True for item in blockers
+        if isinstance(item, dict)
+    )
+    if not reason:
+        reason = (
+            "platform_repair_requires_prompt_change"
+            if requires_prompt_change
+            else "platform_record_not_field_repairable"
+        )
+    detail_text = (
+        "平台失败项只能通过修改提示词或重做题面处理；已在本地标记废弃，不修改提示词、不重跑、不继续返修。"
+        if requires_prompt_change
+        else "原平台记录不能通过非锁定字段返修；已在本地标记废弃，不重跑、不继续返修。"
+    )
+    return lib.deprecate_platform_task(
+        task_dir,
+        submission_id=(lib.load_json(task_dir / "review/upload.json", default={}) or {}).get("submission_id"),
+        remote_status=str(detail.get("status") or ""),
+        blockers=blockers,
+        reason=reason,
+        detail=detail_text,
+    )
 
 
 def repair_one(root: Path, plan: dict, client, schema: dict, *, execute: bool, comment: str,
                interval: float | None = None) -> dict:
     task_dir = root / "batches" / plan["batch"] / plan["task_id"]
+    discarded = lib.platform_deprecated(task_dir)
+    if discarded:
+        return {
+            "task_id": plan["task_id"],
+            "state": "discarded",
+            "submission_id": discarded.get("submission_id"),
+            "status": discarded.get("remote_status"),
+            "reason": discarded.get("reason"),
+            "detail": discarded.get("detail") or "任务已在本地标记废弃，不处理",
+        }
     path = task_dir / "review/upload.json"
     receipt = lib.load_json(path, default={})
     if not isinstance(receipt, dict) or not valid_id(receipt.get("submission_id")):
         raise lib.FbrError(f"{plan['task_id']}：没有可返修的平台记录")
-    style_errors = platform_style_problems(str(plan["data"].get("feedback", "")))
-    if style_errors:
-        raise lib.FbrError("；".join(style_errors))
+    lib.assert_platform_prompt_unchanged(task_dir)
     submission_id = receipt["submission_id"]
     detail = client.detail(submission_id)
-    if str(detail.get("session_id")) != str(plan["data"]["session_id"]):
+    detail_session = detail.get("session_id") or remote_data(detail).get("session_id")
+    if str(detail_session) != str(plan["data"]["session_id"]):
         raise lib.FbrError(f"{plan['task_id']}：平台记录 SessionID 与当前交付不一致")
     prompt_blockers = non_repairable_prompt_checks(detail)
     if prompt_blockers:
-        runtime_only = bool(prompt_blockers) and all(
-            item.get("owner") == "s11-feedback-run"
-            for item in prompt_blockers
-        )
+        discarded = discard_platform_task(task_dir, detail, prompt_blockers)
         return {
             "task_id": plan["task_id"],
-            "state": (
-                "runtime_rerun_required"
-                if runtime_only
-                else "prompt_rebuild_required"
-            ),
+            "state": "discarded",
             "submission_id": submission_id,
             "status": detail.get("status"),
             "blockers": prompt_blockers,
-            "detail": (
-                "平台失败项来自运行轨迹或私有会话读取；返修只能改字段，不能替换会话或附件，需重新运行。"
-                if runtime_only
-                else "平台失败项属于题目难度、查重、工作量或领域主体；返修只能改字段，不能替换题面、会话或附件，需回到出题重做。"
-            ),
+            "reason": discarded["reason"],
+            "detail": discarded["detail"],
         }
+    style_errors = platform_style_problems(str(plan["data"].get("feedback", "")))
+    if style_errors:
+        raise lib.FbrError("；".join(style_errors))
     current = remote_data(detail)
     current_trace = detail.get("trace_file")
     if current_trace:
@@ -1296,6 +1368,29 @@ def repair_one(root: Path, plan: dict, client, schema: dict, *, execute: bool, c
             desired[key] = plan["data"][key]
     changes = {key: {"from": current.get(key), "to": desired.get(key)}
                for key in desired if current.get(key) != desired.get(key)}
+    status = str(detail.get("status") or "")
+
+    def non_repairable_state() -> dict:
+        blocker = {
+            "check_key": "platform_record_not_editable",
+            "check_name": "平台记录不可返修",
+            "summary": f"status={status or 'missing'} editable={detail.get('editable')!r}",
+            "quote": "",
+            "owner": "s11-feedback-run",
+            "action": "discard_locally",
+            "requires_prompt_change": False,
+        }
+        discarded = discard_platform_task(
+            task_dir, detail, [blocker], reason="platform_record_not_editable")
+        return {
+            "task_id": plan["task_id"],
+            "state": "discarded",
+            "submission_id": submission_id,
+            "status": status,
+            "blockers": [blocker],
+            "reason": discarded["reason"],
+            "detail": discarded["detail"],
+        }
 
     def save_receipt(updated: dict, actual: dict) -> dict:
         expected = payload_with_media(plan, receipt.get("uploads", {}))
@@ -1316,6 +1411,14 @@ def repair_one(root: Path, plan: dict, client, schema: dict, *, execute: bool, c
 
     qc_active = detail.get("qc_running") is True or detail.get("stage") in ("QC_WAITING", "QC_RUNNING")
     if not changes:
+        if status == "QC_PASSED":
+            return {"task_id": plan["task_id"], "state": "ok", "submission_id": submission_id,
+                    "status": status, "changed_fields": []}
+        if qc_active or status in ("QC_WAITING", "QC_RUNNING"):
+            return {"task_id": plan["task_id"], "state": "pending", "submission_id": submission_id,
+                    "status": status, "changed_fields": []}
+        if status != "PENDING_FIX" or detail.get("editable") is not True:
+            return non_repairable_state()
         if not execute:
             return {"task_id": plan["task_id"], "state": "dry", "submission_id": submission_id,
                     "status": detail.get("status"), "changed_fields": [], "already_applied": True}
@@ -1323,8 +1426,14 @@ def repair_one(root: Path, plan: dict, client, schema: dict, *, execute: bool, c
         return {"task_id": plan["task_id"], "state": "confirmed", "submission_id": submission_id,
                 "status": detail.get("status"), "changed_fields": [], "already_applied": True,
                 "url": f"{BASE_URL}/app/submissions/{submission_id}"}
-    if detail.get("status") != "PENDING_FIX" or detail.get("editable") is not True:
-        raise lib.FbrError(f"{plan['task_id']}：当前状态不是可编辑的待返修")
+    if status == "QC_PASSED":
+        return {"task_id": plan["task_id"], "state": "ok", "submission_id": submission_id,
+                "status": status, "changed_fields": []}
+    if qc_active or status in ("QC_WAITING", "QC_RUNNING"):
+        return {"task_id": plan["task_id"], "state": "pending", "submission_id": submission_id,
+                "status": status, "changed_fields": sorted(changes)}
+    if status != "PENDING_FIX" or detail.get("editable") is not True:
+        return non_repairable_state()
     if not execute:
         return {"task_id": plan["task_id"], "state": "dry", "submission_id": submission_id,
                 "status": detail.get("status"), "changed_fields": sorted(changes), "changes": changes}
@@ -1365,6 +1474,26 @@ def repair_batch(root: Path, batch_id: str, *, tasks: str | None = None,
                  interval: float | None = None) -> dict:
     if execute and confirm != "REPAIR":
         raise lib.FbrError("真实平台返修需要 --execute --confirm REPAIR")
+    selected = lib.task_dirs(root, batch_id, tasks)
+    discarded = {task.name: lib.platform_deprecated(task) for task in selected}
+    active = [task for task in selected if not discarded[task.name]]
+    if not active:
+        return {
+            "platform": BASE_URL,
+            "account": ACCOUNT,
+            "execute": execute,
+            "tasks": [
+                {
+                    "task_id": task.name,
+                    "state": "discarded",
+                    "submission_id": discarded[task.name].get("submission_id"),
+                    "status": discarded[task.name].get("remote_status"),
+                    "reason": discarded[task.name].get("reason"),
+                    "detail": discarded[task.name].get("detail") or "任务已在本地标记废弃，不处理",
+                }
+                for task in selected
+            ],
+        }
     if client is None:
         from fbr_platform import Client
         client = Client(account=ACCOUNT)
@@ -1375,10 +1504,56 @@ def repair_batch(root: Path, batch_id: str, *, tasks: str | None = None,
         if user.get("username") != ACCOUNT or user.get("must_change_password"):
             raise lib.FbrError("登录账号不符或需要人工修改初始密码")
         schema = client.schema()
-        plans = prepare(root, batch_id, schema, tasks, None)
-        rows = [repair_one(root, plan, client, schema, execute=execute, comment=comment,
-                           interval=interval) for plan in plans]
-        return {"platform": BASE_URL, "account": ACCOUNT, "execute": execute, "tasks": rows}
+        rows = {}
+        remaining = []
+        for task in active:
+            receipt = lib.load_json(task / "review/upload.json", default={})
+            if not isinstance(receipt, dict) or not valid_id(receipt.get("submission_id")):
+                remaining.append(task)
+                continue
+            lib.assert_platform_prompt_unchanged(task)
+            detail = client.detail(receipt["submission_id"])
+            binding = receipt.get("binding") if isinstance(receipt.get("binding"), dict) else {}
+            expected_session = (binding.get("data") or {}).get("session_id")
+            detail_session = detail.get("session_id") or remote_data(detail).get("session_id")
+            if expected_session and str(detail_session) != str(expected_session):
+                raise lib.FbrError(f"{task.name}：平台记录 SessionID 与当前交付不一致")
+            blockers = non_repairable_prompt_checks(detail)
+            if blockers:
+                marker = discard_platform_task(task, detail, blockers)
+                rows[task.name] = {
+                    "task_id": task.name,
+                    "state": "discarded",
+                    "submission_id": receipt["submission_id"],
+                    "status": detail.get("status"),
+                    "blockers": blockers,
+                    "reason": marker["reason"],
+                    "detail": marker["detail"],
+                }
+            else:
+                remaining.append(task)
+        if remaining:
+            plans = prepare(root, batch_id, schema, ",".join(task.name for task in remaining), None)
+            rows.update({plan["task_id"]: repair_one(
+                root, plan, client, schema, execute=execute, comment=comment, interval=interval)
+                for plan in plans})
+        for task in selected:
+            if not rows.get(task.name):
+                marker = discarded[task.name]
+                rows[task.name] = {
+                    "task_id": task.name,
+                    "state": "discarded",
+                    "submission_id": marker.get("submission_id"),
+                    "status": marker.get("remote_status"),
+                    "reason": marker.get("reason"),
+                    "detail": marker.get("detail") or "任务已在本地标记废弃，不处理",
+                }
+        return {
+            "platform": BASE_URL,
+            "account": ACCOUNT,
+            "execute": execute,
+            "tasks": [rows[task.name] for task in selected],
+        }
 
 
 def run_batch(root: Path, batch_id: str, *, tasks: str | None = None, limit: int | None = None,

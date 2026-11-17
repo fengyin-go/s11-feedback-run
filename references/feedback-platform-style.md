@@ -27,6 +27,9 @@
 ## 返修流程
 
 ```bash
+# 先只读分类平台失败；不可返修项会直接转为本地废弃，不进入后续步骤
+fbr_batch.py repair --batch b1110-01 --tasks s11-000123
+# 仅未被本地废弃的题继续
 fbr_reviewer.py review --batch b1110-01 --task s11-000123 --platform-repair --execute
 fbr_reviewer.py prepare --batch b1110-01 --task s11-000123 --platform-repair --execute
 # 修改 candidate 和 verification
@@ -42,6 +45,12 @@ fbr_batch.py repair --batch b1110-01 --tasks s11-000123 \
 
 返修后继续轮询详情：只有 `QC_PASSED` 才算通过；新的 `PENDING_FIX` 要按最新 `qc_summary` 和失败 `qc_checks` 再修。
 
+平台返修绝对不允许修改提示词后重跑。`task.json.prompt`、`prompt.txt` 和原平台
+`user_prompt` 必须完全一致；返修 reviewer/prepare/finalize 与 `repair` 都会在读写前核对。
+问题若只能在改题面后通过，或属于领域、难度、工作量、A-5 查重、memory/私有会话读取、
+`DISCARDED`、不可编辑记录，立即写 `review/platform-deprecated.json` 作为本地终态。不得换题、
+重跑、重出题或继续 PUT；后续批次状态只显示“本地废弃”。
+
 ## 2026-11-14 批次返修结论
 
 本批首次提交 38 条后，平台在首轮质检中判定了 5 条需要返修，另有 1 条因题目真实难度不足被直接作废。返修项都不是业务事实错误，而是 Feedback 的可读性和扣分解释不充分。提交前必须按下面的检查逐条排除：
@@ -52,6 +61,8 @@ fbr_batch.py repair --batch b1110-01 --tasks s11-000123 \
 - **不要照搬终端成功语。** `ALL CHECKS PASSED`、`✓ built in ...` 等输出放进正文会触发 AI 化打回；改写成用户能理解的行为和结果。
 - **精确程序量只保留解释问题所必需的。** 同一段连续出现撤销时长、重算天数、释放容量等多个精确值时，会像把日志和断言重排；非关键数值删除，关键值最多保留一两个。
 - **4 到 5 分要有可核对落点。** 正文至少留下一个真实文件、命令、对象或实际返回值，避免只有抽象能力描述。现有 `fbr_reviewer.py finalize` 会在正文完全没有可核对线索时拦截；语义复核仍需判断该线索是否真正支持结论。
-- **题目难度作废不能返修。** `DISCARDED` 和 `PENDING_FIX` 要分开处理；难度规则 P3/P4 判为题目本身过简单时必须换题重出，不改 Feedback、难度字段或已锁定附件。
+- **题目难度作废不能返修。** `DISCARDED` 和 `PENDING_FIX` 要分开处理；难度规则 P3/P4/P5
+  判为题目本身不成立时不得改题重跑，直接在本地标记废弃，不改 Feedback、领域、难度字段或
+  已锁定附件。
 
 `fbr_submit.py.platform_style_problems` 现在会在上传或返修前拦截可机械识别的模式：测试层级空泛通过、精确操作量过密、终端成功输出和已知业务速记。“4 分缺少扣分后果”和“4 到 5 分缺少可核对落点”仍由当前任务 AI 与 finalize 语义检查负责，避免用宽泛正则误伤已经通过的真实过程描述。

@@ -25,6 +25,7 @@ EFFORT = "high"
 PROVIDER = "solo11_reviewer"
 KEY_ENV = "SOLO11_REVIEW_API_KEY"
 DEFAULT_ENV = "~/.codex/solo11/reviewer.env"
+FINALIZE_IDEMPOTENCY_VERSION = 1
 
 
 def credentials(path: Path) -> tuple[str, str]:
@@ -159,6 +160,170 @@ def file_sha(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _load_attempt_history(task: Path) -> tuple[Path, dict]:
+    """Load current history and normalize the legacy top-level list format."""
+    path = Path(task) / "review/task-agent-history.json"
+    raw = lib.load_json(path, default={})
+    if isinstance(raw, list):
+        return path, {"version": 2, "attempts": raw, "accepted_versions": []}
+    if not isinstance(raw, dict):
+        raise lib.FbrError("task-agent-history.json 必须是对象或旧版数组")
+    attempts = raw.get("attempts")
+    if attempts is None:
+        attempts = []
+    if not isinstance(attempts, list):
+        raise lib.FbrError("task-agent-history.json.attempts 必须是数组")
+    history = dict(raw)
+    history["version"] = 2
+    history["attempts"] = attempts
+    accepted = history.get("accepted_versions")
+    if not isinstance(accepted, list):
+        accepted = []
+    history["accepted_versions"] = accepted
+    return path, history
+
+
+def _validate_frozen_prompt_inputs(task: Path) -> None:
+    """Finalize must not reuse or accept output after the frozen prompt changed."""
+    record = lib.load_json(task / "task.json")
+    prompt_path = task / "prompt.txt"
+    if (not prompt_path.is_file() or prompt_path.is_symlink()
+            or prompt_path.read_text(encoding="utf-8") != str(record.get("prompt") or "")):
+        raise lib.FbrError(f"{task.name}：prompt.txt 与 task.json 题面不一致")
+    contract = record.get("review_contract")
+    if contract is not None:
+        contract_path = task / "review-contract.json"
+        if (not contract_path.is_file() or contract_path.is_symlink()
+                or lib.load_json(contract_path, default={}) != contract):
+            raise lib.FbrError(f"{task.name}：review-contract.json 与 task.json 不一致")
+
+
+def _finalize_attempt_key(task: Path, candidate: dict, verification: dict, binding: dict,
+                          *, publish: bool, defer_delivery: bool,
+                          allow_platform_repair: bool, peers: list[dict]) -> tuple[str, dict]:
+    """Hash only semantic inputs; timestamps and repeated execution are excluded."""
+    root = lib.find_root(str(task.parents[2]))
+    cfg = lib.settings(root)
+    spot = task / "review/spotcheck.json"
+    mode = {
+        "publish": bool(publish),
+        "defer_delivery": bool(defer_delivery),
+        "allow_platform_repair": bool(allow_platform_repair),
+    }
+    signature = {
+        "version": FINALIZE_IDEMPOTENCY_VERSION,
+        "candidate_sha": lib.content_hash(candidate),
+        "verification_sha": lib.content_hash(verification),
+        "binding": binding,
+        "quality_version": quality.VERSION,
+        "style_version": fbr_style.VERSION,
+        "style_policy_sha": fbr_style.policy_sha(),
+        "gate_context": {
+            "feedback_gate": cfg.get("feedback_gate", {}),
+            "peer_feedback_sha": lib.content_hash(peers),
+            "spotcheck_sha": file_sha(spot) if spot.is_file() and not spot.is_symlink() else "",
+        },
+        "mode": mode,
+    }
+    return lib.content_hash(signature), {"signature": signature, "mode": mode}
+
+
+def _accepted_state_current(task: Path, candidate: dict, *, publish: bool,
+                            defer_delivery: bool) -> bool:
+    """Return true only when a previously accepted state is still complete and valid."""
+    try:
+        lib.load_task_readonly(task)
+    except lib.FbrError:
+        return False
+    audit, feedback = candidate.get("audit"), candidate.get("feedback")
+    if not isinstance(audit, dict) or not isinstance(feedback, dict):
+        return False
+    if lib.load_json(task / "evidence/audit.json", default={}) != audit:
+        return False
+    if lib.load_json(task / "review/feedback.json", default={}) != feedback:
+        return False
+    stage = lib.load_state(task)["stages"].get("feedback", {})
+    gate = lib.load_json(task / "review/gate.json", default={})
+    model_review = lib.load_json(task / "review/model-review.json", default={})
+    quality_receipt = lib.load_json(task / "review/quality.json", default={})
+    text_sha = hashlib.sha256(str(feedback.get("feedback", "")).encode("utf-8")).hexdigest()
+    if (stage.get("state") != "ok" or stage.get("feedback_sha") != text_sha
+            or gate.get("passed") is not True or gate.get("feedback_sha") != text_sha
+            or model_review.get("state") != "completed"
+            or quality_receipt.get("state") != "accepted"):
+        return False
+    spot = lib.load_json(task / "review/spotcheck.json", default={})
+    if spot.get("state") == "退回" and spot.get("feedback_sha") == text_sha:
+        return False
+    delivery = lib.load_json(task / "review/delivery-repair.json", default={})
+    if delivery.get("state") != "passed":
+        return False
+    if publish and not defer_delivery:
+        snapshot = lib.load_json(task / "review/snapshot.json", default={})
+        if snapshot.get("pushed") is not True:
+            return False
+    if not defer_delivery:
+        import fbr_attestation
+        root = lib.find_root(str(task.parents[2]))
+        if not fbr_attestation.validate(task, root, lib.settings(root))["valid"]:
+            return False
+    return True
+
+
+def _reuse_finalize_attempt(task: Path, history_path: Path, history: dict, attempt: dict,
+                            candidate: dict, *, publish: bool, defer_delivery: bool) -> dict | None:
+    """Return a previously recorded result when no semantic input has changed."""
+    state = str(attempt.get("result_state") or "")
+    errors = attempt.get("errors") if isinstance(attempt.get("errors"), list) else []
+    accepted = not errors and _accepted_state_current(
+        task, candidate, publish=publish, defer_delivery=defer_delivery)
+    if accepted:
+        attempt["result_state"] = "ok"
+        attempt["result_detail"] = "相同 candidate 和 verification 已完整验收，复用现有回执"
+        result_state, result_errors, detail = (
+            "ok", [], "相同 candidate 和 verification 已完整验收，复用现有回执"
+        )
+    elif state == "repairing" or errors or attempt.get("gate_errors"):
+        gate_errors = attempt.get("gate_errors")
+        result_errors = list(dict.fromkeys(
+            [str(item) for item in errors] +
+            ([str(item) for item in gate_errors] if isinstance(gate_errors, list) else [])
+        ))
+        result_state = "repairing"
+        detail = (
+            "相同 candidate 和 verification 已经处理过；返回已记录错误，"
+            "不要重复 finalize"
+        )
+        if attempt.get("result_detail"):
+            detail += "；" + str(attempt["result_detail"])
+    else:
+        return None
+    attempt["reuse_count"] = int(attempt.get("reuse_count") or 0) + 1
+    attempt["last_reused_at"] = lib.now_iso()
+    lib.save_json(history_path, history)
+    return {
+        "task_id": task.name,
+        "state": result_state,
+        "errors": result_errors,
+        "detail": detail,
+        "idempotent_reuse": True,
+        "attempt_sha": attempt.get("attempt_sha"),
+    }
+
+
+def _remember_finalize_result(history_path: Path, history: dict, attempt: dict,
+                              result: dict, *, gate_errors: list[str] | None = None) -> dict:
+    attempt.update({
+        "result_state": result.get("state", "unknown"),
+        "result_detail": result.get("detail", ""),
+        "result_errors": list(result.get("errors") or []),
+    })
+    if gate_errors is not None:
+        attempt["gate_errors"] = list(gate_errors)
+    lib.save_json(history_path, history)
+    return result
+
+
 def trace_index(task: Path) -> Path:
     """Compatibility navigation index projected from the single-ingest event graph."""
     target = task / "review/trace-index.jsonl"
@@ -192,7 +357,8 @@ def trace_index(task: Path) -> Path:
 def inputs(task: Path) -> dict:
     fbr_evidence.ingest(task)
     names = ["task.json", "trace/ids.json", "evidence/facts.json", "evidence/probes.jsonl",
-             "review/card.md", "review/task-agent-brief.md", "review/diff.patch",
+             "review/card.md", "review/review-capsule.json", "review/task-agent-brief.md",
+             "review/diff.patch",
              'record/recording.json', 'record/recording.mp4']
     names += [fbr_evidence.MANIFEST, fbr_evidence.EVENTS, fbr_evidence.CHECK, fbr_evidence.PACK]
     names += [str(p.relative_to(task)) for p in sorted((task / 'evidence/command-logs').rglob('*.log'))]
@@ -426,9 +592,6 @@ def compact_result(task: Path, stage: str, result: dict, *, full: bool = False) 
         return json.dumps(result, ensure_ascii=False, indent=2)
     errors = list(dict.fromkeys(str(item) for item in result.get("errors") or []))
     lines = [f"{task.name}\t{result.get('state', 'ok')}\t{result.get('detail', '')}".rstrip()]
-    for key in ("candidate", "verification"):
-        if result.get(key):
-            lines.append(f"{key}: {result[key]}")
     if errors:
         report = validation_report(task, stage, result)
         lines.append(f"错误 {len(errors)} 项；完整报告 {report}")
@@ -455,6 +618,8 @@ def decode_output(text: str) -> dict:
 def review(task: Path, base: str, secret: str, *, max_versions=3, model=MODEL, effort=EFFORT,
            allow_platform_repair: bool = False) -> dict:
     """Analyze traces only, then hand acceptance to the AI advancing this task."""
+    if allow_platform_repair:
+        lib.assert_platform_prompt_unchanged(task)
     lib.require_stage(task, 'facts')
     if not (task/'review/card.md').is_file() or not (task/'review/task-agent-brief.md').is_file():
         raise lib.FbrError('先执行 fbr_feedback.py card')
@@ -488,6 +653,8 @@ def prepare_task_agent(task: Path, *, allow_platform_repair: bool = False) -> di
     if (not allow_platform_repair
             and lib.load_json(task/'review/upload.json', default={}).get('submission_id')):
         raise lib.FbrError('任务已有平台单，不能自动重写评价')
+    if allow_platform_repair:
+        lib.assert_platform_prompt_unchanged(task)
     errors = analysis_errors(task)
     if errors:
         raise lib.FbrError('；'.join(errors))
@@ -521,7 +688,8 @@ def prepare_task_agent(task: Path, *, allow_platform_repair: bool = False) -> di
                       'claim_reviews': '按 public_units 完整逐句回查；trace 来源必须带 start_line、end_line、block 和原文'},
                   'detail': '当前任务 AI 检查产物、评分、撰写及复核 Feedback；本阶段不调用 reviewer.env'}
     gate = lib.load_json(task/'review/gate.json', default={})
-    last = lib.load_json(task/'review/task-agent-history.json', default={}).get('attempts', [])
+    _, history = _load_attempt_history(task)
+    last = history.get('attempts', [])
     checkpoint['repair_errors'] = gate.get('errors', []) + (last[-1].get('errors', []) if last else [])
     checkpoint['next_steps'] = ['当前任务 AI 修复候选并逐句核对过程及产物断言', 'finalize 过闸并主动推送快照']
     lib.save_json(task/'review/task-agent-work.json', checkpoint)
@@ -533,6 +701,11 @@ def prepare_task_agent(task: Path, *, allow_platform_repair: bool = False) -> di
 def finalize(task: Path, candidate: dict, verification: dict, *, publish=True,
              allow_platform_repair: bool = False, defer_delivery: bool = False) -> dict:
     """Deterministic validation only: never load credentials or call an external model."""
+    if allow_platform_repair:
+        lib.assert_platform_prompt_unchanged(task)
+    if not isinstance(candidate, dict) or not isinstance(verification, dict):
+        raise lib.FbrError("candidate 和 verification 都必须是 JSON 对象")
+    _validate_frozen_prompt_inputs(task)
     lib.require_stage(task, 'facts')
     work = lib.load_json(task/'review/task-agent-work.json', default={})
     binding = {'inputs': inputs(task), 'policy_sha': quality.policy_sha(),
@@ -542,6 +715,26 @@ def finalize(task: Path, candidate: dict, verification: dict, *, publish=True,
     if (verification.get('task_agent') != 'current_task_agent'
             or verification.get('candidate_sha') != lib.content_hash(candidate)):
         raise lib.FbrError('缺少当前任务 AI 与本次候选绑定的复核记录')
+    peers = peer_feedback(task)
+    attempt_key, attempt_meta = _finalize_attempt_key(
+        task, candidate, verification, binding,
+        publish=publish, defer_delivery=defer_delivery,
+        allow_platform_repair=allow_platform_repair, peers=peers,
+    )
+    history_path, history = _load_attempt_history(task)
+    existing = next(
+        (row for row in history["attempts"]
+         if isinstance(row, dict)
+         and attempt_key in (row.get("attempt_key"), row.get("attempt_sha"))),
+        None,
+    )
+    if existing:
+        reused = _reuse_finalize_attempt(
+            task, history_path, history, existing, candidate,
+            publish=publish, defer_delivery=defer_delivery,
+        )
+        if reused:
+            return reused
     errors = analysis_errors(task, binding['trace-analysis_sha'])
     requests = candidate.get('needs_probes')
     if not isinstance(requests, list):
@@ -552,28 +745,13 @@ def finalize(task: Path, candidate: dict, verification: dict, *, publish=True,
     audit, feedback = candidate.get('audit'), candidate.get('feedback')
     if not isinstance(audit, dict) or not isinstance(feedback, dict):
         raise lib.FbrError('候选缺少 audit 或 feedback')
-    errors += draft_errors(task, audit, feedback, peer_feedback(task))
+    errors += draft_errors(task, audit, feedback, peers)
     style_report = fbr_style.write_report(
         task, str(feedback.get("feedback", "")), feedback.get("score"),
         verification.get("language_review"), require_review=True)
     errors += [row["message"] for row in style_report["errors"]]
     errors += quality.report_errors(verification) + quality.claim_report_errors(verification, feedback, task)
     errors = list(dict.fromkeys(errors))
-    history_path = task/'review/task-agent-history.json'
-    history = lib.load_json(history_path, default={'attempts': []})
-    attempt = {'at': lib.now_iso(), 'candidate': candidate, 'verification': verification, 'errors': errors}
-    attempt_sha = lib.content_hash(attempt)
-    existing = {row.get('attempt_sha'): row for row in history.get('attempts', [])
-                if isinstance(row, dict)}
-    if attempt_sha in existing:
-        write_metrics(task, 'feedback_attempt', {
-            'result': 'duplicate_attempt',
-            'candidate_bytes': len(json.dumps(candidate, ensure_ascii=False).encode('utf-8')),
-            'verification_bytes': len(json.dumps(verification, ensure_ascii=False).encode('utf-8')),
-            'errors': len(errors), 'access': fbr_evidence.access_summary(task),
-        })
-        return {'state': 'repairing', 'task_id': task.name, 'errors': errors,
-                'detail': '相同候选和复核已经记录过；没有新证据或修改时不要重复 finalize'}
     objects = task/'review/task-agent-history/objects'
     objects.mkdir(parents=True, exist_ok=True)
     candidate_sha = lib.content_hash(candidate)
@@ -584,12 +762,29 @@ def finalize(task: Path, candidate: dict, verification: dict, *, publish=True,
         lib.save_json(candidate_obj, candidate)
     if not verification_obj.is_file():
         lib.save_json(verification_obj, verification)
-    history['attempts'].append({
-        'at': attempt['at'], 'attempt_sha': attempt_sha, 'candidate_sha': candidate_sha,
-        'verification_sha': verification_sha, 'errors': errors,
-        'candidate_ref': str(candidate_obj.relative_to(task)),
-        'verification_ref': str(verification_obj.relative_to(task)),
-    })
+    attempt = existing
+    if attempt is None:
+        attempt = {
+            'at': lib.now_iso(),
+            'attempt_sha': attempt_key,
+            'attempt_key': attempt_key,
+            'candidate_sha': candidate_sha,
+            'verification_sha': verification_sha,
+            'binding_sha': lib.content_hash(binding),
+            'idempotency_version': FINALIZE_IDEMPOTENCY_VERSION,
+            'mode': attempt_meta['mode'],
+            'errors': errors,
+            'candidate_ref': str(candidate_obj.relative_to(task)),
+            'verification_ref': str(verification_obj.relative_to(task)),
+            'reuse_count': 0,
+        }
+        history['attempts'].append(attempt)
+    else:
+        attempt.update({
+            'candidate_ref': str(candidate_obj.relative_to(task)),
+            'verification_ref': str(verification_obj.relative_to(task)),
+            'errors': errors,
+        })
     lib.save_json(history_path, history)
     write_metrics(task, 'feedback_attempt', {
         'result': 'accepted' if not errors else 'repairing',
@@ -599,8 +794,11 @@ def finalize(task: Path, candidate: dict, verification: dict, *, publish=True,
         'history_attempts': len(history['attempts']),
     })
     if errors:
-        return {'state': 'repairing', 'task_id': task.name, 'errors': errors,
-                'detail': '当前任务 AI 按错误继续修复并复验；未采用失败候选'}
+        return _remember_finalize_result(
+            history_path, history, attempt,
+            {'state': 'repairing', 'task_id': task.name, 'errors': errors,
+             'detail': '当前任务 AI 按错误继续修复并复验；未采用失败候选'},
+        )
     if inputs(task) != binding['inputs'] or quality.policy_sha() != binding['policy_sha']:
         raise lib.FbrError('复核期间证据或规则变化，拒绝采用过期评价')
     # Preserve an accepted version as one content-addressed object, not four copied files.
@@ -614,11 +812,14 @@ def finalize(task: Path, candidate: dict, verification: dict, *, publish=True,
         snapshot_path = objects/(snapshot_sha + '.json')
         if not snapshot_path.is_file():
             lib.save_json(snapshot_path, previous)
-        history.setdefault('accepted_versions', []).append({
-            'at': lib.now_iso(), 'snapshot_sha': snapshot_sha,
-            'snapshot_ref': str(snapshot_path.relative_to(task)),
-        })
-        lib.save_json(history_path, history)
+        accepted_versions = history.setdefault('accepted_versions', [])
+        if not any(row.get('snapshot_sha') == snapshot_sha
+                   for row in accepted_versions if isinstance(row, dict)):
+            accepted_versions.append({
+                'at': lib.now_iso(), 'snapshot_sha': snapshot_sha,
+                'snapshot_ref': str(snapshot_path.relative_to(task)),
+            })
+            lib.save_json(history_path, history)
     trace_hashes = {row['path']: row['sha256']
                     for row in lib.load_json(task/fbr_evidence.CHECK).get('sources', [])}
     source_inputs = {}
@@ -651,21 +852,28 @@ def finalize(task: Path, candidate: dict, verification: dict, *, publish=True,
         import fbr_work
         fbr_work.closeout(root, task.parent.name, task.name)
         if defer_delivery:
-            history_path = task/'review/delivery-repair.json'
-            history = lib.load_json(history_path, default={'attempts': []})
-            history['state'] = 'passed'
-            lib.save_json(history_path, history)
+            delivery_path = task/'review/delivery-repair.json'
+            delivery_history = lib.load_json(delivery_path, default={'attempts': []})
+            delivery_history['state'] = 'passed'
+            lib.save_json(delivery_path, delivery_history)
             lib.set_stage(task, 'feedback', 'ok', score=feedback.get('score'),
                           feedback_sha=fbr_feedback.sha(str(feedback.get('feedback', ''))))
-            return {'task_id': task.name, 'state': 'ok',
-                    'detail': '已复核并过闸门；交付表和导出延后统一生成'}
+            return _remember_finalize_result(
+                history_path, history, attempt,
+                {'task_id': task.name, 'state': 'ok',
+                 'detail': '已复核并过闸门；交付表和导出延后统一生成'},
+            )
         import fbr_sheet
         fbr_sheet.write_sheet(root, task.parent.name, cfg)
         import argparse, threading, fbr_flow
         options = argparse.Namespace(batch=task.parent.name, publish=publish, auto_submit=False, delivery_lock=threading.Lock())
-        return fbr_flow.finish_review(task, root, cfg, options)
-    return {'state': 'ok' if row['state'] == 'ok' else 'repairing', 'task_id': task.name,
-            'errors': row.get('errors', []), 'detail': '已复核、过闸门并刷新本地表' if row['state'] == 'ok' else '继续修复闸门错误'}
+        result = fbr_flow.finish_review(task, root, cfg, options)
+        return _remember_finalize_result(history_path, history, attempt, result)
+    result = {'state': 'repairing', 'task_id': task.name,
+              'errors': row.get('errors', []), 'detail': '继续修复闸门错误'}
+    return _remember_finalize_result(
+        history_path, history, attempt, result, gate_errors=row.get('errors', []),
+    )
 
 
 def main() -> int:

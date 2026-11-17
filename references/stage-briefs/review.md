@@ -2,9 +2,9 @@
 
 目标：依据原始轨迹和最终产物，生成可逐句回溯、无矛盾且能过闸门的 Feedback。
 
-- 先读 `review/task-agent-brief.md`。按需查询相关 diff hunk、最终代码和实跑日志，不整读 facts、diff、原始 JSONL 或历史。
-- 新批次同时读取任务根目录的 `review-contract.json`：结果与测试句必须落到其中的业务行为和真实测试映射；环境噪声不得作为模型扣分依据，`key_business_constraint` 用于语言复核。
-- 用 `fbr_work.py next --wait` 在任务仍运行时滚动领取评审；当前题完成 finalize 和 closeout 后立即领取下一题，不等整批结束。
+- 用 `fbr_work.py next --inline --wait` 领取当前题去重 `review-capsule.json`；不再分别读取 task-agent brief 和 review contract。按需查询相关 diff hunk、最终代码和实跑日志，不整读 facts、diff、原始 JSONL 或历史。
+- Capsule 已内联 review contract：结果与测试句必须落到其中的业务行为和真实测试映射；环境噪声不得作为模型扣分依据，`key_business_constraint` 用于语言复核。
+- 当前题完成 finalize 和 closeout 后立即领取下一题，不等整批结束；同一批次不重复读取 stage brief。
 - reviewer 读取 `trace/review-pack.json`。模型行为只能从 `trace/projects/*.jsonl` 的精确行号/block 取证；事件包不是最终证据。
 - 使用 `fbr_feedback.py decision` 写 compact `decision-input.json`，再用 `fbr_reviewer.py build` 展开。人工完整 candidate 仍受同一契约支持。
 - build 会自动生成 requirements_status、process_audit、缺省评分字段和 process claim 来源；查看 `review/build-report.json`，不要手工重复维护这些派生字段。

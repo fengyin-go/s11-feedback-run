@@ -22,11 +22,13 @@
 
 事件包不是最终证据。每条过程结论仍必须回到原始区间核对连续摘录和后续最终状态；索引、facts、card 或生成侧摘要不能替代原文。轨迹在摄取后变化时，清单与当前文件大小/mtime 不一致，必须重新摄取，旧偏移和旧分析不能复用。
 
-`review/task-agent-brief.md` 是当前 AI 的默认决策包，完整 `card.md`、`facts.json`、`diff.patch` 和事件图只用于定向查询。`review/metrics.json` 记录 reviewer 返回的 token usage、prompt/response 字节、raw trace 大小、pack 大小和证据访问次数。Token 下降不是通过标准；任何无法由原始区间支持的模型过程描述都必须被闸门拒绝。
+`review/review-capsule.json` 是当前 AI 的默认决策包，`task-agent-brief.md` 是同内容 Markdown 投影；完整 `card.md`、`facts.json`、`diff.patch` 和事件图只用于定向查询。`fbr_work.py next --inline` 直接返回去重 capsule，同一对话只在首次进入阶段时读取阶段说明，后续题目不重复加载。`review/metrics.json` 记录 reviewer 返回的 token usage、prompt/response 字节、raw trace 大小、pack 大小和证据访问次数。Token 下降不是通过标准；任何无法由原始区间支持的模型过程描述都必须被闸门拒绝。
 
-批量处理用 `fbr_work.py next --batch …` 逐题领取精简包，只返回当前题的 stage brief、checkpoint、trace pack 和候选 schema 路径。完成一题后运行 `closeout` 写结构化任务摘要；不要把多题 card、facts、diff 或 history 一起放进同一上下文。
+批量处理用 `fbr_work.py next --batch … --inline` 逐题领取去重 capsule，并带 checkpoint、trace pack 和候选 schema 路径。完成一题后运行 `closeout`；默认只输出一行摘要，完整结构化摘要继续写 `task-closeout.json`。不要把多题 card、facts、diff 或 history 一起放进同一上下文。
 
 `fbr_metrics.py aggregate --batch …` 分开统计产物模型、reviewer、Feedback attempt 和证据访问。`fbr_flow.py wait` 在服务端等待 `needs_task_agent/blocked/completed` 等事件，避免当前 AI 反复轮询状态。
+
+Feedback finalize 使用稳定语义键去重。相同失败只保留一条 attempt 和 `reuse_count`，相同成功只返回已完整交付的回执；binding、规则、查重上下文或抽检变化会生成新键。重复调用不做第二次 gate、表刷新或快照发布，因此不会隐藏仍然有效的中间错误。
 
 命令默认摘要，完整对象落盘：运行状态在 `_verification/status/`，批次指标在 `_verification/metrics/`，平台 schema 在 `_registry/platform-schema/`，upload plan 在 `review/upload-plan.json`，校验错误在 `review/*-errors.json`。只有 `--json` 或定向查询才展开，不能把摘要当成数据源。
 

@@ -108,6 +108,7 @@ class Rules(unittest.TestCase):
     def test_domain_mismatch_is_not_reclassified_as_feedback_repair(self):
         detail = {
             "status": "PENDING_FIX",
+            "editable": True,
             "qc_checks": [
                 {
                     "check_key": "llm_desc_domain_mismatch_0",
@@ -129,10 +130,13 @@ class Rules(unittest.TestCase):
         blockers = submit.non_repairable_prompt_checks(detail)
         self.assertEqual(len(blockers), 1)
         self.assertEqual(blockers[0]["check_key"], "llm_desc_domain_mismatch_0")
+        self.assertEqual(blockers[0]["action"], "discard_locally")
+        self.assertTrue(blockers[0]["requires_prompt_change"])
 
-    def test_p5_dedup_and_p6_are_prompt_rebuild_failures(self):
+    def test_p5_dedup_and_p6_are_local_deprecation_failures(self):
         detail = {
             "status": "PENDING_FIX",
+            "editable": True,
             "qc_checks": [
                 {"check_key": "trace_complexity_floor", "passed": False,
                  "summary": "H3 不成立", "evidence": {}},
@@ -148,14 +152,16 @@ class Rules(unittest.TestCase):
             ["trace_complexity_floor", "dedup", "trace_tool_call_floor"],
         )
         self.assertTrue(all(
-            row["owner"] == "s11-gsb-prompt-create"
-            and row["action"] == "prompt_rebuild_required"
+            row["owner"] == "s11-feedback-run"
+            and row["action"] == "discard_locally"
+            and row["requires_prompt_change"]
             for row in blockers
         ))
 
-    def test_memory_read_is_runtime_rerun_failure(self):
+    def test_memory_read_discards_existing_platform_record_without_rerun(self):
         detail = {
             "status": "PENDING_FIX",
+            "editable": True,
             "qc_checks": [{
                 "check_key": "trace_memory",
                 "passed": False,
@@ -166,7 +172,44 @@ class Rules(unittest.TestCase):
         blockers = submit.non_repairable_prompt_checks(detail)
         self.assertEqual(len(blockers), 1)
         self.assertEqual(blockers[0]["owner"], "s11-feedback-run")
-        self.assertEqual(blockers[0]["action"], "runtime_rerun_required")
+        self.assertEqual(blockers[0]["action"], "discard_locally")
+        self.assertFalse(blockers[0]["requires_prompt_change"])
+
+    def test_discarded_platform_status_is_local_deprecation(self):
+        blockers = submit.non_repairable_prompt_checks({
+            "status": "DISCARDED",
+            "qc_summary": "题目难度不成立",
+            "qc_checks": [],
+        })
+        self.assertEqual(len(blockers), 1)
+        self.assertEqual(blockers[0]["check_key"], "platform_discarded")
+        self.assertEqual(blockers[0]["action"], "discard_locally")
+
+    def test_prompt_level_problem_type_is_not_retried_as_feedback_repair(self):
+        blockers = submit.non_repairable_prompt_checks({
+            "status": "PENDING_FIX",
+            "editable": True,
+            "qc_checks": [{
+                "check_key": "llm_overall_quality",
+                "check_name": "题目过简",
+                "passed": False,
+                "summary": "现有题面无法形成申报难度",
+                "evidence": {"problem_type": "TASK_TOO_EASY"},
+            }],
+        })
+        self.assertEqual(len(blockers), 1)
+        self.assertEqual(blockers[0]["action"], "discard_locally")
+        self.assertTrue(blockers[0]["requires_prompt_change"])
+
+    def test_pending_fix_without_editable_flag_is_discarded_locally(self):
+        blockers = submit.non_repairable_prompt_checks({
+            "status": "PENDING_FIX",
+            "editable": False,
+            "qc_checks": [],
+        })
+        self.assertEqual(len(blockers), 1)
+        self.assertEqual(blockers[0]["check_key"], "platform_record_not_editable")
+        self.assertEqual(blockers[0]["action"], "discard_locally")
 
 
 class BindingDrift(SubmitCase):

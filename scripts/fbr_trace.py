@@ -296,9 +296,6 @@ def summarize(projects_dir: Path, session_file: str) -> dict:
         "assistant_answers": assistant_answers,
         "api_errors": api_errors(rows), "started_at": stamps[0] if stamps else "",
         "ended_at": stamps[-1] if stamps else "",
-        "counts": {"tools": len(steps), "errors": sum(1 for s in steps if s["is_error"]),
-                   "edits": sum(1 for s in steps if s["kind"] == "edit"),
-                   "unanswered": sum(1 for s in steps if not s["answered"])},
     }
 
 

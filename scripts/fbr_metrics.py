@@ -74,7 +74,13 @@ def run_usage(task: Path) -> dict:
 
 def feedback_usage(task: Path) -> dict:
     history = lib.load_json(Path(task)/'review/task-agent-history.json', default={})
-    attempts = [row for row in history.get('attempts', []) if isinstance(row, dict)]
+    if isinstance(history, list):
+        rows = history
+    elif isinstance(history, dict):
+        rows = history.get('attempts', [])
+    else:
+        rows = []
+    attempts = [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
     candidates = [row.get('candidate_sha') for row in attempts if row.get('candidate_sha')]
     duplicates = len(candidates)-len(set(candidates))
     errors = sum(len(row.get('errors') or []) for row in attempts)
@@ -83,6 +89,10 @@ def feedback_usage(task: Path) -> dict:
         'failed_attempts': sum(bool(row.get('errors')) for row in attempts),
         'errors': errors,
         'duplicate_candidate_attempts': duplicates,
+        'idempotent_reuses': sum(
+            int(row.get('reuse_count') or 0) for row in attempts
+            if type(row.get('reuse_count')) is int
+        ),
     }
 
 
@@ -125,7 +135,8 @@ def aggregate(root: Path, batch: str) -> dict:
                     ('calls', 'input_tokens', 'output_tokens', 'reasoning_output_tokens',
                      'prompt_bytes', 'response_bytes', 'pack_bytes', 'raw_trace_bytes'))
     feedback = _sum([row['feedback'] for row in tasks],
-                    ('attempts', 'failed_attempts', 'errors', 'duplicate_candidate_attempts'))
+                    ('attempts', 'failed_attempts', 'errors', 'duplicate_candidate_attempts',
+                     'idempotent_reuses'))
     run = _sum([row['run'] for row in tasks], ('attempts', 'retries'))
     run_reasons = {}
     for row in tasks:
@@ -166,7 +177,9 @@ def summary(report: dict) -> str:
         + " / ".join(f"{key} {value}" for key, value in sorted(rw['reasons'].items())),
         f"reviewer：{r['calls']} 次，input {r['input_tokens']:,} / output {r['output_tokens']:,}，"
         f"prompt {r['prompt_bytes']:,} bytes",
-        f"Feedback：{f['attempts']} 次尝试，失败 {f['failed_attempts']}，重复 candidate {f['duplicate_candidate_attempts']}",
+        f"Feedback：{f['attempts']} 次尝试，失败 {f['failed_attempts']}，"
+        f"重复 candidate {f['duplicate_candidate_attempts']}，"
+        f"幂等复用 {f['idempotent_reuses']}",
         f"证据读取：{e['calls']} 次，indexed reads {e['file_opens']}，full reads {e['full_reads']}，"
         f"返回 {e['bytes_returned']:,} bytes",
         f"完整报告：{report['report']}",

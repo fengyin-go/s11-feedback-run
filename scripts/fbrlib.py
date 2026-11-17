@@ -38,6 +38,7 @@ TASK_ID_RE = re.compile(r"^(?:s11-(\d{6})|[A-Za-z0-9_.-]+-(?:0[1-9]|[1-9][0-9])-
 BATCH_ID_RE = re.compile(r"^b(\d{4})-(\d{2})$")
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 STAGES = ["run", "collect", "commit", "record", "facts", "feedback"]
+PLATFORM_DEPRECATED_FILE = "review/platform-deprecated.json"
 MARK = "@@FBR"
 # Claude Code's private runtime directory inside the task container, not Codex skills.
 TRACE_SRC = "/home/node/.claude/projects"
@@ -563,6 +564,87 @@ def require_stage(task_dir: Path, stage: str) -> dict:
     if info.get("state") != "ok":
         raise FbrError(f"{Path(task_dir).name}：{stage} 阶段还没通过，不能往下做")
     return info
+
+
+def platform_deprecated(task_dir: Path) -> dict:
+    """Return the local discard receipt for a platform record, if present."""
+    path = Path(task_dir) / PLATFORM_DEPRECATED_FILE
+    if not path.exists():
+        return {}
+    if path.is_symlink():
+        raise FbrError(f"{Path(task_dir).name}：本地废弃凭证不能是符号链接")
+    doc = load_json(path, default={})
+    if not isinstance(doc, dict) or doc.get("state") != "deprecated":
+        raise FbrError(f"{Path(task_dir).name}：本地废弃凭证格式无效")
+    return doc
+
+
+def deprecate_platform_task(
+    task_dir: Path,
+    *,
+    submission_id,
+    remote_status: str,
+    blockers: list[dict],
+    reason: str,
+    detail: str,
+) -> dict:
+    """Persist a terminal local discard without touching the platform record."""
+    task_dir = Path(task_dir)
+    previous = platform_deprecated(task_dir)
+    record = load_json(task_dir / "task.json", default={})
+    prompt = str(record.get("prompt") or "")
+    prompt_file = task_dir / "prompt.txt"
+    prompt_file_sha256 = ""
+    if prompt_file.is_file() and not prompt_file.is_symlink():
+        prompt_file_sha256 = hashlib.sha256(prompt_file.read_bytes()).hexdigest()
+    created_at = previous.get("deprecated_at") or now_iso()
+    document = {
+        "version": 1,
+        "state": "deprecated",
+        "task_id": task_dir.name,
+        "submission_id": submission_id,
+        "remote_status": remote_status,
+        "reason": reason,
+        "detail": detail,
+        "blockers": blockers,
+        "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+        "prompt_file_sha256": prompt_file_sha256,
+        "handoff_hash": record.get("handoff_hash"),
+        "policy": "平台返修只允许更新原记录的非锁定字段；不得修改提示词后重跑，也不得为不可返修项重新出题",
+        "action": "discard_locally",
+        "deprecated_at": created_at,
+        "updated_at": now_iso(),
+    }
+    save_json(task_dir / PLATFORM_DEPRECATED_FILE, document)
+    return document
+
+
+def assert_platform_prompt_unchanged(task_dir: Path) -> str:
+    """Fail closed when a platform repair starts from a changed prompt."""
+    task_dir = Path(task_dir)
+    receipt = load_json(task_dir / "review/upload.json", default={})
+    if not receipt.get("submission_id"):
+        return ""
+    binding = receipt.get("binding") if isinstance(receipt.get("binding"), dict) else {}
+    data = binding.get("data") if isinstance(binding.get("data"), dict) else {}
+    expected = data.get("user_prompt")
+    if not expected:
+        remote = receipt.get("remote_data") if isinstance(receipt.get("remote_data"), dict) else {}
+        expected = remote.get("user_prompt")
+    if not expected:
+        raise FbrError(f"{task_dir.name}：平台返修缺少原提示词绑定，停止处理")
+    record = load_json(task_dir / "task.json", default={})
+    current = record.get("prompt")
+    prompt_file = task_dir / "prompt.txt"
+    if not prompt_file.is_file() or prompt_file.is_symlink():
+        raise FbrError(f"{task_dir.name}：平台返修期间提示词文件缺失，停止处理")
+    file_prompt = prompt_file.read_text(encoding="utf-8")
+    if current != expected or file_prompt != expected:
+        raise FbrError(
+            f"{task_dir.name}：平台返修绝对禁止修改提示词；"
+            "原平台记录不可通过改题面后重跑处理"
+        )
+    return str(expected)
 
 
 # ---------- 外部命令 ----------

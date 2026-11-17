@@ -10,6 +10,17 @@ import fbrlib as lib
 
 
 class Metrics(Sandbox):
+    def test_feedback_metrics_reads_legacy_array_history(self):
+        task = self.make_task()
+        lib.save_json(task/"review/task-agent-history.json", [
+            {"candidate_sha": "same", "errors": ["bad"]},
+            {"candidate_sha": "same", "errors": [], "reuse_count": 1},
+        ])
+        usage = fbr_metrics.feedback_usage(task)
+        self.assertEqual(usage["attempts"], 2)
+        self.assertEqual(usage["duplicate_candidate_attempts"], 1)
+        self.assertEqual(usage["idempotent_reuses"], 1)
+
     def test_aggregate_separates_product_reviewer_and_feedback_costs(self):
         task = self.make_task()
         write(task/"run/stream.jsonl", "\n".join([
@@ -25,7 +36,7 @@ class Metrics(Sandbox):
             "usage": {"input_tokens": 200, "output_tokens": 50,
                       "reasoning_output_tokens": 10}}}})
         lib.save_json(task/"review/task-agent-history.json", {"attempts": [
-            {"candidate_sha": "same", "errors": ["bad"]},
+            {"candidate_sha": "same", "errors": ["bad"], "reuse_count": 2},
             {"candidate_sha": "same", "errors": []},
         ]})
         lib.save_json(task/"run/attempts.json", [
@@ -41,6 +52,7 @@ class Metrics(Sandbox):
         self.assertEqual(report["reviewer_model"]["output_tokens"], 50)
         self.assertEqual(report["feedback_workflow"]["attempts"], 2)
         self.assertEqual(report["feedback_workflow"]["duplicate_candidate_attempts"], 1)
+        self.assertEqual(report["feedback_workflow"]["idempotent_reuses"], 2)
         self.assertEqual(report["run_workflow"]["attempts"], 2)
         self.assertEqual(report["run_workflow"]["retries"], 1)
         self.assertEqual(report["run_workflow"]["reasons"]["网关报错"], 1)

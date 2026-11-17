@@ -552,7 +552,7 @@ class FactsOne(FactsCase):
         self.results = [GOOD, BAD]
         row = fbr_facts.facts_one(task_dir, self.root, self.cfg)
         self.assertEqual((row["state"], row["detail"]),
-                         ("ok", "改动 2 个文件，产物测试不通过，新增失败 1 个，轨迹 4 步"))
+                         ("ok", "改动 2 个文件，产物测试不通过，新增失败 1 个"))
         first, second = self.step_calls
         self.assertEqual((first["head"], first["segment"]), (record["initial_commit"], False))
         self.assertEqual((second["head"], second["segment"]), (commit, True))
@@ -583,7 +583,7 @@ class FactsOne(FactsCase):
         self.assertEqual((changes["model_commits"], changes["host_commit"], changes["history_rewritten"]),
                          (0, True, False))
         self.assertEqual(changes["placeholders"][0]["file"], "src/clipcut/packer.py")
-        self.assertEqual(facts["trace"]["counts"]["tools"], 4)
+        self.assertNotIn("counts", facts["trace"])
         self.assertEqual([s["step"] for s in facts["trace"]["steps"]], [1, 2, 3, 4])
         self.assertFalse(facts["verification"]["verified_after_last_edit"])
         self.assertEqual(facts["claims"]["final_answer"], ANSWER)
@@ -600,7 +600,7 @@ class FactsOne(FactsCase):
         self.assertEqual((row["state"], row["detail"]), ("skip", "已经取证过"))
         self.results = [GOOD]       # 重做时基线走缓存，只再跑产物这一遍
         self.assertEqual(fbr_facts.facts_one(task_dir, self.root, self.cfg, redo=True)["detail"],
-                         "改动 2 个文件，产物测试通过，新增失败 0 个，轨迹 4 步")
+                         "改动 2 个文件，产物测试通过，新增失败 0 个")
         self.assertEqual(len(self.step_calls), 3)
         self.assertFalse(self.facts(task_dir)["tests"]["regression"])
 
@@ -608,7 +608,7 @@ class FactsOne(FactsCase):
         task_dir = self.prepared(change=False)
         self.results = [GOOD]
         row = fbr_facts.facts_one(task_dir, self.root, self.cfg)
-        self.assertEqual(row["detail"], "改动 0 个文件，产物测试通过，新增失败 0 个，轨迹 4 步")
+        self.assertEqual(row["detail"], "改动 0 个文件，产物测试通过，新增失败 0 个")
         self.assertEqual(len(self.step_calls), 1)
         facts = self.facts(task_dir)
         self.assertTrue(facts["changes"]["no_change"])

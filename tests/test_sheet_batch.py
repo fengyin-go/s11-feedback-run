@@ -363,8 +363,10 @@ class WriteSheet(SheetCase):
         self.gated(2, TEXT_B)
         code, out, err = run_main(fbr_sheet, "--root", str(self.root), "--batch", BATCH)
         self.assertEqual((code, err), (0, ""))
-        self.assertEqual(out.splitlines(), [str(self.root / "results" / BATCH / "result.xlsx"),
-                                            "批次共 2 题，进结果页 2 题，其中可提交 1 题", f"  s11-000002  {NOT_PUSHED}"])
+        self.assertEqual(out.splitlines(), [
+            f"{self.root / 'results' / BATCH / 'result.xlsx'} tasks=2 rows=2 ready=1 pending=1",
+            f"  s11-000002  {NOT_PUSHED}",
+        ])
         code, out, err = run_main(fbr_sheet, "--root", str(self.root), "--batch", "b1111-09")
         self.assertEqual((code, out), (2, ""))
         self.assertIn("错误：批次不存在：", err)
@@ -450,6 +452,24 @@ class Status(SheetCase):
         self.assertEqual(fbr_batch.next_stage(task_dir), "commit")
         self.mark(task_dir, "feedback")
         self.assertIsNone(fbr_batch.next_stage(task_dir))
+
+    def test_platform_deprecated_is_terminal_and_excluded_from_delivery(self):
+        task_dir = self.gated()
+        lib.deprecate_platform_task(
+            task_dir,
+            submission_id=17,
+            remote_status="PENDING_FIX",
+            blockers=[{"check_key": "trace_complexity_floor", "requires_prompt_change": True}],
+            reason="platform_repair_requires_prompt_change",
+            detail="只能改题面后通过，已在本地标记废弃。",
+        )
+        self.assertEqual(fbr_batch.next_stage(task_dir), "platform_deprecated")
+        self.assertIn("本地废弃", fbr_batch.platform_state(task_dir))
+        manifest = fbr_delivery.export_batch(self.root, BATCH, self.cfg)
+        self.assertNotIn(task_dir.name, {row["task_id"] for row in manifest["tasks"]})
+        excluded = next(row for row in manifest["excluded"] if row["task_id"] == task_dir.name)
+        self.assertIn("本地废弃", excluded["reason"])
+        self.assertIn(task_dir.name + "  本地废弃（平台不可返修）", self.printed())
 
     def test_status(self):
         self.gated(1)

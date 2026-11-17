@@ -10,7 +10,6 @@ from typing import Any
 import fbrlib as lib
 
 
-MIN_PROMPT_EXPECTED_TOOL_CALLS = 55
 H3_FALSE_GUARDS = {
     "one_branch_violates_constraints",
     "fixed_resolution_in_prompt",
@@ -141,11 +140,6 @@ def prompt_contract_problems(
                         evidence={"missing_guards": missing},
                     ))
                 workload = design.get("workload_design")
-                expected = (
-                    workload.get("expected_effective_tool_calls")
-                    if isinstance(workload, dict)
-                    else None
-                )
                 slices = workload.get("work_slices") if isinstance(workload, dict) else None
                 paths = (
                     workload.get("verification_paths")
@@ -153,20 +147,17 @@ def prompt_contract_problems(
                     else None
                 )
                 if (
-                    type(expected) is not int
-                    or expected < MIN_PROMPT_EXPECTED_TOOL_CALLS
-                    or not isinstance(slices, list)
+                    not isinstance(slices, list)
                     or len(slices) < 4
                     or not isinstance(paths, list)
                     or len(set(paths)) < 2
                 ):
                     errors.append(_problem(
                         "p6_workload_design_weak",
-                        "workload_design 未达到 55 次预期调用、4 个工作切片和 2 条验证路径",
+                        "workload_design 未达到 4 个工作切片和 2 条验证路径；工具调用次数不作为要求",
                         owner="s11-gsb-prompt-create",
                         action="expand_workload_before_run",
                         evidence={
-                            "expected_effective_tool_calls": expected,
                             "work_slices": len(slices) if isinstance(slices, list) else 0,
                             "verification_paths": len(set(paths)) if isinstance(paths, list) else 0,
                         },
@@ -260,10 +251,6 @@ def trace_rule_problems(task_dir: Path) -> tuple[list[dict], list[dict], dict]:
         ))
         return errors, warnings, {}
 
-    effective = summary.get("paired_tools")
-    if type(effective) is not int:
-        effective = summary.get("logical_tool_uses")
-
     hits = []
     for index, event in enumerate(pack.get("tool_events") or [], start=1):
         if not isinstance(event, dict):
@@ -290,7 +277,6 @@ def trace_rule_problems(task_dir: Path) -> tuple[list[dict], list[dict], dict]:
             evidence={"hits": soft_hits[:5]},
         ))
     return errors, warnings, {
-        "effective_tool_calls": effective,
         "memory_read": bool(hard_hits),
         "memory_probe": bool(soft_hits),
         "memory_hits": hard_hits[:5],

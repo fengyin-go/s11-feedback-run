@@ -35,7 +35,7 @@ GENERATED_TOP = {"delivery-manifest.json", "result.xlsx", "preview.html", "field
 RETAINED_TASK_FILES = {
     "task-seed.json", "state.json", "recording-plan.json", "recording-plan.override.json",
     "run/attempts.json", "review/diff.patch", "retention.json", "cleanup.json",
-    "review/attestation.json",
+    "review/attestation.json", "review/platform-deprecated.json",
     "platform/snapshot.json", "platform/upload.json",
     "platform/submit-preflight.json",
 }
@@ -351,6 +351,15 @@ def _export_batch_locked(root: Path, target: Path, batch_id: str, cfg: dict) -> 
                        if isinstance(row, dict) and row.get("task_id")}
         for source in lib.task_dirs(root, batch_id):
             try:
+                deprecated = lib.platform_deprecated(source)
+                if deprecated:
+                    excluded.append({
+                        "task_id": source.name,
+                        "reason": "本地废弃：" + str(
+                            deprecated.get("detail") or deprecated.get("reason") or "平台记录不可返修"
+                        ),
+                    })
+                    continue
                 if lib.load_json(source / "cleanup.json", default={}).get("state") == "cleaned":
                     entry = old_entries.get(source.name)
                     if not entry or not _task_entry_valid(root, target, entry):

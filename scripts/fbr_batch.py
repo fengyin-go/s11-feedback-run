@@ -33,7 +33,7 @@ NEXT = {
     "feedback": "fbr_work.py next --batch {b} --wait，完成当前题验收后 fbr_work.py closeout --batch {b} --task <任务>",
 }
 LABEL = {"run": "运行", "collect": "收集", "commit": "提交", "record": "录屏", "facts": "取证",
-         "feedback": "Feedback", "abandoned": "放弃"}
+         "feedback": "Feedback", "abandoned": "放弃", "platform_deprecated": "本地废弃"}
 PAGE_HEAD = """<!doctype html><html lang="zh"><meta charset="utf-8"><title>%s 抽检预览</title><style>
 body{font:14px/1.6 -apple-system,"PingFang SC",sans-serif;margin:0;background:#f6f7f9;color:#1f2328}
 main{max-width:1100px;margin:0 auto;padding:24px}
@@ -53,6 +53,8 @@ def esc(value) -> str:
 
 
 def next_stage(task_dir: Path) -> str | None:
+    if lib.platform_deprecated(task_dir):
+        return 'platform_deprecated'
     if lib.load_state(task_dir)['stages'].get('run', {}).get('state') == 'abandoned':
         return 'abandoned'
     for stage in lib.STAGES:
@@ -62,6 +64,9 @@ def next_stage(task_dir: Path) -> str | None:
 
 
 def platform_state(task_dir: Path) -> str:
+    deprecated = lib.platform_deprecated(task_dir)
+    if deprecated:
+        return "本地废弃：" + str(deprecated.get("detail") or deprecated.get("reason") or "不处理")
     cleanup = lib.load_json(task_dir / "cleanup.json", default={})
     if cleanup.get("state") == "cleaned":
         return f"已清理 / {cleanup.get('remote_status', 'QC_PASSED')}"
@@ -105,19 +110,22 @@ def print_status(rows: list[dict], batch_id: str) -> None:
     counts: dict[str, int] = {}
     for row in rows:
         label = (row.get("platform", "都做完了") if row["next"] is None else
+                 "本地废弃（平台不可返修）" if row["next"] == "platform_deprecated" else
                  "已放弃（批次尾部超时）" if row["next"] == "abandoned" else f"等{LABEL[row['next']]}")
         counts[label] = counts.get(label, 0) + 1
         line = f"{row['task_id']}  {label}"
         if row["failed"]:
             line += f"（上次没过：{lib.clip(row['detail'], 160)}）"
-        if row["committed"] and not row["pushed"]:
+        if (row["committed"] and not row["pushed"]
+                and row["next"] != "platform_deprecated"):
             line += "  产物快照未推送"
         print(line)
     print("—— " + "，".join(f"{k} {v} 题" for k, v in counts.items()))
     for stage in lib.STAGES:
         if any(row["next"] == stage for row in rows):
             print(f"下一步（{LABEL[stage]}）：{NEXT[stage].format(b=batch_id)}")
-    if any(row["committed"] and not row["pushed"] for row in rows):
+    if any(row["committed"] and not row["pushed"]
+           and row["next"] != "platform_deprecated" for row in rows):
         print(f"待推送：fbr_snapshot.py push --batch {batch_id}（演练；真推要用户明确同意后加 --execute --confirm PUBLISH）")
     if rows and all(row["next"] is None for row in rows):
         print(f"下一步：fbr_sheet.py --batch {batch_id}")
@@ -295,7 +303,8 @@ def main() -> int:
             else:
                 counts = result["counts"]
                 print(f"{result['state']}：选中 {counts['selected']} 题，"
-                      f"ready {counts['ready']}，blocked {counts['blocked']}；"
+                      f"ready {counts['ready']}，blocked {counts['blocked']}，"
+                      f"deprecated {counts.get('deprecated', 0)}；"
                       f"{delivery.delivery_dir(root, args.batch) / 'batch-closeout.json'}")
                 for row in result["errors"][:10]:
                     print(f"- {row.get('task_id')}：{row.get('error')}")

@@ -5,11 +5,15 @@
 - 提交前验证 `review/attestation.json` 和当前平台 schema；不再重跑需求评审、评分或 Feedback 写作。
 - 账号从 `_config/settings.json.platform.account` 读取，默认 `zouyonghong`；环境变量只作显式覆盖。
 - 同时验证 `review/platform-rules.json`：出题侧 P5/P6 契约、A-5 或私有会话读取风险未清零时
-  不得上传。实际轨迹工具调用数只记录，不再按本地 50 次下限阻断。
+  不得上传。不统计轨迹工具调用总数，也没有 50/55 次数量门槛；P6 只核对工作切片和
+  验证路径等可观察设计，具体数量以平台实际回执为准。
 - 整批提交先运行 `fbr_batch.py closeout`；`batch-closeout.json` 不是 `ready` 时不上传任何文件。
 - schema、凭证、正文、附件、快照、账号或领域变化都会使旧预检失效。评审输入变化只让对应题重新评价，交付变化只重做交付冻结。
 - 完整 schema 和 upload plan 只从本地报告定向查询；终端摘要不是提交依据。
 - 正式提交必须单独授权并使用 `--execute --confirm SUBMIT`。返修使用 `--confirm REPAIR`。
+- 平台返修只允许更新原记录非锁定字段。绝对禁止修改 `task.json.prompt`、`prompt.txt`
+  或平台 `user_prompt` 后重跑；只能靠改题面通过的失败写
+  `review/platform-deprecated.json`，本地废弃后不再处理。
 - 建单和返修写请求默认相隔 10 秒；账号级节流会跨 resume 和不同批次继续生效，人工没有特殊原因不要改小。
 - 只有明确 429 才按 `Retry-After` 或 15/30/45 秒退避；重投前先按 SessionID 回查。其他 5xx、超时和未知结果不得自动重发。
 - 结果未知时先按 SessionID 回查，绝不能盲目重发。

@@ -26,6 +26,7 @@ REVIEW_FILES = (
     "review/quality.json",
     "review/style-report.json",
     "review/trace-analysis.json",
+    "review/review-capsule.json",
 )
 
 DELIVERY_FILES = (
@@ -302,6 +303,15 @@ def batch_closeout(root: Path, batch: str, cfg: dict, tasks: str | None = None, 
     domains = {}
     for task in selected:
         try:
+            deprecated = lib.platform_deprecated(task)
+            if deprecated:
+                rows.append({
+                    "task_id": task.name,
+                    "state": "deprecated",
+                    "reason": deprecated.get("reason"),
+                    "submission_id": deprecated.get("submission_id"),
+                })
+                continue
             feedback = lib.load_json(task / "review/feedback.json", default={})
             if str(feedback.get("feedback", "")).strip():
                 records[task.name] = str(feedback["feedback"])
@@ -355,7 +365,8 @@ def batch_closeout(root: Path, batch: str, cfg: dict, tasks: str | None = None, 
         "tasks": rows,
         "errors": errors,
         "counts": {"selected": len(selected), "ready": sum(row["state"] == "ready" for row in rows),
-                   "blocked": sum(row["state"] == "blocked" for row in rows)},
+                   "blocked": sum(row["state"] == "blocked" for row in rows),
+                   "deprecated": sum(row["state"] == "deprecated" for row in rows)},
     }
     if write:
         lib.save_json(fbr_delivery.delivery_dir(root, batch) / BATCH_FILE, result)

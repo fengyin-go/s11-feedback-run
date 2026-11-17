@@ -846,6 +846,83 @@ class RepairReceipt(SubmitCase):
         self.assertTrue(status["valid"])
         self.assertIn("已提交", status["state"])
 
+    def test_prompt_repair_is_discarded_locally_without_platform_update(self):
+        task, client = self.ready(), FakeClient()
+        self.execute(client)
+        plan = submit.prepare(self.root, BATCH, client.schema())[0]
+        client.records[0].update(
+            status="PENDING_FIX",
+            stage="PENDING_FIX",
+            editable=True,
+            locked_fields=[],
+            current_version=1,
+            session_id=plan["data"]["session_id"],
+            qc_checks=[{
+                "check_key": "trace_complexity_floor",
+                "check_name": "P5 难度不成立",
+                "passed": False,
+                "summary": "当前题面无法支持申报难度",
+                "evidence": {},
+            }],
+        )
+        result = submit.repair_one(
+            self.root, plan, client, client.schema(), execute=False,
+            comment="must not update", interval=0,
+        )
+        self.assertEqual(result["state"], "discarded")
+        marker = lib.platform_deprecated(task)
+        self.assertEqual(marker["submission_id"], 1)
+        self.assertEqual(marker["reason"], "platform_repair_requires_prompt_change")
+        self.assertEqual(marker["blockers"][0]["check_key"], "trace_complexity_floor")
+
+        untouched = FakeClient()
+        skipped = submit.repair_batch(self.root, BATCH, execute=False, client=untouched)
+        self.assertEqual(skipped["tasks"][0]["state"], "discarded")
+        self.assertEqual(untouched.logins, 0)
+
+    def test_platform_repair_rejects_changed_prompt_before_any_write(self):
+        task, client = self.ready(), FakeClient()
+        self.execute(client)
+        plan = submit.prepare(self.root, BATCH, client.schema())[0]
+        client.records[0].update(
+            status="PENDING_FIX", stage="PENDING_FIX", editable=True,
+            locked_fields=[], current_version=1,
+            session_id=plan["data"]["session_id"],
+        )
+        changed = plan["data"]["user_prompt"] + "\n修改后重跑"
+        record = lib.load_json(task / "task.json")
+        record["prompt"] = changed
+        lib.save_json(task / "task.json", record)
+        (task / "prompt.txt").write_text(changed, encoding="utf-8")
+        with self.assertRaisesRegex(lib.FbrError, "绝对禁止修改提示词"):
+            submit.repair_one(
+                self.root, plan, client, client.schema(), execute=True,
+                comment="invalid", interval=0,
+            )
+        self.assertFalse((task / "review/platform-deprecated.json").exists())
+
+    def test_repair_batch_discards_before_preparing_feedback(self):
+        task, client = self.ready(), FakeClient()
+        self.execute(client)
+        client.records[0].update(
+            status="PENDING_FIX",
+            stage="PENDING_FIX",
+            editable=True,
+            locked_fields=[],
+            current_version=1,
+            qc_checks=[{
+                "check_key": "dedup",
+                "check_name": "A-5 公共长片段",
+                "passed": False,
+                "summary": "命中重复",
+                "evidence": {},
+            }],
+        )
+        with mock.patch.object(submit, "prepare", side_effect=AssertionError("must not prepare")):
+            result = submit.repair_batch(self.root, BATCH, execute=False, client=client)
+        self.assertEqual(result["tasks"][0]["state"], "discarded")
+        self.assertTrue(lib.platform_deprecated(task))
+
 
 if __name__ == "__main__":
     unittest.main()

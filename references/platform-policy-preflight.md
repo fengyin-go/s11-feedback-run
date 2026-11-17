@@ -2,7 +2,7 @@
 
 `dfzr10012 / b1115-01` 的 39 条回执显示，`PENDING_FIX` 不一定能改 Feedback：
 
-- 05：有效工具调用 42 次，当时被平台按 P6 打回；
+- 有题目曾被平台按 P6 打回，但本地不再统计工具调用次数；
 - 20/31：读取 `/home/node/.claude/projects/...jsonl` 中的本轮会话轨迹，平台判为 memory 作弊；
 - 12 条 `DISCARDED` 是 P5 H3 不成立；
 - 2 条 `DISCARDED` 是 A-5 公共长片段查重。
@@ -14,14 +14,15 @@
 
 1. 读取批次 `repo-topic-map.json`。新 S11 批次缺失文件即阻断；旧批次完全缺失时进入 legacy
    兼容模式并记录 warning。文件存在但没有 H3 v3 契约、缺少八项假 H3 守卫或缺少
-   `workload_design` 时阻断。预期有效工具调用低于 55、工作切片少于 4、验证路径少于 2
-   同样阻断。
+   `workload_design` 时阻断。工作切片少于 4、验证路径少于 2 时阻断；不读取、不校验
+   `expected_effective_tool_calls`，也不设 50/55 次工具调用门槛。
 2. 独立读取 `prompt-generation-manifest.json`，不能因上一步缺文件而跳过。新 S11 批次缺失
    文件即阻断；旧批次完全缺失时记录 warning。文件存在且 `gate_ok`、`raw_a5_ok` 或
    `cross_project.platform_dedup_ok` 为假时，任何批次都阻断。
-3. 读取 `trace/review-pack.json`，记录 `paired_tools` 或回退的 `logical_tool_uses` 作为
-   证据。实际调用次数低于 50 不再由本地预检阻断，是否命中 P6 以平台回执为准。
-4. 扫描 `tool_events[].target` 和 `result_preview`。`Read/Bash/Grep/Glob` 访问任务容器内
+3. 不读取 `trace-check.json` 或 `review-pack.json` 中的工具调用总数，不计算
+   `paired_tools`、`logical_tool_uses` 或其他调用数量。reviewer 输入只保留编辑、
+   测试/构建、错误和助手修正等过程事件。
+4. 扫描这些有界过程事件的 `target` 和 `result_preview`。`Read/Bash/Grep/Glob` 访问任务容器内
    `.claude/projects`、`.claude/todos`、`.claude/sessions`、`.claude/history.jsonl` 或
    `.claude/memory` 时阻断。这里的 `.claude` 是被测任务运行目录，与 Codex skill 无关。
 5. 只有 `review/platform-rules.json` 和 `review/submit-preflight.json` 都为 ready，才允许上传。
@@ -36,12 +37,12 @@
 
 | 平台检查 | 本地动作 | 禁止动作 |
 |---|---|---|
-| `trace_complexity_floor` | 换 H3 或重出题 | 改 Feedback / PUT |
-| `trace_tool_call_floor` | 平台实际返回后按回执扩展工作量并重跑 | 把本地计数改写成通过 |
-| `dedup` / `dedup_semantic` | 重写故事形态并重新查重 | 只换名词或同义词 |
-| `trace_memory` | 用干净会话重新运行 | 修改 `other_issues` |
-| `trace_skill` / `trace_standard_leak` / `trace_docker_call` | 检查运行隔离后重跑 | 改 Feedback |
-| `DOMAIN_MISMATCH` | 回出题侧换主任务 | 反复 PUT |
+| `trace_complexity_floor` | 已有平台单时本地废弃，不处理 | 改题重跑 / 改 Feedback / PUT |
+| `trace_tool_call_floor` | 本地不统计；若平台明确返回该检查，已有平台单时本地废弃 | 改题重跑 / 把本地计数改写成通过 |
+| `dedup` / `dedup_semantic` | 已有平台单时本地废弃，不处理 | 改题重跑 / 只换名词或同义词 |
+| `trace_memory` | 已有平台单时本地废弃，不重跑 | 修改 `other_issues` / 换会话 |
+| `trace_skill` / `trace_standard_leak` / `trace_docker_call` | 已有平台单时本地废弃，不重启运行 | 改 Feedback / 重跑 |
+| `DOMAIN_MISMATCH` | 已有平台单时本地废弃，不处理 | 换主任务后重跑 / 反复 PUT |
 
 ## 运行期策略
 
@@ -51,5 +52,8 @@
 - 新批次使用 H3 v3、A-5 raw gate 和 workload design，避免带病起跑；
 - 轨迹收集后扫描私有会话路径，命中后标记 `runtime_rerun_required`，不进入平台提交。
 
-若后续镜像验证 `claude --restricted` 与当前工具集兼容，可再前移到工具权限层；在未完成真实
-跑题验证前，不直接改镜像参数或伪造成功。
+平台单进入 `PENDING_FIX` 后，返修只允许原记录非锁定字段更新，绝不允许修改提示词后重跑。
+失败只能靠改题面处理时，`fbr_submit.py repair` 写 `review/platform-deprecated.json`，
+后续 `repair/upload/export/status/work` 一律跳过。若后续镜像验证
+`claude --restricted` 与当前工具集兼容，可再前移到工具权限层；在未完成真实跑题验证前，
+不直接改镜像参数或伪造成功。

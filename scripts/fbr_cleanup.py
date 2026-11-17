@@ -459,6 +459,8 @@ def compact_local_task(root: Path, batch_id: str, task_dir: Path, cfg: dict,
 
 
 def _task_terminal(task_dir: Path) -> tuple[bool, str]:
+    if lib.platform_deprecated(task_dir):
+        return True, "平台记录不可返修，已在本地标记废弃"
     state = lib.load_state(task_dir)["stages"]
     if state.get("run", {}).get("state") == "abandoned":
         return True, "运行已主动放弃"

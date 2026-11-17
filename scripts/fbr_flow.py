@@ -22,6 +22,8 @@ def home(root, batch):
 
 def phase(task):
     import fbr_delivery
+    if lib.platform_deprecated(task):
+        return 'platform_deprecated'
     if lib.load_state(task)['stages'].get('run', {}).get('state') == 'abandoned':
         return 'abandoned'
     current = lib.load_json(task / 'run/current.json', default={})
@@ -54,7 +56,7 @@ def platform_summary(tasks):
     for task in tasks:
         state = phase(task)
         if state in ('local_done', 'ready_submit', 'submit_pending',
-                     'submitted', 'cleaned', 'preflight_blocked'):
+                     'submitted', 'cleaned', 'preflight_blocked', 'platform_deprecated'):
             counts[state] = counts.get(state, 0) + 1
     return counts
 
@@ -79,6 +81,10 @@ def checked(row):
 
 def produce(task, cfg, options):
     import fbr_snapshot
+    deprecated = lib.platform_deprecated(task)
+    if deprecated:
+        return {'task_id': task.name, 'state': 'deprecated',
+                'detail': deprecated.get('detail') or '本地废弃，不处理'}
     if lib.load_state(task)['stages'].get('run', {}).get('state') == 'abandoned':
         return {'task_id': task.name, 'state': 'abandoned', 'detail': '批次尾部超时，已主动放弃'}
     if frozen(task):
@@ -491,7 +497,7 @@ def run_flow(root, args):
                             pending[enqueue(next_step,task)]=(next_step,task)
                     elif isinstance(result,dict) and result.get('state') not in ('ok','skip','abandoned'):
                         rows.append(result)
-                    elif isinstance(result,dict) and result.get('state') == 'abandoned':
+                    elif isinstance(result,dict) and result.get('state') in ('abandoned', 'deprecated'):
                         rows.append(result)
                     elif step==3:
                         if getattr(args, 'auto_submit', False) and result.get('state') == 'ok':
@@ -514,7 +520,7 @@ def run_flow(root, args):
         import fbr_sheet
         with args.delivery_lock:
             fbr_sheet.write_sheet(root, args.batch, cfg)
-        problem = any(r['state'] not in ('ok', 'frozen', 'abandoned') for r in rows)
+        problem = any(r['state'] not in ('ok', 'frozen', 'abandoned', 'deprecated') for r in rows)
         reason = 'budget' if time.time() >= deadline else 'paused' if args.stopped() else 'needs_task_agent' if any(r['state']=='needs_task_agent' for r in rows) else 'blocked' if problem else 'completed'
         maintenance = None
         try:

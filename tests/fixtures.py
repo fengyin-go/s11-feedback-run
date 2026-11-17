@@ -123,6 +123,7 @@ class Sandbox(unittest.TestCase):
         }
         record.update(extra)
         lib.save_json(task_dir / "task.json", record)
+        write(task_dir / "prompt.txt", PROMPT)
         lib.save_json(task_dir / "recording-plan.json", {
             "task_id": name, "setup_cmd": "make setup",
             "demo": [{"cmd": "python3 -m clipcut pack fixtures/short.mp4 --segment 10", "show": "生成 6 个分片"},

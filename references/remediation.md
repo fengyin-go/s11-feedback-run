@@ -2,6 +2,9 @@
 
 适用于数据调表、独立评价、必填字段和交付闸门失败。失败是下一步工作的输入；调度应主动把可修复的问题处理好，争取当前数据真实通过全部适用闸门，不只汇报“不通过”后转走。
 
+已有平台单的返修是例外：只允许更新原记录的非锁定字段，不得修改提示词后重跑。凡需要改题面
+才可能通过的失败，直接写 `review/platform-deprecated.json` 并在本地废弃，不继续处理。
+
 ## 按失败来源继续处理
 
 - **字段或调表错误**：读取 `field-audit.json`、结果表“必填字段核查”与源记录，逐项定位缺失、错误映射、无效枚举或文件路径。回到真实材料修复生成逻辑或有来源的字段修订，再重新生成表格；直接改 Excel 副本不算修好。冻结交接文件保持原样，修订记录须保留原值、新值、来源、核实过程与适用任务；没有有效修订入口时补齐入口并验证，不能因此永久搁置。
@@ -9,13 +12,14 @@
 - **录屏、setup 或测试材料缺失/失效**：区分环境问题与真实产物问题。恢复验收环境、按原命令重试准备或补录实际功能、补充最小定向 probe，保留失败记录，再更新 facts/card 和独立回执。原有有效材料能复用就复用；变更材料后重验受影响的下游绑定。
 - **轨迹或精确来源失效**：先运行 `fbr_evidence.py ingest --force` 重建 manifest、事件图、偏移和 trace-check，再重新生成 trace-analysis/card/brief 并核对 claim 来源。旧行号、旧 block、旧 hash 不得继续使用；不能用卡片摘要或 facts 摘要替代原始区间。
 - **评价、来源、格式、测试描述、评分依据或查重失败**：由当前任务 AI 根据具体错误及当前证据持续修复、逐句复核，再用 `fbr_reviewer.py finalize` 验证。生成回执有效但批次 gate 失败，也必须进入回修，不能反复沿用同一候选。只有轨迹分析读取 reviewer.env；其他修复由推进任务的当前 AI 完成。
-- **题目级领域、难度、工作量或查重失败**：`DOMAIN_MISMATCH`、`trace_complexity_floor`、
-  `trace_tool_call_floor`、`dedup`、`dedup_semantic` 都不属于 Feedback 可修范围。保留失败
-  检查、原题和冻结字段，标记 `prompt_rebuild_required` 并回到出题侧；不能靠改领域枚举、
-  补业务名词、重写 Feedback 或反复 PUT 返修。
+- **已有平台单的题目级领域、难度、工作量或查重失败**：`DOMAIN_MISMATCH`、
+  `trace_complexity_floor`、`trace_tool_call_floor`、`dedup`、`dedup_semantic` 都不属于
+  Feedback 可修范围。保留失败检查和原题冻结字段，写 `review/platform-deprecated.json`
+  并在本地标记废弃；不修改提示词、不重跑、不转回出题侧、不再 PUT。
 - **私有会话读取**：`trace_memory` 命中 `.claude/projects`、`.claude/todos`、
-  `.claude/sessions` 或 `.claude/history.jsonl` 时标记 `runtime_rerun_required`。不得通过修改 `other_issues`
-  或 Feedback 绕过；保留命中步骤和返回摘要，检查运行隔离后重新跑同题。
+  `.claude/sessions` 或 `.claude/history.jsonl` 时，若已有平台单则原附件无法替换，直接在
+  本地标记废弃且不重跑；只有尚未产生平台单的提交前预检，才可按运行隔离规则重新准备。
+  不得通过修改 `other_issues` 或 Feedback 绕过。
 - **发布或交付缺失**：保留已通过的独立验收并立即落表。完整流水线和 finalize 默认主动处理推送、可见性、SHA 回读与材料导出，再重验必填字段；无发布授权时先完成其余可做事项，明确只剩哪项授权。用户要求暂不提交平台时始终不上传、不建单。
 
 低分或真实功能缺陷不等于数据不能通过；应如实评价和保留产物。不得为了闸门通过改被测代码、重跑刷分、删失败轨迹、手改状态、放宽枚举或证据标准，也不得把本地提交链接冒充已发布快照。

@@ -87,6 +87,9 @@ def build_note(doc: dict, snapshot: dict, recording: dict, attempts: list[dict])
 
 def build_row(root: Path, task_dir: Path, cfg: dict, *, delivery_manifest: dict | None = None) -> tuple[dict | None, str]:
     """返回 (一行数据, 没进结果页的原因)。"""
+    deprecated = lib.platform_deprecated(task_dir)
+    if deprecated:
+        return None, "本地废弃：" + str(deprecated.get("detail") or deprecated.get("reason") or "不处理")
     record = fbr_fields.effective_record(task_dir)
     stages = lib.load_state(task_dir)["stages"]
     info = stages.get("feedback", {})
@@ -288,6 +291,9 @@ def run_activity(task_dir: Path) -> str:
 
 
 def pending_reason(task_dir: Path) -> str:
+    deprecated = lib.platform_deprecated(task_dir)
+    if deprecated:
+        return "本地废弃：" + str(deprecated.get("detail") or deprecated.get("reason") or "不处理")
     stages = lib.load_state(task_dir)['stages']
     if stages.get('run', {}).get('state') == 'abandoned':
         return '批次尾部超时，已主动放弃'
@@ -361,7 +367,7 @@ def progress_fingerprint(root: Path, batch_id: str, cfg: dict) -> str:
     watched = ("state.json", "run/current.json", "run/attempts.json", "trace/ids.json",
                "review/snapshot.json", "review/feedback.json", "review/gate.json",
                "review/attestation.json", "review/submit-preflight.json",
-               "review/upload.json", "cleanup.json",
+               "review/upload.json", "review/platform-deprecated.json", "cleanup.json",
                "record/recording.json")
     active_states = {"starting", "running", "continue_ready", "exited"}
     for task in lib.task_dirs(root, batch_id):
@@ -758,8 +764,10 @@ def main() -> int:
                 return 0
             return watch_loop(root, args.batch, cfg)
         out = write_sheet(root, args.batch, cfg)
-        print(f"{out['path']}")
-        print(f"批次共 {out['tasks']} 题，进结果页 {out['rows']} 题，其中可提交 {out['ready']} 题")
+        if not out["pending"] and out["rows"] == out["tasks"]:
+            print(f"{out['path']} tasks={out['tasks']} ready={out['ready']}")
+            return 0
+        print(f"{out['path']} tasks={out['tasks']} rows={out['rows']} ready={out['ready']} pending={len(out['pending'])}")
         for name, state in out["pending"]:
             print(f"  {name}  {state}")
         return 0

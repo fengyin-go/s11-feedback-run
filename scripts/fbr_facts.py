@@ -261,7 +261,7 @@ def facts_one(task_dir: Path, root: Path, cfg: dict, redo: bool = False) -> dict
         "tests": {"setup_cmd": cfg["facts"]["setup_cmd"], "test_cmd": cfg["facts"]["test_cmd"],
                   "before": before, "after": after, **compare_tests(before, after)},
         "changes": changes,
-        "trace": {"steps": trace["steps"], "counts": trace["counts"], "started_at": trace["started_at"],
+        "trace": {"steps": trace["steps"], "started_at": trace["started_at"],
                   "ended_at": trace["ended_at"], "api_errors": trace["api_errors"],
                   "assistant_answers": trace["assistant_answers"], "continuations": ids.get("continuations", [])},
         "verification": trace["verification"],
@@ -273,7 +273,7 @@ def facts_one(task_dir: Path, root: Path, cfg: dict, redo: bool = False) -> dict
     tests = facts["tests"]
     return {"task_id": name, "state": "ok",
             "detail": f"改动 {changes['totals']['files']} 个文件，产物测试{'通过' if tests['after_ok'] else '不通过'}，"
-                      f"新增失败 {len(tests['new_failures'])} 个，轨迹 {trace['counts']['tools']} 步"}
+                      f"新增失败 {len(tests['new_failures'])} 个"}
 
 
 def main() -> int:
