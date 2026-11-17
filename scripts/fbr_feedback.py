@@ -104,7 +104,7 @@ def decision_template(task_dir: Path) -> dict:
         "issues": [],
         "test_claims": [],
         "score_basis": {
-            "category": "complete | delivery_issue | verification_gap | process_issue",
+            "category": "complete | delivery_issue | verification_gap",
             "delivered": "", "remaining": "", "why_this_score": "",
             "lowest_supported_score": 4, "lower_score_rejected": "", "anchors": [],
         },
@@ -349,7 +349,9 @@ def expand_decision(task_dir: Path, decision: dict) -> tuple[dict, dict]:
         derived_fields.append("score_basis.delivered")
     remaining_rows = [row for row in statuses if row.get("status") != "completed"]
     if not str(basis.get("remaining") or "").strip():
-        basis["remaining"] = "；".join(row["user_text"] for row in remaining_rows) or (
+        final_gaps = gate.remaining_gap_sentences(text) if score == 4 else []
+        basis["remaining"] = final_gaps[-1] if final_gaps else (
+            "；".join(row["user_text"] for row in remaining_rows) or
             "现有证据未发现已证实的功能缺口"
         )
         derived_fields.append("score_basis.remaining")
@@ -365,9 +367,12 @@ def expand_decision(task_dir: Path, decision: dict) -> tuple[dict, dict]:
             basis["category"] = "complete"
         elif score == 4 and any(row.get("status") == "unverified" for row in statuses):
             basis["category"] = "verification_gap"
-        elif score == 4 and process_problem and not issues:
-            basis["category"] = "process_issue"
         elif score == 4 and len(counterexamples) < 2 and not issues:
+            basis["category"] = "verification_gap"
+        elif score == 4 and not issues:
+            # Platform consistency requires a final delivery or verification gap.
+            # A process-only 4 is retained only when the author explicitly requests it
+            # for local diagnosis; automatic expansion must never select that category.
             basis["category"] = "verification_gap"
         elif score < 4:
             basis["category"] = "delivery_issue"

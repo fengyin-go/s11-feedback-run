@@ -4,6 +4,7 @@
 检查对象是 agent 写的两份文件：
 - evidence/audit.json   逐条需求的结论（做到 / 有问题 / 看不出来）+ 锚点、实跑过的反例、虚假成功判断
 - review/feedback.json  分数、Feedback 正文、过程句与问题句各自的锚点
+- 4 分还必须在最终交付上写出验证缺口或轻微交付问题，纯过程返工不能提交平台
 
 每个检查返回 (errors, warnings)。errors 不清零就不进结果表。
 """
@@ -62,6 +63,17 @@ PROCESS_CONSEQUENCE_RE = re.compile(r"导致|因此|结果|最终|最后|仍|仍
 FAIL_WORDS_RE = re.compile(r"不通过|没通过|未通过|没过|失败|报错|跑不起来|起不来|编译不过|无法运行|无法启动|无法编译")
 # 「没有报错」「不会失败」是在说没出问题，不能当成写了失败
 NEGATED_FAIL_RE = re.compile(r"(?:没有|不再|不会|没|未|无|不)(?:报错|失败)")
+PLATFORM_REMAINING_GAP_RE = re.compile(
+    r"(?:最终|当前|目前)[^。；\n]{0,60}(?:仍|尚未|没有|未|无法|缺少|不能)|"
+    r"(?:最终交付|交付结果|当前产物|页面|接口|入口|导出|恢复|记录|文件|任务)"
+    r"[^。；\n]{0,50}(?:仍|尚未|没有|未|无法|缺少|不可用|不能)|"
+    r"(?:用户|使用的人|操作者)[^。；\n]{0,60}(?:看不到|无法|不能|没有)|"
+    r"仍缺少|仍无法|仍不能|仍未|仍返回|仍显示|仍存在|"
+    r"尚未覆盖|没有覆盖|无法确认|尚未验证|仍未验证|"
+    r"有一处没处理|没处理|未处理|没有给出|未给出|没有保存|未保存|没有实现|未实现"
+    r"|走不通|求和会失败|打不开|不可用|无法使用|无法完成|"
+    r"(?:报|返回)\s*(?:Invalid requirement|[45]\d\d)"
+)
 STEP_REF_RE = re.compile(r"第\s*(\d+)\s*步")
 REQ_REF_RE = re.compile(r"(?<![A-Za-z0-9_])R\d+(?![A-Za-z0-9_])")
 # re.A：\w 只认 ASCII，文件名紧挨着中文也能切出来（和 fbr_facts.PATH_RE 一致）
@@ -76,6 +88,43 @@ def squash(text: str) -> str:
 
 def sentences(text: str) -> list[str]:
     return [s.strip() for s in re.split(r"[。！？；\n]+", text or "") if s.strip()]
+
+
+def remaining_gap_sentences(text: str) -> list[str]:
+    """Return public clauses that state a final delivery or verification gap."""
+    return [unit for unit in sentences(text) if PLATFORM_REMAINING_GAP_RE.search(unit)]
+
+
+def platform_consistency_errors(score, text: str, basis: dict | None = None) -> list[str]:
+    """Reject process-only 4-point feedback before platform consistency review."""
+    if score != 4:
+        return []
+    errors = []
+    gaps = remaining_gap_sentences(str(text or ""))
+    if not gaps:
+        errors.append(
+            "4 分必须写出最终交付扣分点：没有最终缺口、验证边界或用户可见残留后果时，"
+            "不能只写过程返工；请重新核实交付并考虑 5 分或补出真实 verification_gap/delivery_issue"
+        )
+    if not isinstance(basis, dict):
+        return errors
+    category = str(basis.get("category") or "")
+    if category == "process_issue":
+        errors.append(
+            "4 分的 process_issue 不能作为平台交付扣分点："
+            "须重新确认最终交付是否完整；若仍有缺口，改为 verification_gap 或 delivery_issue 并在正文明确说明"
+        )
+    elif category and category not in ("verification_gap", "delivery_issue"):
+        errors.append("4 分的 score_basis.category 必须是 verification_gap 或 delivery_issue")
+    remaining = squash(str(basis.get("remaining") or ""))
+    if not remaining_gap_sentences(remaining):
+        errors.append(
+            "score_basis.remaining 必须写明同一最终交付缺口，不能只写过程失败、"
+            "没有已证实功能缺口或全部通过"
+        )
+    elif gaps and not any(squash(gap) in remaining or remaining in squash(gap) for gap in gaps):
+        errors.append("score_basis.remaining 必须对应正文中的同一最终缺口句")
+    return list(dict.fromkeys(errors))
 
 
 def longest_common(a: str, b: str) -> str:
@@ -432,13 +481,16 @@ def check_feedback(doc: dict, task: dict, facts: dict, audit: dict, ev: dict, ga
         if score == 5 and issues:
             errors.append("5 分不写缺口：issues 应当为空")
         process_or_verification_gap = (score == 4 and isinstance(doc.get("score_basis"), dict)
-                             and doc["score_basis"].get("category") in ("verification_gap", "process_issue")
+                             and doc["score_basis"].get("category") == "verification_gap"
                              and all(r.get("verdict") in ("做到", "看不出来") for r in audit.get("requirements", []))
                              and audit.get("false_success") == "无"
                              and not facts["tests"]["regression"]
                              and not any(c.get("found_problem") for c in audit.get("counterexamples", [])))
         if score < 5 and not issues and not process_or_verification_gap:
             errors.append(f"{score} 分至少要有一处问题句")
+        errors += platform_consistency_errors(
+            score, text, doc.get("score_basis") if isinstance(doc.get("score_basis"), dict) else None,
+        )
         if score >= 4 and len(re.findall(r"[A-Za-z_][\w./-]{2,}|\d+", text, flags=re.A)) < 2:
             errors.append("4 到 5 分也要写出核对过的要求和实际验证结果，正文里看不到具体的命令、文件或数值")
     if facts["tests"]["regression"] and not FAIL_WORDS_RE.search(NEGATED_FAIL_RE.sub("", text)):

@@ -10,8 +10,8 @@ import fbr_evidence
 import fbr_gate as gate
 import fbrlib as lib
 
-VERSION = 13
-SUPPORTED_CERTIFICATE_VERSIONS = {12, 13}
+VERSION = 14
+SUPPORTED_CERTIFICATE_VERSIONS = {12, 13, 14}
 CHECKS = ("result_and_process", "task_specific_voice", "test_relevance", "score_alignment",
           "evidence_fidelity", "scope_discipline", "non_template")
 RULE_FILES = ("references/scoring.md", "references/feedback-writing.md", "references/feedback-calibration.md",
@@ -27,6 +27,7 @@ LEGACY_TRACE_POLICIES = {
     "41e8cc299da551d1c8f22773ec0b0307262ddd13f5eb41cb2903b3bcc68d1e72",
 }
 LEGACY_FEEDBACK_POLICIES = {
+    "a1e0ca307e61222cd2ba24ab1c382f6bcf18c2bbeed1eb469d6369dbf60f2e9a",
     "4f8b031762278016d5e63cb784fd04bc2b2f921b33b9a7dda52082fb1427f95e",
     "6a50956ab20e9c7567e9397be7e7be8d3183d84981786b9899809a6c016111d4",
     "e7f4586b18419b0ae217edcfc1e3c6a2f8192810d77b032c11b2e27378882ff2",
@@ -273,6 +274,9 @@ def check_contract(doc: dict, task: dict, facts: dict, audit: dict, probes: list
             errors.append('评分依据必须绑定最终交付证据 anchors')
         else:
             errors += gate._anchor_problems(anchors, ev, '评分依据')
+        errors += gate.platform_consistency_errors(
+            doc.get("score"), str(doc.get("feedback") or ""), basis,
+        )
 
     errors += process_audit_errors(doc, facts)
 

@@ -358,8 +358,11 @@ class PlatformStyle(unittest.TestCase):
         self.assertTrue(any("必须明确写出具体问题" in item for item in
                             submit.platform_style_problems("页面显示状态不一致。", 2)))
         self.assertEqual(submit.platform_style_problems("争用发生时旧计划没有被覆盖，任务时间随后更新。"), [])
+        self.assertTrue(any("最终交付扣分点" in item for item in submit.platform_style_problems(
+            "模型首次运行失败，随后修正 CAND-0001 的状态判断，最终完成任务。", 4)))
         self.assertEqual(submit.platform_style_problems(
-            "模型首次运行失败，随后修正 CAND-0001 的状态判断，最终完成任务。", 4), [])
+            "模型首次运行失败，随后修正 CAND-0001 的状态判断，主要流程已经可用。"
+            "最终仍缺少跨进程同时提交的验收证据。", 4), [])
 
 
 class FakeClient:

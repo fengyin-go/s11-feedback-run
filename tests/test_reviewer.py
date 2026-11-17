@@ -571,6 +571,13 @@ class Review(FlowCase):
         self.assertTrue(basis["anchors"])
         self.assertTrue(verification["build_derivations"]["fields"])
 
+        decision["score_basis"]["category"] = ""
+        candidate, _ = fbr_feedback.expand_decision(task, decision)
+        self.assertNotEqual(
+            candidate["feedback"]["score_basis"]["category"], "process_issue",
+            "自动展开不能把纯 process_issue 选成可提交平台的 4 分",
+        )
+
     def test_work_wait_and_closeout_use_files_not_conversation_history(self):
         task = self.agent_prepared()
         flow = lib.batch_dir(self.root, task.parent.name)/'flow'

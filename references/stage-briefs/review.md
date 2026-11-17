@@ -17,4 +17,6 @@
   `QC_PASSED` 后才压缩可重建代码现场。原始轨迹、录屏、证据、Feedback
   和长期结果包始终保留。
 - 评分先看最终交付，过程问题按 scoring.md；5 分必须与正文呈现的过程一致。
+- 4 分必须在正文留下最终交付缺口；纯 `process_issue` 不再可交付。`score_basis.category` 只能
+  使用 `verification_gap` 或 `delivery_issue`，`remaining` 要与正文同一句对应。
 - 只加载当前需要的 `reviewer.md`、`feedback-quality.md`、`feedback-writing.md`、`feedback-language-policy.md`、`scoring.md` 和归因规范。

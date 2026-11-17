@@ -222,7 +222,7 @@ fbr_record.py --batch b1110-01                       # --redo 重录
 
 先读 [references/reviewer.md](references/reviewer.md)、`references/scoring.md`、`references/feedback-writing.md` 和 `references/feedback-language-policy.md`。**只有轨迹分析使用 `reviewer.env`（默认 `gpt-6.1-sol`）**。过程证据核查、需求完成判断、产物验收、交付完整性评分、Feedback 撰写、产物断言逐句复核、门闸修复均由推进任务的当前 AI 完成，不通过该配置调用其他模型，也不固定另一个产物验收模型。人工 spotcheck 仍由实际审核人完成。
 
-提交或平台返修前还要通过 [references/feedback-platform-style.md](references/feedback-platform-style.md) 的本地风格检查。4 分正文必须明确写出扣分对应的失败或返工后果，并留下至少一个真实文件、命令、对象或返回值；测试层级和总数不能代替具体行为验证。系统会拦截已知的业务速记、终端成功输出和过密精确数值。
+提交或平台返修前还要通过 [references/feedback-platform-style.md](references/feedback-platform-style.md) 的本地风格检查。4 分必须在最终交付上明确写出一个尚未闭合的缺口、验证边界或用户可见残留后果，并留下至少一个真实文件、命令、对象或返回值。过程返工只能解释缺口来源，不能单独充当平台交付扣分点。`score_basis.category=process_issue` 不能通过平台预检；只能改用有真实正文缺口的 `verification_gap` 或 `delivery_issue`，或在确认最终交付完整后重新评审为 5 分。
 
 1. `fbr_feedback.py card` 汇集题面、需求点、测试对比、演示结果、改动与轨迹索引。
 2. `fbr_reviewer.py review` 自动先对全部主/子轨迹及获准续写做一次全量摄取，建立事件图和精确偏移；reviewer 只读经过裁剪的编辑、测试/构建、错误和修正事件，不统计或补算工具调用次数，并按行号/block 回查候选原文，保存带精确出处、完整后续状态和调用回执的 `review/trace-analysis.json`，随后返回 `needs_task_agent` 检查点。轨迹配置未填写 `model` / `reasoning_effort` 时沿用 `gpt-6.1-sol` / `high`；不可用时只暂停这一阶段，不伪造分析。
@@ -271,6 +271,10 @@ Feedback 的硬底线：
   Chromium/系统库、sudo、httpx2、浏览器安装或本地页面测试问题不得写成模型行为，
   也不得据此扣分或写明“未执行”。
 - 5 分必须与正文呈现一致；正文若写出首测失败、错误断言、核心返工或关键竞争未验证，最高 4 分。
+- 4 分正文必须在最后一个结果段明确留下最终缺口。若正文最后仍是“修正后通过、产物无问题、
+  交付行为符合预期”，则不能提交 4 分；必须重新核实最终交付并补真实缺口，或改为 5 分。
+- `score_basis.remaining` 必须逐字写入正文中的同一最终缺口句。`process_issue` 只保留作内部诊断，
+  不能作为平台 4 分依据；平台可用的 4 分类别只有 `verification_gap` 和 `delivery_issue`。
 - 正文自然、具体，不写公司黑话、抽象名词清单、空泛完成度和机器报告字段；统一规则见 `feedback-language-policy.md` 和 `feedback-style-lexicon.json`。测试数量必须绑定同次输出，不能拿全仓总数代替本题行为。
 - `language_review.criterion_sentence` 必须逐字出现在正文，说明本轮最看重的业务约束；词表命中必须改写后重新核对证据，不能自动换词。
 - `requirements_status` 必须覆盖全部需求，状态只能为 completed/partial/missing/unverified，并与 audit 一致。
@@ -294,6 +298,11 @@ Feedback 的硬底线：
   不重跑、不转回出题侧、不继续调用平台；后续 `repair/upload/export/status/work` 均跳过该题。
 - 只有原字段返修后得到 `QC_PASSED` 才算通过。返修后的新 `PENDING_FIX` 仍按同一硬规则判断；
   一旦需要改题面才能过，直接本地废弃。
+
+当 `qc_summary` 命中“交付完整性非满分，但 Feedback 未指出任何交付扣分点”时，先按本节的
+平台一致性门禁重新核实最终交付，禁止只替换同义句或批量改成 5 分。优先补做与题面直接相关的
+并发、时序、幂等、归档、恢复或跨模块一致性 probe：发现真实失败才按证据降到 3 分；确认有
+未闭合验证边界时保持 4 分并写最终缺口；全部边界确认通过后才重新评估 5 分。
 
 ## 6. 抽检与结果表
 

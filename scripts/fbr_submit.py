@@ -19,6 +19,7 @@ from urllib.parse import urljoin, urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import fbrlib as lib
+import fbr_gate as gate
 import fbr_runtime
 import fbr_style
 import fbr_trace
@@ -481,6 +482,12 @@ def preflight_one(root: Path, batch_id: str, task_id: str, *, client=None,
         result["content_digest"] = plan["content_digest"]
         result["errors"].extend(platform_style_problems(
             str(plan["data"].get("feedback", "")), plan["data"].get("score_delivery")))
+        feedback_doc = lib.load_json(task_dir / "review/feedback.json", default={})
+        result["errors"].extend(gate.platform_consistency_errors(
+            feedback_doc.get("score"),
+            str(feedback_doc.get("feedback") or ""),
+            feedback_doc.get("score_basis") if isinstance(feedback_doc.get("score_basis"), dict) else None,
+        ))
         records_by_task = {}
         for candidate in lib.task_dirs(root, batch_id):
             candidate_feedback = lib.load_json(
@@ -634,6 +641,7 @@ def platform_style_problems(text: str, score: int | None = None) -> list[str]:
             break
     if score is not None and score <= 2 and not re.search(r"(?:问题|缺口|未实现|无法|不可用|失败)", text or ""):
         errors.append("2 分及以下的 Feedback 必须明确写出具体问题、缺口或不可用后果")
+    errors.extend(gate.platform_consistency_errors(score, text or ""))
     errors.extend(fbr_style.error_messages(text, score))
     return list(dict.fromkeys(errors))
 
@@ -1352,7 +1360,14 @@ def repair_one(root: Path, plan: dict, client, schema: dict, *, execute: bool, c
             "reason": discarded["reason"],
             "detail": discarded["detail"],
         }
-    style_errors = platform_style_problems(str(plan["data"].get("feedback", "")))
+    local_feedback = lib.load_json(task_dir / "review/feedback.json", default={})
+    style_errors = platform_style_problems(
+        str(plan["data"].get("feedback", "")), plan["data"].get("score_delivery"))
+    style_errors.extend(gate.platform_consistency_errors(
+        local_feedback.get("score"),
+        str(local_feedback.get("feedback") or ""),
+        local_feedback.get("score_basis") if isinstance(local_feedback.get("score_basis"), dict) else None,
+    ))
     if style_errors:
         raise lib.FbrError("；".join(style_errors))
     current = remote_data(detail)

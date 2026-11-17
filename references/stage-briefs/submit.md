@@ -3,6 +3,8 @@
 目标：把已通过本地闸门的当前版本提交到 SOLO2，并回读确认，不重新建单或绕过证据。
 
 - 提交前验证 `review/attestation.json` 和当前平台 schema；不再重跑需求评审、评分或 Feedback 写作。
+- 4 分必须通过最终交付缺口一致性检查；纯 `process_issue`、正文没有最终缺口或
+  `score_basis.remaining` 对不上时，预检直接阻断。
 - 账号从 `_config/settings.json.platform.account` 读取，默认 `zouyonghong`；环境变量只作显式覆盖。
 - 同时验证 `review/platform-rules.json`：出题侧 P5/P6 契约、A-5 或私有会话读取风险未清零时
   不得上传。不统计轨迹工具调用总数，也没有 50/55 次数量门槛；P6 只核对工作切片和

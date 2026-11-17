@@ -514,14 +514,40 @@ class Feedback(Case):
 
     def test_verification_gap_does_not_force_invented_delivery_issue(self):
         doc = feedback(5)
-        doc.update(score=4, score_basis={"category": "verification_gap"})
+        gap = "最终仍缺少无权限目录下的重试证据"
+        doc["feedback"] += gap + "。"
+        doc.update(score=4, score_basis={
+            "category": "verification_gap",
+            "remaining": gap,
+        })
         self.hasnt(self.check(doc, a=audit(5), p=probes(2))[0], "4 分至少")
         doc["score_basis"]["category"] = "process_issue"
-        self.hasnt(self.check(doc, a=audit(5), p=probes(2))[0], "4 分至少")
+        self.has(self.check(doc, a=audit(5), p=probes(2))[0], "process_issue 不能作为平台交付扣分点")
+        doc["score_basis"]["category"] = "verification_gap"
         unknown = audit(5)
         unknown["requirements"][1].update(verdict="看不出来", note="现有材料不足以确认该边界")
         self.hasnt(self.check(doc, a=unknown, p=probes(2))[0], "4 分至少")
         self.has(self.check(doc, a=audit(4))[0], "4 分至少")
+
+    def test_process_only_four_is_blocked_for_platform_consistency(self):
+        doc = feedback(5)
+        doc.update(score=4, score_basis={
+            "category": "process_issue",
+            "remaining": "没有已证实功能缺口",
+        })
+        errors = self.check(doc, a=audit(5), p=probes(2))[0]
+        self.has(errors, "4 分必须写出最终交付扣分点")
+        self.has(errors, "process_issue 不能作为平台交付扣分点")
+        self.has(errors, "score_basis.remaining 必须写明同一最终交付缺口")
+
+    def test_platform_consistency_accepts_real_delivery_issue(self):
+        sentence = "requirements-dev.txt 首行写成说明文字，pip 安装报 Invalid requirement，README 的安装命令走不通"
+        self.assertEqual(gate.platform_consistency_errors(
+            4, sentence + "。", {
+                "category": "delivery_issue",
+                "remaining": sentence,
+            },
+        ), [])
 
     def test_process_without_tools_must_reference_conversation(self):
         f, doc = facts(), feedback(4)
