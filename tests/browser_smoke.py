@@ -17,18 +17,25 @@ def local_only(command, **kwargs):
         return original([sys.executable,'-u','-m','http.server',str(port),'--bind','127.0.0.1','--directory',str(out)],**kwargs)
     return original(command,**kwargs)
 plan={'serve_cmd':'fixture-server {port}', 'steps':[{'action':'fill','selector':'#q','value':'verified'}, {'action':'click','selector':'button'}, {'action':'expect_text','selector':'#result','text':'verified','pause_ms':1500},
-    {'action':'click','selector':"a[href='/details.html']"},
-    {'action':'fill','selector':'#label','value':'updated'},
-    {'action':'click','selector':'button'},
-    {'action':'expect_text','selector':'#saved','text':'updated','pause_ms':1500},
-    {'action':'click','selector':"a[href='/runs.html']"},
-    {'action':'click','selector':'button'},
-    {'action':'expect_text','selector':'#status','text':'Done','pause_ms':1500}]}
+    {'action':'click','selector':"a[href='/details.html']",'page':'home'},
+    {'action':'fill','selector':'#label','value':'updated','page':'details'},
+    {'action':'click','selector':'button','page':'details'},
+    {'action':'expect_text','selector':'#saved','text':'updated','pause_ms':1500,'page':'details'},
+    {'action':'click','selector':"a[href='/runs.html']",'page':'details'},
+    {'action':'click','selector':'button','page':'runs'},
+    {'action':'expect_text','selector':'#status','text':'Done','pause_ms':1500,'page':'runs'}],
+    'pages':[{'id':'home','path':'/','min_visible_seconds':2},
+             {'id':'details','path':'/details.html','min_visible_seconds':2},
+             {'id':'runs','path':'/runs.html','min_visible_seconds':2}]}
+for step in plan['steps']:
+    step.setdefault('page','home')
 with patch.object(subprocess,'Popen',side_effect=local_only):
     steps,metadata=fbr_web.render(plan,'no-container-used',port,out,{'width':1280,'height':720,'max_seconds':40})
 fbr_record.to_mp4(out/'raw.webm',out/'recording.mp4',40,1280,720)
 video=fbr_record.probe_mp4(out/'recording.mp4')
-assert metadata['startup_ready'] and metadata['page_segment'] and not metadata['page_errors'],metadata
+assert metadata['startup_ready'] and metadata['page_segment'] and metadata['page_ready'],metadata
+assert metadata['coverage_complete'] and not metadata['missing_pages'],metadata
+assert metadata['page_seconds'] >= 12,metadata
 assert steps[0]['input_recorded'] and metadata['command_input_seconds'] > 0, (steps, metadata)
 assert all(s['rc']==0 for s in steps[1:]),steps
 assert len({s['url'] for s in steps[1:]}) == 3,steps

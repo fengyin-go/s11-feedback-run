@@ -271,6 +271,8 @@ def main() -> int:
     args = parser.parse_args()
     try:
         root = lib.find_root(args.root)
+        import fbr_submit
+        fbr_submit.configure_account(root)
         if args.command == "status":
             print_status(status(root, args.batch), args.batch)
         elif args.command == "preview":
@@ -299,7 +301,6 @@ def main() -> int:
                     print(f"- {row.get('task_id')}：{row.get('error')}")
             return 0 if result["state"] == "ready" else 1
         elif args.command == "repair":
-            import fbr_submit
             result = fbr_submit.repair_batch(root, args.batch, tasks=args.tasks,
                                              execute=args.execute, confirm=args.confirm, comment=args.comment,
                                              interval=args.submit_interval)

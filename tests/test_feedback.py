@@ -79,11 +79,17 @@ class Card(FlowCase):
                      "steps": [{"cmd": "make demo", "show": "", "rc": 124, "seconds": 60, "cut": True, "tail": "…",
                                 "skipped": False},
                                {"cmd": "make test", "show": "测试通过", "rc": None, "seconds": None, "cut": False,
-                                "tail": "", "skipped": True}]}
+                                "tail": "", "skipped": True}],
+                     "coverage_declared": True, "coverage_complete": False,
+                     "pages": [{"id": "home"}, {"id": "details"}],
+                     "missing_pages": ["details"],
+                     "action_errors": ["details 页面按钮返回 500"]}
         text = self.card(self.evidenced(recording=recording))
         self.assertIn("- 准备命令没成功：pip: no matching distribution", text)
         self.assertIn("1. `make demo` → 退出码 124，被截断；要看的：未写", text)
         self.assertIn("2. `make test` → 没跑到；要看的：测试通过", text)
+        self.assertIn("- Web 页面覆盖：不完整；2 个声明页面，缺失 details", text)
+        self.assertIn("页面动作实际报错：details 页面按钮返回 500", text)
 
     def test_probes_are_listed(self):
         task_dir = self.evidenced()

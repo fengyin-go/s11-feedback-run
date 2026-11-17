@@ -352,6 +352,42 @@ def lint_candidate(task: Path, candidate: dict, verification: dict | None = None
             "按 errors 修复后重新 lint；平台提交预检仍会实时核对 schema、附件和账号"}
 
 
+def repair_actions(errors: list[str]) -> list[dict]:
+    """Convert mechanical validation errors into targeted patch locations."""
+    actions = []
+    for error in errors:
+        path, fix = "feedback", "按错误缩小或补齐正文和结构化证据后重新 build/lint"
+        if "逐条引用过程句 evidence" in error or "过程句 evidence" in error:
+            path = "process[].evidence"
+            fix = "保留 process.evidence，并让同句 claims.sources 引用同一摘录；重新 build 会自动合并"
+        elif "摘录不在原始文件" in error or "摘录不在指定" in error or "摘录没有唯一位置" in error:
+            path = "claims[].sources"
+            fix = "从指定 step 的 target/output/error 复制连续原文，交给 build 自动定位行号和 block"
+        elif "缺少原始文件及连续摘录" in error or "来源不是本题可核对" in error:
+            path = "claims[].sources"
+            fix = "改为 trace/projects、command-logs、probes、recording.json 或 task.json 的连续摘录"
+        elif "完整句段" in error or "正文原句" in error or "完整正文原句" in error:
+            path = "results/process/issues[].sentence"
+            fix = "引用一个完整句号或分号段；若只写局部短语，build 仅在唯一包含句时自动扩展"
+        elif "process_audit" in error or "过程句归因" in error:
+            path = "process[].audit"
+            fix = "补齐五项 checks 和 note；process_audit 由 build 从该对象生成"
+        elif "requirements_status" in error or "需求状态" in error:
+            path = "requirements[]"
+            fix = "补齐需求 verdict、user_text 和 anchors；build 会生成 requirements_status"
+        elif "score_basis" in error or "分数" in error or "评分依据" in error:
+            path = "score_basis"
+            fix = "补齐 category、已交付、剩余、降档理由和 anchors；可省略项由 build 生成"
+        elif "language_review" in error or "正文里" in error or "Feedback" in error:
+            path = "feedback/language_review"
+            fix = "按 style-report 命中位置改写正文，并确保 criterion_sentence 逐字存在于正文"
+        elif "测试描述" in error or "test_claims" in error:
+            path = "test_claims"
+            fix = "用同一次执行的真实输出绑定完整测试分句、行为和计数"
+        actions.append({"path": path, "error": error, "fix": fix})
+    return actions
+
+
 def validation_report(task: Path, stage: str, result: dict) -> Path:
     errors = [str(item) for item in result.get("errors") or []]
     groups = {}
@@ -379,7 +415,8 @@ def validation_report(task: Path, stage: str, result: dict) -> Path:
     lib.save_json(target, {
         "version": 1, "stage": stage, "task_id": task.name,
         "state": result.get("state"), "error_count": len(errors),
-        "groups": groups, "errors": errors, "at": lib.now_iso(),
+        "groups": groups, "errors": errors,
+        "repair_actions": repair_actions(errors), "at": lib.now_iso(),
     })
     return target
 
@@ -395,7 +432,10 @@ def compact_result(task: Path, stage: str, result: dict, *, full: bool = False) 
     if errors:
         report = validation_report(task, stage, result)
         lines.append(f"错误 {len(errors)} 项；完整报告 {report}")
-        lines.extend(f"- {lib.clip(error, 240)}" for error in errors[:5])
+        lines.extend(
+            f"- {lib.clip(row['path'], 80)}：{lib.clip(row['error'], 200)}"
+            for row in repair_actions(errors)[:5]
+        )
         if len(errors) > 5:
             lines.append(f"- 其余 {len(errors)-5} 项见报告")
     return "\n".join(lines)
@@ -668,8 +708,16 @@ def main() -> int:
             verification_path = task/'review/verification.json'
             lib.save_json(candidate_path, candidate)
             lib.save_json(verification_path, verification)
+            lib.save_json(
+                task/'review/build-report.json',
+                verification.get('build_derivations') or {},
+            )
             result = lint_candidate(task, candidate, verification)
-            result.update(candidate=str(candidate_path), verification=str(verification_path))
+            result.update(
+                candidate=str(candidate_path),
+                verification=str(verification_path),
+                build_report=str(task/'review/build-report.json'),
+            )
             print(compact_result(task, 'build', result, full=args.json))
             return 0 if result['state'] == 'ok' else 2
         if not args.execute:

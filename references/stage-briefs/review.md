@@ -7,6 +7,7 @@
 - 用 `fbr_work.py next --wait` 在任务仍运行时滚动领取评审；当前题完成 finalize 和 closeout 后立即领取下一题，不等整批结束。
 - reviewer 读取 `trace/review-pack.json`。模型行为只能从 `trace/projects/*.jsonl` 的精确行号/block 取证；事件包不是最终证据。
 - 使用 `fbr_feedback.py decision` 写 compact `decision-input.json`，再用 `fbr_reviewer.py build` 展开。人工完整 candidate 仍受同一契约支持。
+- build 会自动生成 requirements_status、process_audit、缺省评分字段和 process claim 来源；查看 `review/build-report.json`，不要手工重复维护这些派生字段。
 - 先按 `feedback-language-policy.md` 写正文，填写 `language_review`；不写公司黑话、抽象名词清单、空泛完成度句和机器报告字段。
 - 过程句只写模型实际动作。probe、录屏、当前 AI 的验收动作和基线已有行为不能冒充模型过程。
 - 逐句复核必须检查完整后续和最终状态；无法由原文支持时标 insufficient、缩小范围或补 probe，不能猜。

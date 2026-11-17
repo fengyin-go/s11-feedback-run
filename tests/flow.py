@@ -69,8 +69,10 @@ def audit() -> dict:
              "anchors": [{"type": "probe", "id": "P2"}, {"type": "file", "path": "src/clipcut/packer.py"}]},
             {"id": "R3", "verdict": "做到", "anchors": [{"type": "probe", "id": "P1"}]},
         ],
-        "counterexamples": [{"what": "分片时长为 0", "probe": "P1", "found_problem": False},
-                            {"what": "一小时以上的输入", "probe": "P2", "found_problem": True}],
+        "counterexamples": [
+            {"what": "分片时长为 0", "prompt_implied": False, "probe": "P1", "found_problem": False},
+            {"what": "一小时以上的输入", "prompt_implied": False, "probe": "P2", "found_problem": True},
+        ],
         "false_success": "轻微", "false_success_note": "回答里说新增了 docs/usage.md，产物里没有这个文件",
         "false_success_anchors": [{"type": "missing", "path": "docs/usage.md"}],
     })
@@ -222,7 +224,7 @@ class FlowCase(FactsCase):
         lib.save_json(path, facts)
 
     def review_receipt(self, task_dir: Path) -> None:
-        """离线模拟指定模型完成生成；生产代码只能在实际模型调用成功后写回执。"""
+        """离线模拟轨迹分析；生产代码只能在真实调用成功后写回执。"""
         import fbr_trace_review
         from types import SimpleNamespace
         fbr_reviewer.trace_index(task_dir)

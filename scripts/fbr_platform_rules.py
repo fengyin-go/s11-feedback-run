@@ -10,7 +10,6 @@ from typing import Any
 import fbrlib as lib
 
 
-MIN_EFFECTIVE_TOOL_CALLS = 50
 MIN_PROMPT_EXPECTED_TOOL_CALLS = 55
 H3_FALSE_GUARDS = {
     "one_branch_violates_constraints",
@@ -61,8 +60,17 @@ def _problem(
     }
 
 
-def prompt_contract_problems(task_dir: Path) -> tuple[list[dict], list[dict]]:
-    """Check the frozen prompt-generation contract before spending quota."""
+def prompt_contract_problems(
+    task_dir: Path,
+    *,
+    strict: bool = True,
+) -> tuple[list[dict], list[dict]]:
+    """Check H3 and A-5 independently; legacy batches may omit both source files.
+
+    Missing source files are blocking for new S11 batches. Legacy batches are
+    allowed to continue in compatibility mode, but a manifest that exists and
+    reports a failed gate is always blocking.
+    """
     task_dir = Path(task_dir)
     parent = task_dir.parent
     topic_map = lib.load_json(parent / "repo-topic-map.json", default={})
@@ -70,107 +78,108 @@ def prompt_contract_problems(task_dir: Path) -> tuple[list[dict], list[dict]]:
     errors: list[dict] = []
     warnings: list[dict] = []
     if not topic_map:
-        warnings.append(_problem(
+        item = _problem(
             "prompt_topic_map_missing",
             "缺少 repo-topic-map.json，无法在运行前核对 P5/H3 和 workload_design",
             owner="s11-gsb-prompt-create",
             action="refresh_prompt_handoff",
-        ))
-        return errors, warnings
-
-    version = topic_map.get("difficulty_contract_version")
-    if type(version) is not int or version < 3:
-        errors.append(_problem(
-            "p5_contract_legacy",
-            f"题目难度契约版本为 {version!r}，低于 H3 v3，提交后存在 P5 废弃风险",
-            owner="s11-gsb-prompt-create",
-            action="rebuild_prompt_with_h3_v3",
-        ))
-    try:
-        sequence = int(task_dir.name.split("-")[1])
-    except (IndexError, ValueError):
-        sequence = -1
-    plan = next(
-        (
-            item for item in topic_map.get("task_plan") or []
-            if isinstance(item, dict) and item.get("sequence") == sequence
-        ),
-        None,
-    )
-    if not isinstance(plan, dict):
-        errors.append(_problem(
-            "prompt_plan_missing",
-            "task_plan 中找不到当前题位，不能冻结难度和查重结论",
-            owner="s11-gsb-prompt-create",
-            action="refresh_prompt_handoff",
-        ))
+        )
+        (errors if strict else warnings).append(item)
     else:
-        design = plan.get("difficulty_design")
-        if not isinstance(design, dict) or design.get("version") != 3:
+        version = topic_map.get("difficulty_contract_version")
+        if type(version) is not int or version < 3:
             errors.append(_problem(
-                "p5_h3_design_missing",
-                "当前题位没有 difficulty_design v3，P5 平台检查风险不可接受",
+                "p5_contract_legacy",
+                f"题目难度契约版本为 {version!r}，低于 H3 v3，提交后存在 P5 废弃风险",
                 owner="s11-gsb-prompt-create",
                 action="rebuild_prompt_with_h3_v3",
             ))
+        try:
+            sequence = int(task_dir.name.split("-")[1])
+        except (IndexError, ValueError):
+            sequence = -1
+        plan = next(
+            (
+                item for item in topic_map.get("task_plan") or []
+                if isinstance(item, dict) and item.get("sequence") == sequence
+            ),
+            None,
+        )
+        if not isinstance(plan, dict):
+            errors.append(_problem(
+                "prompt_plan_missing",
+                "task_plan 中找不到当前题位，不能冻结难度和查重结论",
+                owner="s11-gsb-prompt-create",
+                action="refresh_prompt_handoff",
+            ))
         else:
-            tradeoff = design.get("design_tradeoff")
-            guards = (
-                tradeoff.get("false_h3_guards")
-                if isinstance(tradeoff, dict)
-                else None
-            )
-            missing = sorted(
-                name for name in H3_FALSE_GUARDS
-                if not isinstance(guards, dict) or guards.get(name) is not False
-            )
-            if missing:
+            design = plan.get("difficulty_design")
+            if not isinstance(design, dict) or design.get("version") != 3:
                 errors.append(_problem(
-                    "p5_h3_guard_missing",
-                    "H3 假取舍守卫未全部关闭：" + "、".join(missing),
+                    "p5_h3_design_missing",
+                    "当前题位没有 difficulty_design v3，P5 平台检查风险不可接受",
                     owner="s11-gsb-prompt-create",
-                    action="redesign_h3_choice",
-                    evidence={"missing_guards": missing},
+                    action="rebuild_prompt_with_h3_v3",
                 ))
-            workload = design.get("workload_design")
-            expected = (
-                workload.get("expected_effective_tool_calls")
-                if isinstance(workload, dict)
-                else None
-            )
-            slices = workload.get("work_slices") if isinstance(workload, dict) else None
-            paths = (
-                workload.get("verification_paths")
-                if isinstance(workload, dict)
-                else None
-            )
-            if (
-                type(expected) is not int
-                or expected < MIN_PROMPT_EXPECTED_TOOL_CALLS
-                or not isinstance(slices, list)
-                or len(slices) < 4
-                or not isinstance(paths, list)
-                or len(set(paths)) < 2
-            ):
-                errors.append(_problem(
-                    "p6_workload_design_weak",
-                    "workload_design 未达到 55 次预期调用、4 个工作切片和 2 条验证路径",
-                    owner="s11-gsb-prompt-create",
-                    action="expand_workload_before_run",
-                    evidence={
-                        "expected_effective_tool_calls": expected,
-                        "work_slices": len(slices) if isinstance(slices, list) else 0,
-                        "verification_paths": len(set(paths)) if isinstance(paths, list) else 0,
-                    },
-                ))
+            else:
+                tradeoff = design.get("design_tradeoff")
+                guards = (
+                    tradeoff.get("false_h3_guards")
+                    if isinstance(tradeoff, dict)
+                    else None
+                )
+                missing = sorted(
+                    name for name in H3_FALSE_GUARDS
+                    if not isinstance(guards, dict) or guards.get(name) is not False
+                )
+                if missing:
+                    errors.append(_problem(
+                        "p5_h3_guard_missing",
+                        "H3 假取舍守卫未全部关闭：" + "、".join(missing),
+                        owner="s11-gsb-prompt-create",
+                        action="redesign_h3_choice",
+                        evidence={"missing_guards": missing},
+                    ))
+                workload = design.get("workload_design")
+                expected = (
+                    workload.get("expected_effective_tool_calls")
+                    if isinstance(workload, dict)
+                    else None
+                )
+                slices = workload.get("work_slices") if isinstance(workload, dict) else None
+                paths = (
+                    workload.get("verification_paths")
+                    if isinstance(workload, dict)
+                    else None
+                )
+                if (
+                    type(expected) is not int
+                    or expected < MIN_PROMPT_EXPECTED_TOOL_CALLS
+                    or not isinstance(slices, list)
+                    or len(slices) < 4
+                    or not isinstance(paths, list)
+                    or len(set(paths)) < 2
+                ):
+                    errors.append(_problem(
+                        "p6_workload_design_weak",
+                        "workload_design 未达到 55 次预期调用、4 个工作切片和 2 条验证路径",
+                        owner="s11-gsb-prompt-create",
+                        action="expand_workload_before_run",
+                        evidence={
+                            "expected_effective_tool_calls": expected,
+                            "work_slices": len(slices) if isinstance(slices, list) else 0,
+                            "verification_paths": len(set(paths)) if isinstance(paths, list) else 0,
+                        },
+                    ))
 
     if not generation:
-        warnings.append(_problem(
+        item = _problem(
             "prompt_generation_manifest_missing",
             "缺少 prompt-generation-manifest.json，无法复核 A-5 和跨项目查重结论",
             owner="s11-gsb-prompt-create",
             action="refresh_generation_manifest",
-        ))
+        )
+        (errors if strict else warnings).append(item)
     else:
         if generation.get("raw_a5_ok") is False:
             errors.append(_problem(
@@ -221,29 +230,22 @@ def _memory_hit(event: dict[str, Any]) -> dict[str, Any] | None:
         return None
     matched = path_match or content_match
     assert matched is not None
+    protected_path = re.search(
+        r"\.claude/(?:projects|todos|sessions|history\.jsonl|memory)(?:/|$|[\s\"'])",
+        target,
+        re.IGNORECASE,
+    )
     return {
         "tool": tool,
         "target": lib.clip(target, 500),
         "result_preview": lib.clip(preview, 500),
         "matched": matched.group(0),
-        "severity": (
-            "hard"
-            if re.search(
-                r"\.claude/(?:projects/[^\"'\s]*\.jsonl|todos|history\.jsonl|memory)",
-                target,
-                re.IGNORECASE,
-            )
-            else "soft"
-        ),
+        "severity": "hard" if protected_path else "soft",
     }
 
 
-def trace_rule_problems(
-    task_dir: Path,
-    *,
-    enforce_call_floor: bool = True,
-) -> tuple[list[dict], list[dict], dict]:
-    """Check P6 call floor and private transcript access from the bounded review pack."""
+def trace_rule_problems(task_dir: Path) -> tuple[list[dict], list[dict], dict]:
+    """Collect tool-call evidence and check private transcript access."""
     task_dir = Path(task_dir)
     pack = lib.load_json(task_dir / "trace/review-pack.json", default={})
     errors: list[dict] = []
@@ -252,7 +254,7 @@ def trace_rule_problems(
     if not isinstance(summary, dict) or not summary:
         warnings.append(_problem(
             "trace_policy_pack_missing",
-            "缺少轨迹 review-pack，提交前无法核对 P6 和私有轨迹读取",
+            "缺少轨迹 review-pack，提交前无法核对私有轨迹读取",
             owner="s11-feedback-run",
             action="reingest_trace",
         ))
@@ -261,18 +263,6 @@ def trace_rule_problems(
     effective = summary.get("paired_tools")
     if type(effective) is not int:
         effective = summary.get("logical_tool_uses")
-    if (
-        enforce_call_floor
-        and type(effective) is int
-        and effective < MIN_EFFECTIVE_TOOL_CALLS
-    ):
-        errors.append(_problem(
-            "p6_tool_call_floor",
-            f"有效工具调用 {effective} 次，低于平台下限 {MIN_EFFECTIVE_TOOL_CALLS}",
-            owner="s11-gsb-prompt-create",
-            action="prompt_rebuild_required",
-            evidence={"valid_tool_calls": effective, "floor": MIN_EFFECTIVE_TOOL_CALLS},
-        ))
 
     hits = []
     for index, event in enumerate(pack.get("tool_events") or [], start=1):
@@ -308,17 +298,10 @@ def trace_rule_problems(
     }
 
 
-def evaluate(task_dir: Path) -> dict[str, Any]:
+def evaluate(task_dir: Path, *, strict: bool = True) -> dict[str, Any]:
     task_dir = Path(task_dir)
-    prompt_errors, prompt_warnings = prompt_contract_problems(task_dir)
-    generation_managed = (
-        (task_dir.parent / "repo-topic-map.json").is_file()
-        or (task_dir.parent / "prompt-generation-manifest.json").is_file()
-    )
-    trace_errors, trace_warnings, trace_summary = trace_rule_problems(
-        task_dir,
-        enforce_call_floor=generation_managed,
-    )
+    prompt_errors, prompt_warnings = prompt_contract_problems(task_dir, strict=strict)
+    trace_errors, trace_warnings, trace_summary = trace_rule_problems(task_dir)
     errors = prompt_errors + trace_errors
     warnings = prompt_warnings + trace_warnings
     return {

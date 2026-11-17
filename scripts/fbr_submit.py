@@ -25,7 +25,7 @@ import fbr_trace
 import fbr_delivery as delivery
 
 BASE_URL = "https://solo2.jzxhnh.com"
-ACCOUNT = os.environ.get("SOLO11_PLATFORM_ACCOUNT", "zouyonghong")
+ACCOUNT = os.environ.get("SOLO11_PLATFORM_ACCOUNT", lib.DEFAULT_PLATFORM_ACCOUNT)
 FIELD_MAP = {
     "domain": "所属领域", "sub_direction": "子方向", "question_type": "任务类型",
     "difficulty": "任务难度", "languages": "语言/框架", "harness": "Harness",
@@ -75,6 +75,13 @@ SUBMIT_INTERVAL = 10.0
 RATE_LIMIT_RETRIES = 3
 RATE_LIMIT_BACKOFF = (15.0, 30.0, 45.0)
 WRITE_PACING_VERSION = 1
+
+
+def configure_account(root: Path) -> str:
+    """Apply the root-level platform account to this process."""
+    global ACCOUNT
+    ACCOUNT = lib.platform_account(lib.settings(root))
+    return ACCOUNT
 
 
 class SubmitRateLimited(lib.FbrError):
@@ -427,7 +434,11 @@ def preflight_one(root: Path, batch_id: str, task_id: str, *, client=None,
         valid, reason = delivery.current_feedback(task_dir)
         if not valid:
             result["errors"].append(reason)
-        local_rules = fbr_platform_rules.evaluate(task_dir)
+        record = lib.load_task(task_dir)
+        local_rules = fbr_platform_rules.evaluate(
+            task_dir,
+            strict=record.get("producer") == "s11-gsb-prompt-create",
+        )
         lib.save_json(task_dir / "review/platform-rules.json", local_rules)
         result["errors"].extend(
             str(item.get("message") or item.get("code"))
@@ -1518,26 +1529,27 @@ def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
     try:
+        root = lib.find_root(args.root)
+        configure_account(root)
         if args.command == "probe":
-            result = probe(lib.find_root(args.root))
+            result = probe(root)
         elif args.command == "schema-field":
-            result = schema_field(lib.find_root(args.root), args.fingerprint, args.field)
+            result = schema_field(root, args.fingerprint, args.field)
             if result is None:
                 raise lib.FbrError("schema 中没有该字段")
         elif args.command == "preflight":
-            result = preflight_one(lib.find_root(args.root), args.batch, args.task)
+            result = preflight_one(root, args.batch, args.task)
         elif args.command == "repair":
-            result = repair_batch(lib.find_root(args.root), args.batch, tasks=args.tasks,
+            result = repair_batch(root, args.batch, tasks=args.tasks,
                                   execute=args.execute, confirm=args.confirm, comment=args.comment,
                                   interval=args.submit_interval)
         else:
-            result = run_batch(lib.find_root(args.root), args.batch, tasks=args.tasks,
+            result = run_batch(root, args.batch, tasks=args.tasks,
                                limit=args.limit, execute=args.execute, confirm=args.confirm,
                                interval=args.submit_interval)
         if args.command in ("submit", "repair") and args.execute:
             try:
                 import fbr_cleanup
-                root = lib.find_root(args.root)
                 fbr_cleanup.maintain_batch(
                     root, args.batch, lib.settings(root), execute=True, tasks=args.tasks)
             except (lib.FbrError, OSError, ValueError):

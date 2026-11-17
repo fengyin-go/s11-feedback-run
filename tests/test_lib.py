@@ -61,6 +61,25 @@ class Tasks(Sandbox):
         cfg = lib.settings(self.root)
         self.assertNotIn("github_owner", cfg)
 
+    def test_platform_account_uses_settings_and_explicit_env_override(self):
+        path = self.root / "_config" / "settings.json"
+        data = lib.load_json(path)
+        data["platform"] = {"account": "settings-account"}
+        lib.save_json(path, data)
+        self.assertEqual(lib.settings(self.root)["platform"]["account"], "settings-account")
+        with mock.patch.dict(os.environ, {"SOLO11_PLATFORM_ACCOUNT": "override-account"}):
+            self.assertEqual(lib.platform_account(lib.settings(self.root)), "override-account")
+
+    def test_platform_account_rejects_invalid_settings_value(self):
+        path = self.root / "_config" / "settings.json"
+        data = lib.load_json(path)
+        data["platform"] = {"account": "../bad"}
+        lib.save_json(path, data)
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("SOLO11_PLATFORM_ACCOUNT", None)
+            with self.assertRaisesRegex(lib.FbrError, "platform.account"):
+                lib.settings(self.root)
+
     def test_task_dirs(self):
         self.make_task(1, repo=False)
         self.make_task(2, repo=False)

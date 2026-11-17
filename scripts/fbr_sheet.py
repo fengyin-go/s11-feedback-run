@@ -192,6 +192,39 @@ def prepared_fields(root: Path, task_dir: Path, cfg: dict) -> dict:
             "备注": fbr_trace.run_note(ids, api_key_read=fbr_trace.detect_api_key_read(task_dir, cfg))}
 
 
+def field_state(field: str, value, task_dir: Path, *, current_row: bool) -> str:
+    """Separate normal runtime waits from invalid generated values."""
+    if value not in (None, "") and field in OPTIONS and value not in OPTIONS[field]:
+        return "invalid"
+    if (value not in (None, "") and field in ("初始环境快照", "产物快照")
+            and not SNAPSHOT_RE.match(str(value))):
+        return "invalid"
+    if value not in (None, "") and field == "Harness 版本" and not VERSION_RE.match(str(value)):
+        return "invalid"
+    if value not in (None, ""):
+        return "ready"
+    stages = lib.load_state(task_dir)["stages"]
+    if field in ("Feedback", "交付完整性"):
+        state = stages.get("feedback", {}).get("state")
+        if current_row:
+            return "ready"
+        return "invalid" if state in ("ok", "failed") else "pending_review"
+    def waiting_or_invalid(stage):
+        state = stages.get(stage, {}).get("state")
+        return "pending_runtime" if state in (None, "dry") else "invalid"
+
+    collect_ok = stages.get("collect", {}).get("state") == "ok"
+    record_ok = stages.get("record", {}).get("state") == "ok"
+    feedback_ok = stages.get("feedback", {}).get("state") == "ok"
+    if field in ("SessionID", "TurnID/PromptID", "轨迹文件"):
+        return "invalid" if collect_ok else waiting_or_invalid("collect")
+    if field == "运行录屏":
+        return "invalid" if record_ok else waiting_or_invalid("record")
+    if field == "产物快照":
+        return "invalid" if feedback_ok else waiting_or_invalid("feedback")
+    return "invalid"
+
+
 def row_problems(row: dict, ids: dict, snapshot: dict) -> list[str]:
     problems = [f"缺{name}" for name in PUBLIC_COLUMNS if name not in OPTIONAL and (row.get(name) is None or not str(row.get(name)).strip())]
     for name, allowed in OPTIONS.items():
@@ -480,9 +513,7 @@ def _write_sheet_unlocked(root: Path, batch_id: str, cfg: dict, *, force: bool =
             prepared = {}
         for field in required:
             value = prepared.get(field)
-            state = ("已准备" if row else "有原始依据，待当前验收") if value not in (None, "") else "缺失/未通过验收"
-            if value and field in OPTIONS and value not in OPTIONS[field]:
-                state = "枚举无效，阻止交付"
+            state = field_state(field, value, task_dir, current_row=row is not None)
             source = {"User Prompt": "task.json.prompt（冻结交接）",
                       "所属领域": "task.json.domain", "任务类型": "task.json.task_type",
                       "任务难度": "task.json.difficulty", "语言/框架": "task.json.frameworks/language",
@@ -500,7 +531,11 @@ def _write_sheet_unlocked(root: Path, batch_id: str, cfg: dict, *, force: bool =
                       "交付完整性": "review/feedback.json 与独立验收回执",
                       "Feedback": "review/feedback.json 与独立验收回执"}.get(field,
                           "task.json、trace/ids.json 及当前交付清单")
-            detail = source if value not in (None, "") else "缺少当前有效依据；不得填入推测值"
+            detail = source if value not in (None, "") else {
+                "pending_runtime": "等待对应运行阶段生成，不是字段错误",
+                "pending_review": "等待当前任务 AI 完成验收和 Feedback",
+                "invalid": "阶段已完成但值缺失或非法；不得填入推测值",
+            }.get(state, "缺少当前有效依据；不得填入推测值")
             entry = {"task_id": task_dir.name, "field": field, "state": state, "source": detail}
             entries.append(entry)
             audit.append([task_dir.name, field, state, detail])
@@ -508,8 +543,11 @@ def _write_sheet_unlocked(root: Path, batch_id: str, cfg: dict, *, force: bool =
     for column, width in (("A", 18), ("B", 24), ("C", 22), ("D", 90)):
         audit.column_dimensions[column].width = width
     audit_path = delivery.delivery_dir(root, batch_id) / "field-audit.json"
+    counts = {}
+    for entry in entries:
+        counts[entry["state"]] = counts.get(entry["state"], 0) + 1
     _write_json_if_changed(audit_path, {
-        "batch_id": batch_id, "fields": entries,
+        "batch_id": batch_id, "fields": entries, "counts": counts,
         "platform_auto_fields": ["提交人", "提交时间"],
         "ready": all(r["数据状态"] == "可提交" for r in rows) and len(rows) == len(progress),
     })

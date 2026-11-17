@@ -567,7 +567,8 @@ class FactsOne(FactsCase):
         self.assertEqual(facts["demo"]["setup_ok"], True)
         self.assertEqual(facts["demo"]["setup_tail"], "")
         self.assertEqual([set(s) for s in facts["demo"]["steps"]],
-                         [{"cmd", "show", "rc", "cut", "skipped", "tail"}] * 2)
+                         [{"cmd", "show", "rc", "cut", "skipped", "tail", "page",
+                           "actual_page", "url", "pause_ms", "startup_ready"}] * 2)
         self.assertEqual([s["rc"] for s in facts["demo"]["steps"]], [0, 2])
         tests = facts["tests"]
         self.assertEqual((tests["setup_cmd"], tests["test_cmd"]), ("make setup", "make test"))

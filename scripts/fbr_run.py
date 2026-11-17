@@ -187,7 +187,7 @@ def ready_problems(task_dir: Path, record: dict, cfg: dict, *, prepared: bool = 
     problems = []
     if record.get("producer") == "s11-gsb-prompt-create":
         import fbr_platform_rules
-        prompt_errors, _ = fbr_platform_rules.prompt_contract_problems(task_dir)
+        prompt_errors, _ = fbr_platform_rules.prompt_contract_problems(task_dir, strict=True)
         problems.extend(
             f"出题风险：{item.get('message') or item.get('code')}"
             for item in prompt_errors

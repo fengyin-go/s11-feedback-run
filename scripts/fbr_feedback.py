@@ -7,7 +7,7 @@
 
 当前任务 AI 生成候选并逐句复核，fbr_reviewer.py finalize 校验后保存：
 - evidence/audit.json   逐条需求的结论 + 锚点、实跑过的反例、虚假成功判断
-- review/feedback.json  score、feedback 正文、issues（问题句）、process（过程句）、note（进备注列）
+- review/feedback.json  score、feedback 正文、issues（问题句）、process（过程句）、note（仅内部材料）
 闸门通过才把 feedback 阶段记成 ok，结果表只收通过的。
 """
 
@@ -29,7 +29,8 @@ import fbr_style  # noqa: E402
 AUDIT_TEMPLATE = {
     "requirements": [{"id": "R1", "verdict": "做到 | 有问题 | 看不出来", "level": "未实现 | 明显 | 细节（只在有问题时写）",
                       "note": "不是做到时写清楚是什么情况", "anchors": [{"type": "file", "path": "src/x.py"}]}],
-    "counterexamples": [{"what": "试了什么边界", "probe": "P1", "found_problem": False}],
+    "counterexamples": [{"what": "试了什么题面未明说的边界", "prompt_implied": False,
+                          "probe": "P1", "found_problem": False}],
     "false_success": "无 | 轻微 | 较大 | 严重", "false_success_note": "", "false_success_anchors": [],
 }
 FEEDBACK_TEMPLATE = {
@@ -79,6 +80,13 @@ ANCHOR_HELP = """锚点写法（每个都会被核对，对不上就过不了闸
 
 def decision_template(task_dir: Path) -> dict:
     record, facts = load_evidence(task_dir)
+    contract = record.get("review_contract") or {}
+    translated_terms = [
+        {"source": str(row.get("source") or ""), "public": str(row.get("public") or "")}
+        for row in contract.get("language_terms") or []
+        if isinstance(row, dict) and row.get("source") and row.get("public")
+    ]
+    probes = load_probes(task_dir)
     return {
         "requirements": [
             {"id": req["id"], "verdict": "做到 | 有问题 | 看不出来", "level": "",
@@ -103,8 +111,8 @@ def decision_template(task_dir: Path) -> dict:
         "claims": [],
         "language_review": {
             "reviewed": False,
-            "criterion_sentence": "",
-            "translated_terms": [],
+            "criterion_sentence": str(contract.get("key_business_constraint") or ""),
+            "translated_terms": translated_terms,
             "retained_terms": [],
             "note": "",
         },
@@ -117,6 +125,15 @@ def decision_template(task_dir: Path) -> dict:
             "trace_reference": "claims[].sources[] 写 path/excerpt；脚本只在摘录唯一时自动补行号和 block",
             "process_audit": "process[] 内写 audit:{checks:{full_trace,baseline,timeline,source_boundary,scope},note}",
             "language_review": "criterion_sentence 必须逐字出现在正文；translated_terms 登记黑话改写，retained_terms 登记必须保留的业务词",
+            "counterexamples": "5 分使用的边界必须写 prompt_implied:false，并绑定真实 probe",
+            "derived_fields": "requirements_status、process_audit、score_basis 缺省项和过程 claim 来源会由 build 自动补全",
+        },
+        "evidence_index": {
+            "probes": [{"id": row.get("id"), "cmd": row.get("cmd"), "rc": row.get("rc")}
+                       for row in probes],
+            "changed_files": [row.get("path") for row in facts["changes"]["files"]],
+            "demo": [{"index": index, "cmd": row.get("cmd"), "rc": row.get("rc")}
+                     for index, row in enumerate(facts["demo"]["steps"], 1)],
         },
     }
 
@@ -124,12 +141,99 @@ def decision_template(task_dir: Path) -> dict:
 def _canonical_sentence(text: str, sentence: str) -> str:
     import fbr_quality
     sentence = str(sentence or "").strip()
-    if not sentence or sentence in text:
+    if not sentence:
         return sentence
     wanted = gate.squash(sentence)
     matches = [unit for unit in fbr_quality.public_units(text)
                if gate.squash(unit) == wanted]
-    return matches[0] if len(matches) == 1 else sentence
+    if len(matches) == 1:
+        return matches[0]
+    containing = [
+        unit for unit in fbr_quality.public_units(text)
+        if wanted and wanted in gate.squash(unit)
+    ]
+    return containing[0] if len(containing) == 1 else sentence
+
+
+def _trace_ref_for_evidence(task_dir: Path, evidence: dict) -> dict:
+    """Resolve one process evidence item to its exact trace row/block."""
+    pack = lib.load_json(task_dir / fbr_evidence.PACK, default={})
+    events = pack.get("tool_events") if isinstance(pack, dict) else []
+    step = evidence.get("step")
+    if type(step) is not int or not isinstance(events, list) or not 1 <= step <= len(events):
+        raise lib.FbrError(f"过程 evidence 指向不存在的工具步骤：{step!r}")
+    event = events[step - 1]
+    field = evidence.get("field")
+    if field in ("tool", "target"):
+        source = event.get("source")
+        line, block = event.get("line"), event.get("block")
+    elif field in ("output", "error"):
+        source = event.get("source")
+        line, block = event.get("result_line"), event.get("result_block")
+    else:
+        raise lib.FbrError(f"过程 evidence.field 不合法：{field!r}")
+    excerpt = str(evidence.get("excerpt") or "").strip()
+    if not source or not excerpt:
+        raise lib.FbrError(f"第 {step} 步缺少可定位的来源或摘录")
+    ref = {"path": source, "start_line": line, "end_line": line,
+           "block": block, "excerpt": excerpt}
+    if type(line) is int and type(block) is int:
+        try:
+            checked = fbr_evidence.verify_refs(
+                task_dir, [ref], operation="feedback-build-process-evidence")
+        except lib.FbrError:
+            checked = {"state": "failed"}
+        if checked.get("state") == "ok":
+            return ref
+    located = fbr_evidence.resolve_excerpt(task_dir, source, excerpt)
+    return {
+        "path": source,
+        "start_line": located["start_line"],
+        "end_line": located["start_line"],
+        "block": located["block"],
+        "excerpt": excerpt,
+    }
+
+
+def _merge_process_evidence_into_claims(task_dir: Path, claims: list, process: list) -> tuple[list, list]:
+    """Make process evidence and its claim review share the same trace excerpts."""
+    by_sentence = {
+        gate.squash(str(row.get("sentence") or "")): row
+        for row in claims if isinstance(row, dict)
+    }
+    derived = []
+    for index, item in enumerate(process, 1):
+        if not isinstance(item, dict):
+            continue
+        key = gate.squash(str(item.get("sentence") or ""))
+        claim = by_sentence.get(key)
+        if claim is None:
+            raise lib.FbrError(
+                f"第 {index} 个过程句缺少对应 claims 项；先写同一完整句段的断言和后续状态"
+            )
+        sources = claim.setdefault("sources", [])
+        for evidence in item.get("evidence") or []:
+            if not isinstance(evidence, dict):
+                continue
+            ref = _trace_ref_for_evidence(task_dir, evidence)
+            identity = (ref["path"], ref["start_line"], ref["end_line"],
+                        ref["block"], ref["excerpt"])
+            existing = {
+                (row.get("path"), row.get("start_line"), row.get("end_line"),
+                 row.get("block"), row.get("excerpt"))
+                for row in sources if isinstance(row, dict)
+            }
+            if identity not in existing:
+                sources.append(ref)
+                derived.append({
+                    "sentence": item.get("sentence"),
+                    "step": evidence.get("step"),
+                    "field": evidence.get("field"),
+                    "path": ref["path"],
+                    "start_line": ref["start_line"],
+                    "block": ref["block"],
+                })
+    return claims, derived
 
 
 def _normalize_rows(text: str, rows) -> list:
@@ -179,10 +283,17 @@ def expand_decision(task_dir: Path, decision: dict) -> tuple[dict, dict]:
     if not isinstance(decision, dict):
         raise lib.FbrError("decision-input 必须是 JSON 对象")
     work = lib.load_json(task_dir/"review/task-agent-work.json")
+    record = lib.load_task_readonly(task_dir)
+    requirement_text = {
+        str(item.get("id")): str(item.get("text") or "")
+        for item in record.get("requirements", [])
+        if isinstance(item, dict)
+    }
     text = str(decision.get("feedback") or "")
     requirements = []
     statuses = []
     audit_rows = []
+    derived_fields = []
     status_map = {"做到": "completed"}
     for raw in decision.get("requirements") or []:
         if not isinstance(raw, dict):
@@ -199,8 +310,11 @@ def expand_decision(task_dir: Path, decision: dict) -> tuple[dict, dict]:
             status = status_map.get(verdict, item.get("status") or "")
         audit_rows.append({key: value for key, value in item.items()
                            if key not in ("status", "user_text")})
+        user_text = str(item.get("user_text") or item.get("note") or requirement_text.get(requirement_id, "")).strip()
+        if not item.get("user_text") and user_text:
+            derived_fields.append(f"requirements[{requirement_id}].user_text")
         statuses.append({"requirement_id": requirement_id, "status": status,
-                         "user_text": item.get("user_text", ""),
+                         "user_text": user_text,
                          "anchors": item.get("anchors", [])})
         requirements.append(item)
     audit = {
@@ -223,19 +337,99 @@ def expand_decision(task_dir: Path, decision: dict) -> tuple[dict, dict]:
             "checks": audit_row.get("checks") or {},
             "note": audit_row.get("note") or "",
         })
+    issues = _normalize_rows(text, decision.get("issues"))
+    results = _normalize_rows(text, decision.get("results"))
+    test_claims = _normalize_rows(text, decision.get("test_claims"))
+    score = decision.get("score")
+    basis = dict(decision.get("score_basis") or {})
+    if not str(basis.get("delivered") or "").strip():
+        basis["delivered"] = "；".join(
+            row["user_text"] for row in statuses if row.get("status") == "completed"
+        ) or "现有证据未确认任何完整交付能力"
+        derived_fields.append("score_basis.delivered")
+    remaining_rows = [row for row in statuses if row.get("status") != "completed"]
+    if not str(basis.get("remaining") or "").strip():
+        basis["remaining"] = "；".join(row["user_text"] for row in remaining_rows) or (
+            "现有证据未发现已证实的功能缺口"
+        )
+        derived_fields.append("score_basis.remaining")
+    if basis.get("category") not in {
+        "complete", "process_issue", "verification_gap", "delivery_issue",
+    }:
+        process_problem = any(
+            gate.PROCESS_PROBLEM_RE.search(str(row.get("sentence") or ""))
+            for row in process if isinstance(row, dict)
+        )
+        counterexamples = audit.get("counterexamples") or []
+        if score == 5 and not remaining_rows and not issues:
+            basis["category"] = "complete"
+        elif score == 4 and any(row.get("status") == "unverified" for row in statuses):
+            basis["category"] = "verification_gap"
+        elif score == 4 and process_problem and not issues:
+            basis["category"] = "process_issue"
+        elif score == 4 and len(counterexamples) < 2 and not issues:
+            basis["category"] = "verification_gap"
+        elif score < 4:
+            basis["category"] = "delivery_issue"
+        else:
+            basis.pop("category", None)
+        if basis.get("category"):
+            derived_fields.append("score_basis.category")
+    if (not str(basis.get("why_this_score") or "").strip()
+            and basis.get("category") in {
+                "complete", "process_issue", "verification_gap", "delivery_issue",
+            }):
+        basis["why_this_score"] = {
+            "complete": "所有明示需求均有证据支持，未发现功能缺口或过程返工",
+            "process_issue": "最终交付可用，但过程证据显示存在不满足一次性完美跑通的返工",
+            "verification_gap": "现有证据不足以证明更高档位，但没有已证实的功能缺陷",
+            "delivery_issue": "最终交付仍存在正文或审计中已证实的问题",
+        }[basis["category"]]
+        derived_fields.append("score_basis.why_this_score")
+    if type(basis.get("lowest_supported_score")) is not int:
+        basis["lowest_supported_score"] = score
+        derived_fields.append("score_basis.lowest_supported_score")
+    if not str(basis.get("lower_score_rejected") or "").strip():
+        basis["lower_score_rejected"] = (
+            "已经是最低档，没有更低分数可给"
+            if score == 1 else
+            "当前证据没有证明更严重的功能失败、不可运行或虚假成功，不能继续降低档位"
+        )
+        derived_fields.append("score_basis.lower_score_rejected")
+    if not basis.get("anchors"):
+        candidates = [
+            anchor
+            for row in [*statuses, *results]
+            for anchor in (row.get("anchors") or [])
+            if isinstance(anchor, dict)
+        ]
+        basis["anchors"] = list({json.dumps(row, ensure_ascii=False, sort_keys=True): row
+                                 for row in candidates}.values())[:4]
+        if basis["anchors"]:
+            derived_fields.append("score_basis.anchors")
+    language_review = dict(decision.get("language_review") or {})
+    if not language_review.get("criterion_sentence"):
+        contract = record.get("review_contract") or {}
+        if contract.get("key_business_constraint"):
+            language_review["criterion_sentence"] = contract["key_business_constraint"]
+            derived_fields.append("language_review.criterion_sentence")
     feedback = {
-        "score": decision.get("score"),
+        "score": score,
         "feedback": text,
         "requirements_status": statuses,
-        "results": _normalize_rows(text, decision.get("results")),
-        "score_basis": decision.get("score_basis") or {},
-        "test_claims": _normalize_rows(text, decision.get("test_claims")),
-        "issues": _normalize_rows(text, decision.get("issues")),
+        "results": results,
+        "score_basis": basis,
+        "test_claims": test_claims,
+        "issues": issues,
         "process": process,
         "process_audit": process_audit,
         "note": decision.get("note") or "",
     }
     claims = _normalize_rows(text, _enrich_claim_sources(task_dir, decision.get("claims")))
+    claims, merged_process_sources = _merge_process_evidence_into_claims(task_dir, claims, process)
+    derived_fields.extend(
+        f"claims[{row['sentence']}].sources" for row in merged_process_sources
+    )
     candidate = {"audit": audit, "feedback": feedback,
                  "needs_probes": decision.get("needs_probes") or []}
     checks_in = decision.get("quality_checks")
@@ -255,12 +449,16 @@ def expand_decision(task_dir: Path, decision: dict) -> tuple[dict, dict]:
         "binding": work.get("binding"),
         "candidate_sha": lib.content_hash(candidate),
         "checks": checks,
-        "language_review": decision.get("language_review") or {},
+        "language_review": language_review,
         "claim_reviews": [
             {key: row.get(key) for key in
              ("sentence", "assertions", "verdict", "reason", "later_check", "sources")}
             for row in claims if isinstance(row, dict)
         ],
+        "build_derivations": {
+            "fields": list(dict.fromkeys(derived_fields)),
+            "process_sources": merged_process_sources,
+        },
     }
     return candidate, verification
 
@@ -315,6 +513,16 @@ def build_card(record: dict, facts: dict, probes: list[dict]) -> str:
         state = "没跑到" if step.get("skipped") else f"退出码 {step.get('rc')}" + ("，被截断" if step.get("cut") else "")
         out += [f"{index}. `{step['cmd']}` → {state}；要看的：{step.get('show') or '未写'}", "", "```",
                 lib.clip((step.get("tail") or "")[-600:], 600), "```"]
+    if facts["demo"].get("coverage_declared"):
+        pages = facts["demo"].get("pages", [])
+        out.append(
+            "- Web 页面覆盖："
+            + ("完整" if facts["demo"].get("coverage_complete") else "不完整")
+            + f"；{len(pages)} 个声明页面，缺失 "
+            + ("、".join(facts["demo"].get("missing_pages", [])) or "无")
+        )
+    for error in facts["demo"].get("action_errors", [])[:3]:
+        out.append("- 页面动作实际报错：" + lib.clip(error, 500))
 
     out += ["", "## 改动", "",
             f"- {changes['totals']['files']} 个文件，+{changes['totals']['added']} / -{changes['totals']['deleted']}；"
@@ -383,6 +591,19 @@ def build_brief(record: dict, facts: dict, probes: list[dict]) -> str:
            "## 题面", "", record["prompt"].strip(), "", "## 需求", ""]
     for req in record["requirements"]:
         out.append(f"- {req['id']}：{req.get('text', '')}")
+    out += [
+        "", "## build 自动派生",
+        "- requirements_status、process_audit、score_basis 缺省项由 requirements/process/claims 生成，不要重复手填。",
+        "- process.evidence 会自动定位原始轨迹并合并到同一句 claim.sources。",
+        "- score_basis.anchors 优先从 requirements 和 results 的 anchors 取；没有有效锚点时仍会阻断。",
+        "", "## 证据候选",
+    ]
+    for row in probes:
+        out.append(f"- probe {row.get('id')}：`{lib.clip(row.get('cmd'), 160)}` → 退出码 {row.get('rc')}")
+    for row in changes["files"][:20]:
+        out.append(f"- file {row.get('path')}")
+    for index, row in enumerate(facts["demo"]["steps"][:10], 1):
+        out.append(f"- demo {index}：`{lib.clip(row.get('cmd'), 160)}`")
     out += ["", "## 交付结果",
             f"- 测试：初始 `{tests['before']['test_rc']}` / 产物 `{tests['after']['test_rc']}`；"
             f"产物 {'通过' if tests['after_ok'] else '不通过'}，新增失败 {'、'.join(tests['new_failures']) or '无'}",
@@ -394,6 +615,16 @@ def build_brief(record: dict, facts: dict, probes: list[dict]) -> str:
         out.append(f"- 演示 {index}：`{lib.clip(step['cmd'], 180)}` → {state}；{step.get('show') or '未写'}")
         if step.get("tail"):
             out.append("  " + lib.clip(step["tail"][-600:].replace("\n", " / "), 600))
+    if facts["demo"].get("coverage_declared"):
+        pages = facts["demo"].get("pages", [])
+        out.append(
+            "- Web 页面覆盖："
+            + ("完整" if facts["demo"].get("coverage_complete") else "不完整")
+            + f"；{len(pages)} 个声明页面，缺失 "
+            + ("、".join(facts["demo"].get("missing_pages", [])) or "无")
+        )
+    for error in facts["demo"].get("action_errors", [])[:3]:
+        out.append("- 页面动作实际报错：" + lib.clip(error, 500))
     out += ["", "## 模型过程摘要",
             f"- 工具 {facts['trace']['counts']['tools']} 步，报错 {facts['trace']['counts']['errors']}，"
             f"编辑 {facts['trace']['counts']['edits']}；最后编辑第 {check['last_edit_step']} 步，"

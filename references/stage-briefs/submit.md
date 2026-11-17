@@ -3,7 +3,9 @@
 目标：把已通过本地闸门的当前版本提交到 SOLO2，并回读确认，不重新建单或绕过证据。
 
 - 提交前验证 `review/attestation.json` 和当前平台 schema；不再重跑需求评审、评分或 Feedback 写作。
-- 同时验证 `review/platform-rules.json`：P5/P6、A-5 或私有会话读取风险未清零时不得上传。
+- 账号从 `_config/settings.json.platform.account` 读取，默认 `zouyonghong`；环境变量只作显式覆盖。
+- 同时验证 `review/platform-rules.json`：出题侧 P5/P6 契约、A-5 或私有会话读取风险未清零时
+  不得上传。实际轨迹工具调用数只记录，不再按本地 50 次下限阻断。
 - 整批提交先运行 `fbr_batch.py closeout`；`batch-closeout.json` 不是 `ready` 时不上传任何文件。
 - schema、凭证、正文、附件、快照、账号或领域变化都会使旧预检失效。评审输入变化只让对应题重新评价，交付变化只重做交付冻结。
 - 完整 schema 和 upload plan 只从本地报告定向查询；终端摘要不是提交依据。

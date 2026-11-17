@@ -621,6 +621,8 @@ def main():
             if args.publish is None:
                 args.publish = True
         root = lib.find_root(args.root)
+        import fbr_submit
+        fbr_submit.configure_account(root)
         if args.execute:
             lib.active_github_account()
         directory = home(root, args.batch)

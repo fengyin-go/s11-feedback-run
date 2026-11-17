@@ -183,6 +183,15 @@ def _source_files(task_dir: Path, feedback_sha: str) -> list[Path]:
                 raise lib.FbrError('证据日志不能是符号链接')
             if path.is_file() and path.suffix == '.log' and safe_file(task_dir, path):
                 files.append(path)
+    page_screens = task_dir / "record/pages"
+    if page_screens.is_symlink():
+        raise lib.FbrError(f"{task_dir.name}：record/pages 不能是符号链接")
+    if page_screens.is_dir():
+        for path in sorted(page_screens.rglob("*")):
+            if path.is_symlink():
+                raise lib.FbrError(f"{task_dir.name}：页面截图不能是符号链接")
+            if path.is_file() and path.suffix.lower() == ".png" and safe_file(task_dir, path):
+                files.append(path)
     projects = task_dir / "trace/projects"
     if projects.is_symlink():
         raise lib.FbrError(f"{task_dir.name}：trace/projects 不能是符号链接")

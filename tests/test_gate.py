@@ -100,14 +100,19 @@ def audit(score: int = 4) -> dict:
             {"id": "R2", "verdict": "做到", "anchors": [{"type": "probe", "id": "P1"}]},
             {"id": "R3", "verdict": "做到", "anchors": [{"type": "demo", "index": 2}, {"type": "probe", "id": "P2"}]},
         ],
-        "counterexamples": [{"what": "一小时以上的输入", "probe": "P1", "found_problem": False},
-                            {"what": "负数的分片时长", "probe": "P2", "found_problem": False}],
+        "counterexamples": [
+            {"what": "一小时以上的输入", "prompt_implied": False, "probe": "P1", "found_problem": False},
+            {"what": "负数的分片时长", "prompt_implied": False, "probe": "P2", "found_problem": False},
+        ],
         "false_success": "无", "false_success_note": "", "false_success_anchors": [],
     }
     if score < 5:
         doc["requirements"][2] = {"id": "R3", "verdict": "有问题", "level": "细节", "note": "非数字参数抛调用栈",
                                   "anchors": [{"type": "probe", "id": "P3"}, {"type": "demo", "index": 2}]}
-        doc["counterexamples"].append({"what": "非数字的分片时长", "probe": "P3", "found_problem": True})
+        doc["counterexamples"].append({
+            "what": "非数字的分片时长", "prompt_implied": False,
+            "probe": "P3", "found_problem": True,
+        })
     return doc
 
 
@@ -356,6 +361,11 @@ class Score(Case):
                 rows[0][field] = value
                 self.assertEqual(len(gate.valid_counterexamples(audit(5), evidence(p=rows))), 1)
                 self.assertEqual(self.cap(audit(5), p=rows)[0], 4)
+
+    def test_five_requires_prompt_unmentioned_boundaries(self):
+        doc = audit(5)
+        doc["counterexamples"][0]["prompt_implied"] = True
+        self.assertEqual(self.cap(doc)[0], 4)
 
     def test_inherited_test_failures_prevent_five_without_regression_penalty(self):
         f = facts()

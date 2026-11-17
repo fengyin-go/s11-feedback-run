@@ -223,10 +223,12 @@ def check_audit(audit: dict, task: dict, ev: dict) -> tuple[list[str], list[str]
     return errors, warnings
 
 
-def valid_counterexamples(audit: dict, ev: dict) -> list[dict]:
+def valid_counterexamples(audit: dict, ev: dict, *, require_novel: bool = False) -> list[dict]:
     valid, seen = [], set()
     for item in audit.get("counterexamples") or []:
         if not isinstance(item, dict) or not isinstance(item.get("found_problem"), bool):
+            continue
+        if require_novel and item.get("prompt_implied") is not False:
             continue
         pid = item.get("probe")
         probe = ev["probes"].get(pid)
@@ -268,7 +270,7 @@ def score_cap(facts: dict, audit: dict, ev: dict, gate: dict) -> tuple[int, list
     level = audit.get("false_success")
     if level in FALSE_SUCCESS and level != "无":
         lower(FALSE_SUCCESS[level], f"虚假成功（{level}）")
-    examples = valid_counterexamples(audit, ev)
+    examples = valid_counterexamples(audit, ev, require_novel=True)
     if len(examples) < int(gate["min_counterexamples"]):
         lower(4, f"实跑过的反例不到 {gate['min_counterexamples']} 个")
     if any(c["found_problem"] for c in examples):

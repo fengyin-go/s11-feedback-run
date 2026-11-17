@@ -192,6 +192,33 @@ class BuildRow(SheetCase):
         self.assertEqual((row["轨迹文件"], row["数据状态"]), ("", "缺轨迹文件；Harness 版本只填纯版本号"))
 
 
+class FieldStates(SheetCase):
+    def test_runtime_waits_and_invalid_values_are_distinct(self):
+        task = self.make_task(repo=False)
+        self.assertEqual(
+            fbr_sheet.field_state("SessionID", "", task, current_row=False),
+            "pending_runtime",
+        )
+        self.assertEqual(
+            fbr_sheet.field_state("Feedback", "", task, current_row=False),
+            "pending_review",
+        )
+        lib.set_stage(task, "collect", "failed", reason="fixture")
+        self.assertEqual(
+            fbr_sheet.field_state("SessionID", "", task, current_row=False),
+            "invalid",
+        )
+        self.assertEqual(
+            fbr_sheet.field_state(
+                "环境可复现等级",
+                "已容器化，真实镜像首次安装通过",
+                task,
+                current_row=False,
+            ),
+            "invalid",
+        )
+
+
 class ReceiptRow(SheetCase):
     @staticmethod
     def receipt(**changes):

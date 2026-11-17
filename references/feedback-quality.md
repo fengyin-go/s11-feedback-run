@@ -8,6 +8,19 @@ fbr_reviewer.py review 仅通过 reviewer.env 分析轨迹并返回 needs_task_a
 
 默认作者格式是 `review/decision-input.json`：需求条目同时保留 `verdict/level/note/user_text/anchors`；`process[]` 可内嵌 `audit`；顶层 `claims[]` 按正文顺序保存逐句断言和原始来源；`quality_checks` 保存七项检查理由；`language_review` 保存最关键业务约束句、黑话改写和必要业务词。`fbr_reviewer.py build` 只做结构展开：从需求生成 audit/requirements_status，从 claims 生成 claim_reviews，从 process.audit 生成 process_audit，从检查理由生成 verification，并把 language_review 原样带入。脚本不生成或修改评分、需求结论、过程判断和正文。
 
+`build` 还负责机械派生，避免人工重复抄写：
+
+- requirements 的 `user_text` 为空时回退到 note 或需求原文，并生成 requirements_status；
+- score_basis 缺少已交付、剩余、类别、档位理由或 anchors 时，从需求状态和现有 anchors 补全；
+- `language_review.criterion_sentence` 为空时从 review-contract 的关键约束预填；
+- process evidence 自动定位原始轨迹行号和 block，并合并到同一句 claim 的 sources；
+- 只写正文局部短语时，仅当它唯一属于某个完整句段才自动扩展，歧义仍失败。
+
+派生结果写入 `review/build-report.json`。语义结论、正文、claims 的断言和过程判断仍由当前任务 AI 填写。
+
+`counterexamples` 每项写 `what`、`probe`、`found_problem`；用于 5 分证明时必须额外写
+`prompt_implied: false`，表示这是题面未明说、实际执行过的边界。
+
 - requirements_status：逐项 {requirement_id, status, user_text, anchors}。status 为 completed、partial、missing、unverified，必须与 audit 的“做到/有问题/看不出来”及问题级别一致，并覆盖全部需求点。user_text 写用户能看到的完成能力、部分能力或具体缺口；results 的 requirement_ids 合起来也必须覆盖全部需求。
 - results：至少一条 {sentence, requirement_ids, anchors}。sentence 是正文中说明最终行为的连续原文，requirement_ids 指向真实需求；anchors 至少含产物文件、缺失文件、运行日志、probe、演示或失败用例证据。不能只填需求编号或过程步骤。
 - score_basis：{category, delivered, remaining, why_this_score, lowest_supported_score, lower_score_rejected, anchors}。category 为 delivery_issue、verification_gap、process_issue 或 complete；process_issue 只用于 4 分，表示最终交付没有已证实功能缺口，但模型过程出现真实错误验证、错判、实现返工或关键竞争未正确复核，因此不满足 5 分的一次性完美跑通。其余字段分别解释实际完成部分、真实残余问题或验证边界、为何处于该档。lowest_supported_score 必须等于 score；lower_score_rejected 至少 8 字，解释为什么不能更低（1 分说明已最低）；anchors 必须真实有效。确证前提下选择最低合理档位。

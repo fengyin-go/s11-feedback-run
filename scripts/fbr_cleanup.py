@@ -717,6 +717,8 @@ def main() -> int:
     args = parser.parse_args()
     try:
         root = lib.find_root(args.root)
+        import fbr_submit
+        fbr_submit.configure_account(root)
         if args.command == "restore":
             result = restore_frozen_projection(root, args.batch, args.tasks)
         elif args.command == "audit":

@@ -39,8 +39,11 @@ BATCH_ID_RE = re.compile(r"^b(\d{4})-(\d{2})$")
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 STAGES = ["run", "collect", "commit", "record", "facts", "feedback"]
 MARK = "@@FBR"
+# Claude Code's private runtime directory inside the task container, not Codex skills.
 TRACE_SRC = "/home/node/.claude/projects"
 FORBIDDEN_ACTIVE_GITHUB_ACCOUNTS = {"fengyin-solo"}
+DEFAULT_PLATFORM_ACCOUNT = "zouyonghong"
+PLATFORM_ACCOUNT_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 
 DEFAULTS = {
     "image": "adminfather/benzhi-claude-code2:20261110",
@@ -49,7 +52,6 @@ DEFAULTS = {
     "os": "MacOS/Linux",
     "concurrency": 5,
     "review_parallel": 5, "facts_parallel": 2,
-    "publish_after_review": False,
     "dependencies": {"enabled": True, "paths": [], "smoke_cmd": ""},
     "record_parallel": 2,
     "key_file": "~/.codex/solo11/gateway.env",
@@ -81,7 +83,7 @@ DEFAULTS = {
                 "retry_base": 30, "retry_max": 300},
     "record": {
         "max_seconds": 90, "max_attempts": 3, "setup_timeout": 900, "step_timeout": 60,
-        "width": 1280, "height": 720,
+        "width": 1280, "height": 720, "page_min_seconds": 12,
     },
     "sheet": {"watch": True, "interval_seconds": 2, "min_write_seconds": 5, "idle_exit_seconds": 60},
     "facts": {"setup_cmd": "make setup", "test_cmd": "make test", "setup_timeout": 900, "test_timeout": 600},
@@ -97,6 +99,7 @@ DEFAULTS = {
         "rate_limit_retries": 3,
         "rate_limit_backoff_seconds": [15, 30, 45],
     },
+    "platform": {"account": DEFAULT_PLATFORM_ACCOUNT},
     "cleanup": {
         "policy": "minimal",
         "auto": True,
@@ -198,6 +201,7 @@ def settings(root: Path) -> dict:
         if not cfg.get(key):
             raise FbrError(f"_config/settings.json 缺少 {key}")
     cfg["review_parallel"] = min(5, max(1, int(cfg["review_parallel"])))
+    platform_account(cfg)
     count = cfg["run"]["max_continuations"]
     if type(count) is not int or not 0 <= count <= 2:
         raise FbrError("run.max_continuations 必须是 0 到 2 的整数")
@@ -220,6 +224,15 @@ def settings(root: Path) -> dict:
         if type(value) not in (int, float) or value <= 0:
             raise FbrError(f"sheet.{name} 必须为正数")
     return cfg
+
+
+def platform_account(cfg: dict) -> str:
+    """Resolve the SOLO2 account: explicit environment override, then settings."""
+    override = os.environ.get("SOLO11_PLATFORM_ACCOUNT", "").strip()
+    account = override or str((cfg.get("platform") or {}).get("account") or "").strip()
+    if (not account or account in (".", "..") or not PLATFORM_ACCOUNT_RE.fullmatch(account)):
+        raise FbrError("platform.account 必须是合法平台账号名")
+    return account
 
 
 def active_github_account() -> str:
@@ -324,6 +337,8 @@ def handoff_payload(
             "image", "image_id", "harness", "harness_version", "os", "task_repo", "task_repo_full")
     if record.get("producer") == "s11-gsb-prompt-create":
         keys += ("producer", "execution_mode", "branch", "origin", "workspace")
+        if "repro_evidence" in record:
+            keys += ("repro_evidence",)
         if include_domain_contract:
             keys += ("domain_contract", "domain_gate_version")
     return {"task": {key: record.get(key) for key in keys}, "recording": recording}

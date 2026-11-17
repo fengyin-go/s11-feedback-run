@@ -66,6 +66,23 @@ class Handoff(Sandbox):
         lib.save_json(task / "task.json", record)
         self.assertEqual(lib.load_task(task)["publish"]["published_at"], "later")
 
+    def test_prompt_opportunity_binding_is_optional(self):
+        task, record = self.new_task()
+        self.assertNotIn("prompt_opportunities", self.manifest)
+        self.assertEqual(lib.load_task(task), record)
+
+        self.manifest["prompt_opportunities"] = {
+            "path": "../prompt-opportunities/legacy.json",
+            "sha256": "a" * 64,
+            "source_commit": record["initial_commit"],
+        }
+        lib.save_json(task.parent / "batch-manifest.json", self.manifest)
+        self.assertEqual(lib.load_task(task), record)
+
+        self.manifest["prompt_opportunities"] = None
+        lib.save_json(task.parent / "batch-manifest.json", self.manifest)
+        self.assertEqual(lib.load_task(task), record)
+
     def test_image_digest_drift_blocks_before_run(self):
         task, record = self.new_task()
         cfg = dict(self.cfg, image_id="sha256:other")

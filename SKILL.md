@@ -36,11 +36,14 @@ fbr_work.py closeout --batch b1110-01 --task s11-000123
 fbr_batch.py closeout --batch b1110-01
 ```
 
-阶段默认只读一份 `references/stage-briefs/{run,review,submit}.md`，不要同时加载全部 references。命令默认摘要模式只返回状态、阻断项、结果路径和下一条动作；`--json` 才输出完整对象。完整表格、平台 schema、errors 和 metrics 留在本地文件，定向查询，不整份回灌。
+阶段先读一份 `references/stage-briefs/{run,review,submit}.md`，再按该 brief 只加载当前需要
+的 references，不要同时加载全部文档。支持 `--json` 的命令默认输出摘要，只有
+`--json` 才展开完整对象；不支持 `--json` 的命令按其帮助或错误报告定向查询。完整表格、
+平台 schema、errors 和 metrics 留在本地文件，定向查询，不整份回灌。
 
 滚动评价默认开启。`pre-submit` 启动后，当前 AI 立即进入 `fbr_work.py next --wait -> 当前题评价 -> finalize -> closeout` 循环；任务运行、录屏和取证继续并行。不能等整批跑完再领取评价待办。
 
-真跑默认在验收通过后主动推送 GitHub 产物快照并回读 SHA，再核查结果表；明确只做本地时加 `--no-publish`。平台提交另加 `--auto-submit --confirm-submit SUBMIT`，仍须单独获得用户明确授权。下列逐阶段命令仍可用于排错和补跑：
+真跑默认在验收通过后主动推送 GitHub 产物快照并回读 SHA，再核查结果表；明确只做本地时加 `--no-publish`。`pre-submit` 不接受平台提交参数；需要滚动提交时另用 `fbr_flow.py run --auto-submit`，并须单独获得用户明确授权。下列逐阶段命令仍可用于排错和补跑：
 
 滚动提交不是默认模式，也不由 `pre-submit` 开启。只有用户明确要求一边生产、一边提交平台时，才使用：
 
@@ -54,16 +57,19 @@ fbr_flow.py run --batch b1110-01 \
 
 - 校验评审凭证绑定的题面、轨迹、事实、Feedback、质量回执、抽检、快照和媒体摘要；
 - 复核白名单交付投影、18 个必填字段、SessionID 和当前批内/历史查重；
-- 复核出题 H3/工作量清单、A-5 查重结论、实际有效工具调用数和私有会话读取；命中 P5/P6、
-  A-5 或 memory 风险时只阻断当前题，不进入附件上传和建单；
+- 复核出题 H3/工作量清单、A-5 查重结论和私有会话读取；实际有效工具调用数只记录，不再
+  按本地 50 次下限阻断。命中出题侧 P5/P6 契约、A-5 或 memory 风险时只阻断当前题，
+  不进入附件上传和建单；
 - 登录平台读取实时 schema、账号领域和已有 SessionID，但预检阶段不上传、不建单；
 - 结果写入 `review/submit-preflight.json`，绑定 `feedback_sha`、`source_digest`、`content_digest`、产物快照和 schema fingerprint。
 
 只有预检 `ready` 的单条才进入平台上传。评审输入变化时该题回到当前 AI 重新评价；仅交付快照等交付字段变化时只重做交付冻结，不重新判断需求。平台表单、账号或附件变化会使预检失效。预检失败只阻断这一条，不停止其他题。人工整批提交先运行 `fbr_batch.py closeout`，批量检查通过后才允许开始上传。
 
-本地平台规则预检读取 `review-pack.json` 的有界工具索引，不整读原始轨迹。低于 50 次有效工具
-调用、读取 `.claude/projects/todos/sessions/history.jsonl/memory`、A-5 未通过或 H3 v3/workload 契约
-缺失时写入 `review/platform-rules.json` 并阻断。归属边界见
+本地平台规则预检读取 `review-pack.json` 的有界工具索引，不整读原始轨迹。实际有效工具调用
+数低于 50 只记录、不阻断；访问任务容器私有运行目录
+`.claude/projects/todos/sessions/history.jsonl/memory`、A-5 未通过或新批次 H3 v3/workload
+契约缺失时写入 `review/platform-rules.json` 并阻断。这里的 `.claude` 是被测任务容器内
+Claude Code 的运行目录，不是 Codex skill 目录。归属边界见
 [platform-policy-preflight.md](references/platform-policy-preflight.md)。
 
 同一平台账号的上次写请求时间持久化在 `~/.codex/solo11/runtime/platform-write-pacing-<账号摘要>.json`。脚本退出、resume、换批次或手工补交后仍继续按上次时间计算。建单明确遇到 429 时优先使用 `Retry-After`，否则按 15、30、45 秒退避；每次重投前按 SessionID 回查，发现已建单就直接回读，不重复 POST。其他 5xx、超时和结果未知仍保留 `uncertain`，不自动重试。
@@ -97,6 +103,7 @@ fbr_run.py collect --batch …         R2  导出轨迹，取 SessionID / Prompt
 fbr_snapshot.py commit --batch …     R3  宿主机提交工作区（只动本地）
 fbr_snapshot.py push --batch …           演练；真推要 --execute --confirm PUBLISH
 fbr_record.py --batch …              R4  任务镜像新容器里跑演示命令，录成 mp4
+fbr_record.py --batch … --plan-check      只读校验页面覆盖和录屏预算，不启动容器
 fbr_facts.py --batch …               R5  取证 → evidence/facts.json
 fbr_feedback.py card --batch …       R6  素材卡 → review/card.md
 fbr_evidence.py ingest --task …          轨迹单次摄取 → manifest/events/pack/check
@@ -128,7 +135,7 @@ fbr_cleanup.py maintain --batch b1113-01 --execute --confirm MAINTAIN
 fbr_cleanup.py prune --batch b1113-01 --execute --confirm CLEANUP
 ```
 
-删除前先把目标原子移动到 `_verification/cleanup-trash/`，写维护记录、`cleanup.json` 和批次 `cleanup-manifest.json` 后才清空 trash。清理后仍保留 `task.json`、`state.json`、`recording-plan.json`、`run/attempts.json`、`run/key-identity.json`、`trace/`、`record/recording.mp4`、`record/recording.json`、`evidence/` 和 `review/`。依赖缓存和旧交付历史由批次维护回收，不与单题 `prune` 混在一起。
+删除前先把目标原子移动到 `_verification/cleanup-trash/`，写维护记录、`cleanup.json` 和批次 `cleanup-manifest.json` 后才清空 trash。清理后仍保留 `task.json`、`state.json`、`recording-plan.json`、`run/attempts.json`、`run/key-identity.json`、`trace/`、`record/recording.mp4`、`record/recording.json`、`record/pages/`、`evidence/` 和 `review/`。依赖缓存和旧交付历史由批次维护回收，不与单题 `prune` 混在一起。
 
 已清理任务的当前结果包会冻结保存，后续刷新结果表不再用新规则重新淘汰；若历史批次曾被后来的规则刷新缩减，可先运行 `fbr_cleanup.py restore --batch …`，从已校验的 delivery history 恢复原任务投影，再审计和清理。
 
@@ -141,6 +148,10 @@ fbr_cleanup.py prune --batch b1113-01 --execute --confirm CLEANUP
 ## 1. 运行与收集
 
 先按 [references/handoff-input.md](references/handoff-input.md) 接收出题侧批次。新批次会核对冻结基线、题面、需求点与录屏方案的交接摘要；发生变化需重新交接。每题独立起跑，不能接着上一题的代码跑。新出题侧每题只保留一个 `origin/` 和一个 `workspace/`，远端只有 `main`；同一提示词只执行一次首轮，不拆 A/B 两侧。`origin/` 保留冻结初始提交和出题预检依赖；`workspace/` 是宿主 Git 交付树，模型运行时不挂载它。
+
+提示词机会地图是出题侧可选的生产溯源。运行侧接收旧批次和新批次时都不要求该文件存在，
+缺失时不阻断也不告警；`batch-manifest.json` 有绑定就原样保留，没有绑定也不能补造。
+机会地图、生成清单中的地图路径或地图摘要都不是运行、评审或平台提交的必需输入。
 
 运行基线：镜像 `adminfather/benzhi-claude-code2:20261110`，Claude Code `2.1.319`。Intel 与 Apple 芯片使用同一镜像名、同一组命令，由 Docker 自动选架构，不加 `--platform`。网关 `https://llm2.jzxhnh.com`、模型 `auto_model/urm` 和 Git 环境已配置在镜像内，不重复配置。镜像 Id 是本机所选架构的值，不能把另一架构的 Id 写死复用。
 
@@ -182,7 +193,9 @@ fbr_snapshot.py push   --batch b1110-01              # 演练
 
 - 在任务镜像的新容器、产物干净克隆上录，不带 key；演示方案取 `recording-plan.json`，授权覆盖才用 `recording-plan.override.json`。
 - 先出现提示符，再逐字输入并执行启动命令。命令失败照录，不改命令、不重试到成功；setup 失败不得冒充产物失败。
-- Web 必须演示真实启动和功能操作，不能只录构建、首页或空弹窗；页面目标 8 秒，终端启动目标 10 秒，成片 1280×720/H.264/≤90 秒。
+- Web 必须演示真实启动和功能操作，不能只录构建、首页或空弹窗；新 S11 Web 方案必须声明
+  `pages`，每页至少一个真实动作和可见结果，页面段默认至少 12 秒，终端启动目标 10 秒，
+  成片 1280×720/H.264/≤90 秒。
 - 新录制先进入候选目录，合格后才替换正式视频；重录失败保留旧合格版本。
 - 选页、pause_ms、多页面覆盖和截断判定以 `run-rules.md#录屏r4` 为准。
 
@@ -204,7 +217,7 @@ fbr_record.py --batch b1110-01                       # --redo 重录
 
 1. `fbr_feedback.py card` 汇集题面、需求点、测试对比、演示结果、改动与轨迹索引。
 2. `fbr_reviewer.py review` 自动先对全部主/子轨迹及获准续写做一次全量摄取，建立事件图和精确偏移；reviewer 只读事件包，并按行号/block 回查候选原文，保存带精确出处、完整后续状态和调用回执的 `review/trace-analysis.json`，随后返回 `needs_task_agent` 检查点。轨迹配置未填写 `model` / `reasoning_effort` 时沿用 `gpt-6.1-sol` / `high`；不可用时只暂停这一阶段，不伪造分析。
-3. 当前任务 AI 默认读取 `review/task-agent-brief.md`、当前阶段 brief、相关代码 hunk 和真实实跑材料，判需求完成情况与评分。先写 `review/decision-input.json`，同时填写 `language_review`：最关键业务约束原句、黑话改写和必要业务词；再运行 `fbr_reviewer.py build` 展开并 lint。只有排错或迁移时才手写完整 candidate。代码已能确证的问题不重复跑服务；缺证据则用既有 probe 补齐后刷新 card 和检查点。5 分仍须至少两个不同的、题面未明说的有效边界 probe。
+3. 当前任务 AI 默认读取 `review/task-agent-brief.md`、当前阶段 brief、相关代码 hunk 和真实实跑材料，判需求完成情况与评分。先写 `review/decision-input.json`，同时填写 `language_review`：最关键业务约束原句、黑话改写和必要业务词；再运行 `fbr_reviewer.py build` 展开并 lint。只有排错或迁移时才手写完整 candidate。代码已能确证的问题不重复跑服务；缺证据则用既有 probe 补齐后刷新 card 和检查点。5 分仍须至少两个不同的、题面未明说的有效边界 probe，每条反例登记 `prompt_implied: false`。
 4. 当前任务 AI 另做产物与文字复核轮，按 `public_units` 逐句拆出断言，核对原始连续摘录、后续修正、最终影响，以及七项语义要求，保存绑定候选和检查点的 verification。每个 `process` 句除真实 `steps` 外还必须写 `evidence`，逐条指定 `kind=tool`、step、`target/output/error/tool` 字段和原始连续摘录；没有工具步骤时用 `kind=assistant` 绑定真实助手文本。`claim_reviews.sources` 中凡是 `trace/projects/*.jsonl`，必须同时写 `start_line`、`end_line`、`block` 和 `excerpt`。独立复核轮必须引用同一摘录，并通过 `fbr_evidence.py fetch/verify` 回查精确原始区间，不能复读整份原始轨迹。过程句还必须按 [模型过程归因审计](references/process-attribution-audit.md) 完成 `process_audit`：逐句确认主体是模型、基线行为没有被误归给模型、时间线覆盖后续修改、验收 probe/录屏没有混入模型动作，并对“只、仅、从未、收尾”等范围或时序表述扫描完整轨迹。不得将自报“通过”代替逐句证据，不得冒称另一个模型或独立审核人完成。细节见 [reviewer.md](references/reviewer.md) 和 [feedback-quality.md](references/feedback-quality.md)。
 5. `fbr_reviewer.py finalize` 只做确定性校验，不读取 `reviewer.env` 或调用外部模型；通过后保存 `audit.json`、`feedback.json`、`model-review.json` 与 `quality.json`，执行门闸、刷新本地表并主动推送快照，再核查交付字段；明确本地模式时使用 `--no-publish`。失败返回具体错误，由当前任务 AI 继续修复、补证和复验；材料、规则或正文变化须重新核实，不给旧记录补盖新回执。
 
@@ -216,6 +229,7 @@ fbr_evidence.py pack   --task /absolute/path/to/batches/b1110-01/<任务目录>
 fbr_evidence.py fetch  --task /absolute/path/to/batches/b1110-01/<任务目录> --ref '{"path":"trace/projects/...jsonl","start_line":554,"end_line":554,"block":0,"excerpt":"连续原文"}'
 fbr_reviewer.py review --batch b1110-01 --task s11-000123 --execute
 fbr_reviewer.py build --batch b1110-01 --task s11-000123 --decision /absolute/path/to/review/decision-input.json
+                                          自动补需求状态、评分字段、process audit 和 claim 来源
 fbr_reviewer.py lint --batch b1110-01 --task s11-000123 --candidate /path/to/candidate.json
 fbr_style.py check --text '待检查的 Feedback 正文'
 fbr_feedback.py probe --batch b1110-01 --task s11-000123 --cmd 'node bin/cli.js pack fixtures/empty.mp4'
@@ -264,7 +278,7 @@ Session 和附件；不得继续重写 Feedback 或反复 PUT。memory 读取返
 
 环境可复现等级必须逐字属于 `fbr_submit.py probe` 读取的平台 `repro_level.options`；不得填系统架构、安装或启动经过等自由文本。来源不在选项内时阻止交付，保留冻结 task.json，核实真实环境后通过有来源的字段修订处理，不猜测或静默降级。平台暂不可达时不能声称已核实最新选项；恢复后先重新读取 schema 再提交。
 
-结果表“闸门状态”同时检查当前独立验收、18 个必填输入字段、枚举、真实轨迹与录屏、已推送且回读确认的快照。任一缺失显示具体阻塞原因，不得仅因 Feedback 通过显示“通过”；提交人和提交时间由平台生成，未提交时保持空白。每条验收结束立即刷新本地结果及字段核查页，不等待整批完成。
+结果表“闸门状态”同时检查当前独立验收、18 个必填输入字段、枚举、真实轨迹与录屏、已推送且回读确认的快照。平台共 19 个启用输入字段，其中 18 个必填，`other_issues` 可空。任一缺失显示具体阻塞原因，不得仅因 Feedback 通过显示“通过”；提交人和提交时间由平台生成，未提交时保持空白。每条验收结束立即刷新本地结果及字段核查页，不等待整批完成。
 
 ```bash
 fbr_batch.py export --batch b1110-01                 # 白名单证据投影，不复制代码
@@ -284,13 +298,13 @@ fbr_sheet.py --batch b1110-01                       # 确认回执后回填媒�
 
 - 抽检由真人执行；`spotcheck` 只登记结论，agent 不能自批通过。退回后改正文并重新过闸。
 - `results/<批次>/` 是固定交付投影，只含当前有效且已过闸门的白名单证据；代码和 workspace 不外移。直接改副本无效，列定义见 `sheet-columns.md`。
-- 平台 18 个必填输入字段必须逐题核查；只有 `other_issues` 可空，提交人/时间由平台生成。缺值或未验收就阻止，不猜、不占位。
+- 平台 19 个启用输入字段中，18 个必填字段必须逐题核查；只有 `other_issues` 可空，提交人/时间由平台生成。缺值或未验收就阻止，不猜、不占位。
 - `other_issues` 只允许中断续写和“模型运行时读取了 apikey”两类轨迹事实，其余为空。
 - 操作系统使用实时枚举 `MacOS/Linux`；未知枚举或 schema 变化停止并重新核实。
 
 本地“备注”和平台“其他问题”（`other_issues`）只允许两类由原始轨迹自动生成的事实：中断续写说明，以及 `模型运行时读取了 apikey`。两类同时存在时用中文分号连接；其余时候一律提交空字符串 `""`，返修也相同。备注不从 `feedback.note`、重跑、历史改写、录屏或验收说明复制；当前脚本不自动返修，另行获准返修时也必须遵守此字段规则。
 
-提交前只读 `references/stage-briefs/submit.md`，需要细节时再读 [references/platform-api.md](references/platform-api.md)。平台固定为 `https://solo2.jzxhnh.com`，默认使用本机保存的 `zouyonghong` 凭据，可用 `SOLO11_PLATFORM_ACCOUNT` 覆盖；每次登录、读取实时 schema/fingerprint、账号领域和历史 SessionID，遇到新增字段或类型变化就停止。账号以首次提交锁定领域，同账号不能跨领域提交。
+提交前只读 `references/stage-briefs/submit.md`，需要细节时再读 [references/platform-api.md](references/platform-api.md)。平台固定为 `https://solo2.jzxhnh.com`，账号从 `_config/settings.json` 的 `platform.account` 读取，当前默认 `zouyonghong`；`SOLO11_PLATFORM_ACCOUNT` 只作显式临时覆盖。每次登录、读取实时 schema/fingerprint、账号领域和历史 SessionID，遇到新增字段或类型变化就停止。账号以首次提交锁定领域，同账号不能跨领域提交。
 
 平台只收一个主会话 `.jsonl`，子会话保留在本地交付目录。轨迹和视频先上传，再按账号级间隔建单，最后回读每个字段。预检和正式回执分别绑定当前来源摘要，存任务源目录的 `review/upload.json`；内容变动即失效。每次写请求的等待秒数、尝试次数和 429 退避记录在同一回执的 `pacing`。超时或结果未知时先回查 SessionID，不盲目重发。`confirmed` 只表示建单字段一致，不代表平台质检通过。
 
@@ -310,13 +324,14 @@ fbr_sheet.py --batch b1110-01                       # 确认回执后回填媒�
               run-tree.json integration.json dependencies.json
     trace/    projects/<目录>/<SessionID>.jsonl  ids.json
               manifest.json events.jsonl trace-check.json review-pack.json offsets/
-    record/   recording.mp4 recording.json terminal.raw.log
+    record/   recording.mp4 recording.json terminal.raw.log pages/<页面ID>.png
     evidence/ facts.json audit.json probes.jsonl
     review/   snapshot.json diff.patch card.md task-agent-brief.md candidate-schema.json feedback.json
               model-review.json quality.json metrics.json task-agent-work.json task-closeout.json
               attestation.json（当前有效评审凭证）
-              decision-input.json candidate.json verification.json style-report.json validation-errors.json
-              build-errors.json lint-errors.json upload-plan.json
+              decision-input.json candidate.json verification.json build-report.json
+              style-report.json finalize-errors.json
+              build-errors.json lint-errors.json prepare-errors.json upload-plan.json
               task-agent-history.json task-agent-history/objects/ probe-requests.json gate.json
               spotcheck.json submit-preflight.json upload.json
 <root>/results/b1110-01/
@@ -329,7 +344,7 @@ fbr_sheet.py --batch b1110-01                       # 确认回执后回填媒�
     cleanup.json                          已清理任务的删除台账
     platform/                             平台回执、产物快照和预检副本
     trace/    ids.json projects/...        原样复制主会话与子会话 JSONL
-    record/   recording.mp4 recording.json
+    record/   recording.mp4 recording.json pages/<页面ID>.png
     evidence/ facts.json audit.json probes.jsonl
     review/   feedback.json model-review.json quality.json style-report.json gate.json spotcheck.json（仅当前正文版本）
 <root>/_registry/baseline-tests/<完整身份摘要>.json  基线、镜像、命令、架构与脚本版本绑定的缓存
@@ -346,7 +361,7 @@ API key 填在上述独立 env 文件的 `apikey=` 后面。`settings.json` 只�
 
 仅轨迹分析使用 `/Users/fengyin/.codex/solo11/reviewer.env`，填写 `base_url=`、`apikey=`，可配置 `model=` 与 `reasoning_effort=`；入口支持 `--env-file` 改路径。其他操作使用推进任务的当前 AI，不读取这份配置，不改 CC Switch 或全局 Codex 配置。详见 [references/reviewer.md](references/reviewer.md)。
 
-可调的配置都在 `_config/settings.json`，缺省值见 `scripts/fbrlib.py` 的 `DEFAULTS`（并发、超时、重跑次数、录屏规格、测试命令、闸门阈值和平台写入间隔）。滚动评价固定为默认流程；`submit.interval_seconds` 默认 10，`submit.rate_limit_retries` 默认 3，退避为 15、30、45 秒。`_config/` 里不放密钥。
+可调的配置都在 `_config/settings.json`，缺省值见 `scripts/fbrlib.py` 的 `DEFAULTS`（并发、超时、重跑次数、录屏规格、页面覆盖时长、测试命令、闸门阈值、平台账号和写入间隔）。滚动评价固定为默认流程；`submit.interval_seconds` 默认 10，`submit.rate_limit_retries` 默认 3，退避为 15、30、45 秒。`_config/` 里不放密钥。
 
 ## 自测
 

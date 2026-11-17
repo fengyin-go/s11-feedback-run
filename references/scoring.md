@@ -76,8 +76,8 @@ fbr_feedback.py probe --batch b1110-01 --task s11-000123 --cmd '<命令>'
     {"id": "R3", "verdict": "看不出来", "note": "要求在 Windows 路径下也能用，现有环境验证不了", "anchors": []}
   ],
   "counterexamples": [
-    {"what": "空文件作为输入", "probe": "P3", "found_problem": false},
-    {"what": "同一输出路径连续执行两次", "probe": "P4", "found_problem": true}
+    {"what": "空文件作为输入", "prompt_implied": false, "probe": "P3", "found_problem": false},
+    {"what": "同一输出路径连续执行两次", "prompt_implied": false, "probe": "P4", "found_problem": true}
   ],
   "false_success": "无",
   "false_success_note": "",
@@ -93,7 +93,8 @@ fbr_feedback.py probe --batch b1110-01 --task s11-000123 --cmd '<命令>'
     - 明显：功能在，但正常使用就会撞上的错，需要人再改才能用。
     - 细节：不影响主要用途的小遗漏。
   - 看不出来：只用于确实验证不了的情况，并在 `note` 里说明为什么验证不了。能实跑的不要用它。
-- `counterexamples`：实跑过的边界情况。`probe` 必须是 `probes.jsonl` 里存在的编号；`found_problem` 如实填。
+- `counterexamples`：实跑过的边界情况。`probe` 必须是 `probes.jsonl` 里存在的编号；
+  `found_problem` 如实填；用于 5 分时必须写 `prompt_implied: false`。
 - `false_success`：无 / 轻微 / 较大 / 严重。不是「无」就必须写 `false_success_note`（模型说了什么、实际是什么）和 `false_success_anchors`。
 
 ## 虚假成功
@@ -144,7 +145,11 @@ fbr_feedback.py probe --batch b1110-01 --task s11-000123 --cmd '<命令>'
 | 实跑过的边界情况不到 2 个 | 4 |
 | 边界情况里找出了问题 | 4 |
 
-所以默认上限是 4 分。5 分的条件是全部满足：每个需求点都判了做到并且有锚点，至少两个边界情况实跑过并且都没找出问题，没有虚假成功，产物测试通过。两个边界情况必须引用不同的 probe；只有 setup 成功、命令确已执行的记录才计数，超时、启动失败或未执行不能充数。继承自初始仓库的测试失败不算模型新增回归，但产物测试仍未通过时最高 4 分。
+所以默认上限是 4 分。5 分的条件是全部满足：每个需求点都判了做到并且有锚点，至少两个边界
+情况实跑过并且都没找出问题，没有虚假成功，产物测试通过。两个边界情况必须引用不同的 probe，
+并逐条登记 `prompt_implied: false`，证明它们不是题面直接交代的验收步骤；只有 setup 成功、
+命令确已执行的记录才计数，超时、启动失败或未执行不能充数。继承自初始仓库的测试失败不算模型
+新增回归，但产物测试仍未通过时最高 4 分。
 
 给 5 分时正文说明实际验证范围，有已知未覆盖情形就如实写，不强制添加一个遗憾或范围外增强。发现真实功能问题时仍执行上面的分数上限；不能把已发现的问题写成「未验证」来保留 5 分。
 

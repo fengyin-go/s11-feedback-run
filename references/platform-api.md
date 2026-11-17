@@ -1,6 +1,8 @@
 # SOLO2 平台接口
 
-2026-11-11 已用本机 `gonghao` 凭据实际完成登录、`auth/me`、表单 schema 与自己的提交列表读取。接口固定为 `https://solo2.jzxhnh.com/api/v1`，不沿用旧凭据文件里的 `base_url`。正式附件上传和有效建单须由第一条合格交付验证；本地自测不代表生产质检通过。
+2026-11-11 曾用本机 `gonghao` 凭据完成一次历史接口验证；当前默认账号不是 `gonghao`。
+接口固定为 `https://solo2.jzxhnh.com/api/v1`，不沿用旧凭据文件里的 `base_url`。正式附件上传和
+有效建单须由第一条合格交付验证；本地自测不代表生产质检通过。
 
 ## 命令和权限
 
@@ -34,7 +36,17 @@ fbr_sheet.py --root "<root>" --batch b1110-01
 
 ## 凭据和认证
 
-默认账号为 `gonghao`，可用环境变量 `SOLO11_PLATFORM_ACCOUNT` 覆盖。优先读取 `~/.codex/coding-agent-satisfaction/solo-qa-accounts/<账号>.json`，不存在时才读取 `~/.codex/coding-agent-satisfaction/solo-qa.json`。两者均要求普通文件、权限 600、`username` 恰为所选账号，密码只读到内存。优先文件损坏或不安全时不能悄悄退回备用文件。禁止打印文件、密码、Cookie、CSRF 或完整登录响应；凭据不放工作目录、仓库、回执或交付目录。
+账号从 `_config/settings.json` 的 `platform.account` 读取，当前默认 `zouyonghong`；
+`SOLO11_PLATFORM_ACCOUNT` 只作显式临时覆盖。所有 CLI 入口读取根目录后会统一切换到该账号。
+
+```json
+"platform": {"account": "zouyonghong"}
+```
+
+优先读取 `~/.codex/coding-agent-satisfaction/solo-qa-accounts/<账号>.json`，不存在时才读取
+`~/.codex/coding-agent-satisfaction/solo-qa.json`。两者均要求普通文件、权限 600、
+`username` 恰为所选账号，密码只读到内存。优先文件损坏或不安全时不能悄悄退回备用文件。
+禁止打印文件、密码、Cookie、CSRF 或完整登录响应；凭据不放工作目录、仓库、回执或交付目录。
 
 登录：`POST /auth/login`，JSON 为 `username`、`password`。会话由内存 CookieJar 保存；写请求使用 `solo_qa_csrf` Cookie 解码后的值作为 `X-CSRF-Token`。不保存 Cookie 文件，不跟随跨 origin 重定向；普通结果未知的 POST 不自动重试，只有建单明确返回 429 时按下方规则先回查再重投。登录后 GET `/auth/me` 核对用户名和是否需要修改初始密码；需要改密码时停止。
 

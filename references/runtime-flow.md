@@ -18,11 +18,17 @@ fbr_flow.py resume --batch b1110-01 --execute --confirm FLOW --detach
 
 用户说“运行所有提示词/所有任务”时默认执行 `pre-submit`：它直接真跑并完成平台提交前全部阶段，默认发布验收通过的 GitHub 快照；不接受 `--auto-submit`。底层 `run` 和分阶段命令仍保留演练模式供排错。
 
-真跑默认完成：跑题/收集/本地快照 → 录屏 → 取证 → 轨迹分析 → 当前任务 AI 验收、评分和文字复核 → 轨迹模型核查过程断言 → 闸门/本地表格。跑题、录屏、取证、评价和补证队列分别工作，一题完成即可进入下一队列，完成的结果立即进入状态。跑题并发默认 5、录屏 2、取证 2、评价 `review_parallel` 默认 5 且硬上限 5（含跨进程轨迹调用槽）；后三者不占跑题 key 的生成额度。滚动评价默认开启，当前 AI 在 flow 运行时持续执行 `fbr_work.py next --wait`，逐题领取最老的待办；不能等整批任务结束后再集中评价。表格和交付写入串行化。
+真跑默认完成：跑题/收集/本地快照 → 录屏 → 取证 → 轨迹分析器读取事件包并生成检查点 →
+当前任务 AI 验收、评分、写作和同会话二次逐句复核 → `finalize` 确定性校验 → 闸门/本地表格。
+轨迹分析器只分析轨迹，不评价产物；`finalize` 不调用模型。跑题、录屏、取证、评价和补证队列
+分别工作，一题完成即可进入下一队列，完成的结果立即进入状态。跑题并发默认 5、录屏 2、取证 2、
+评价 `review_parallel` 默认 5 且硬上限 5（含跨进程轨迹调用槽）；后三者不占跑题 key 的生成额度。
+滚动评价默认开启，当前 AI 在 flow 运行时持续执行 `fbr_work.py next --wait`，逐题领取最老的待办；
+不能等整批任务结束后再集中评价。表格和交付写入串行化。
 
 结果表 watcher 随真跑批次启动，每 2 秒检查进度指纹，可见状态变化后最多每 5 秒写一次。`results/<批次>/` 不再整体移动，普通刷新只原子替换 `result.xlsx`；证据目录只在交付集合变化时进入或退出。无变化轮询不写工作簿，历史只记录交付语义变化。
 
-GitHub 推送在独立验收和 Feedback 闸门通过、首次落表之后执行；推送后回读并再次落表核查全部必填字段。完整流水线默认主动发布，明确本地模式加 `--no-publish`；平台提交另加 `--auto-submit --confirm-submit SUBMIT`，不是默认模式。当前有效版本写 `review/attestation.json`，冻结评审输入、交付输入、Feedback、来源摘要、内容摘要和产物快照。滚动提交由独立的单线程队列串行消费 `ready_submit`，不占运行、录屏、取证或评价并发。每条提交前只验证凭证和实时平台条件，写 `review/submit-preflight.json`，不重新调用 AI 或重跑内容评审；失败只阻断当前题。人工整批提交先运行 `fbr_batch.py closeout`，检查所有凭证、字段、SessionID、领域和查重后再上传。平台单存在的任务冻结自动生产，返修需另行处理。产物尚未推送时本地仍可评价，但表格不会假报可提交。spotcheck 必须由真实审核人登记。
+GitHub 推送在独立验收和 Feedback 闸门通过、首次落表之后执行；推送后回读并再次落表核查全部必填字段。完整流水线默认主动发布，明确本地模式加 `--no-publish`。`pre-submit` 只做到平台提交前，不接受 `--auto-submit`；需要滚动提交时必须另用 `fbr_flow.py run --auto-submit --confirm-submit SUBMIT`，并取得独立授权。当前有效版本写 `review/attestation.json`，冻结评审输入、交付输入、Feedback、来源摘要、内容摘要和产物快照。滚动提交由独立的单线程队列串行消费 `ready_submit`，不占运行、录屏、取证或评价并发。每条提交前只验证凭证和实时平台条件，写 `review/submit-preflight.json`，不重新调用 AI 或重跑内容评审；失败只阻断当前题。人工整批提交先运行 `fbr_batch.py closeout`，检查所有凭证、字段、SessionID、领域和查重后再上传。平台单存在的任务冻结自动生产，返修需另行处理。产物尚未推送时本地仍可评价，但表格不会假报可提交。spotcheck 必须由真实审核人登记。
 
 默认 `cleanup.auto=true` 且 `policy=minimal`。录屏、取证和每次交付投影成功后分别执行阶段回收、本题 scratch 回收和历史快照裁剪；本地交付封存、batch closeout、提交预检和等待提交期间都保留 `origin/`、`workspace/`、`run-tree/`。滚动提交成功后进入独立 QC/清理轮询，只有实时详情为 `QC_PASSED`、本地回执 `confirmed`、结果包 SHA256 全部有效且任务无活动进程时，才写最终 `retention.json`、平台回执副本与 `cleanup.json` 并删除代码现场。`QC_RUNNING` 继续等，`PENDING_FIX`、`uncertain` 和摘要漂移不会删除长期证据。`pre-submit` 不做平台提交，因此保留代码现场，只执行本地封存和安全的阶段维护。细节见 [retention.md](retention.md)。
 

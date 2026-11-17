@@ -90,6 +90,9 @@ class DeliveryProjection(SheetCase):
     def test_manifest_records_real_bytes_and_hashes_without_source_mutation(self):
         task = self.gated()
         self.complete(task)
+        page = task / "record/pages/home.png"
+        page.parent.mkdir(parents=True)
+        page.write_bytes(b"\x89PNG\r\n\x1a\n")
         before = {str(p.relative_to(task)): p.read_bytes() for p in task.rglob("*") if p.is_file()}
         manifest = self.export()
         self.assertEqual(manifest["batch_id"], BATCH)
@@ -107,6 +110,10 @@ class DeliveryProjection(SheetCase):
             raw = path.read_bytes()
             self.assertEqual(item["bytes"], len(raw))
             self.assertEqual(item["sha256"], hashlib.sha256(raw).hexdigest())
+        self.assertIn(
+            f"results/{BATCH}/{task.name}/record/pages/home.png",
+            {item["path"] for item in row["files"]},
+        )
         self.assertEqual(before, {str(p.relative_to(task)): p.read_bytes() for p in task.rglob("*") if p.is_file()})
         saved = lib.load_json(self.root / "results" / BATCH / "delivery-manifest.json")
         self.assertEqual(saved, manifest)

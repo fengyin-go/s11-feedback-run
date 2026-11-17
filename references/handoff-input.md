@@ -8,6 +8,14 @@
 
 `task.json` 与批次清单均标记 `producer=s11-gsb-prompt-create`、`execution_mode=single`、`branch=main`。摘要额外绑定这些标记和 `origin`/`workspace` 路径。校验拒绝旧 A/B 子目录、origin 偏离初始提交、类型错误以及清单不一致。起跑前再检查 workspace 的分支为 main。旧 V2 摘要格式保留，不强行要求旧批次补 origin。
 
+`batch-manifest.json.prompt_opportunities` 是可选出题溯源，不是运行输入：
+
+- 新批次可能带机会地图路径、SHA-256 和源提交绑定；运行侧只保留该元数据，不改写、不补造。
+- 原有项目可能完全没有机会地图、绑定字段为空或只保留历史路径；这些情况都正常加载和运行。
+- 机会地图缺失、外部路径不可访问或本地没有 `prompt-opportunities/` 目录时，不得阻断或告警，
+  运行、评审、交付和平台提交都正常继续。运行质量继续以题面、领域/H3 契约、生成清单、轨迹和
+  产物证据为准。
+
 任务类型固定五类：功能开发、Bugfix、代码重构、功能优化、依赖升级与迁移。出题侧以 30/30/5/30/5 做整数配额并在交接时复检；运行侧原样消费，不重新归类或改题面。
 
 新增批次的 `task.json.handoff_version=2`。每次读取时脚本核对：

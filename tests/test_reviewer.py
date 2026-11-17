@@ -396,6 +396,91 @@ class Review(FlowCase):
                          "超过一小时的输入没有做")
         self.assertEqual(reviewer.lint_candidate(task, candidate, verification)["state"], "ok")
 
+    def test_process_evidence_automatically_merges_into_matching_claim(self):
+        task = self.agent_prepared()
+        doc = feedback()
+        claims = mock_claim_reviews(doc, task_dir=task)
+        process = [doc["process"][0]]
+        sentence = process[0]["sentence"]
+        claim = next(row for row in claims if row["sentence"] == sentence)
+        claim["sources"] = []
+
+        merged, derived = fbr_feedback._merge_process_evidence_into_claims(
+            task, claims, process)
+
+        source = next(row for row in merged if row["sentence"] == sentence)["sources"][0]
+        self.assertTrue(source["path"].startswith("trace/projects/"))
+        self.assertIn("start_line", source)
+        self.assertTrue(derived)
+
+    def test_partial_process_sentence_expands_only_when_unique(self):
+        text = "模型先运行构建并发现类型错误。它随后修正类型并重新构建。"
+        self.assertEqual(
+            fbr_feedback._canonical_sentence(text, "模型先运行构建"),
+            "模型先运行构建并发现类型错误",
+        )
+        self.assertEqual(
+            fbr_feedback._canonical_sentence("模型先构建。模型先构建并验证。", "模型先构建"),
+            "模型先构建",
+        )
+
+    def test_repair_actions_name_the_structured_patch_location(self):
+        actions = reviewer.repair_actions([
+            "第 1 句复查没有逐条引用过程句 evidence 对应的原始轨迹摘录",
+            "第 2 句复查摘录不在原始文件中",
+        ])
+        self.assertEqual(actions[0]["path"], "process[].evidence")
+        self.assertEqual(actions[1]["path"], "claims[].sources")
+
+    def test_compact_build_derives_internal_status_and_score_fields(self):
+        task = self.agent_prepared()
+        doc = feedback()
+        decision = {
+            "requirements": [
+                {**row, "user_text": ""}
+                for row in audit()["requirements"]
+            ],
+            "counterexamples": [],
+            "false_success": "无",
+            "score": doc["score"],
+            "feedback": doc["feedback"],
+            "results": doc["results"],
+            "issues": doc["issues"],
+            "test_claims": doc["test_claims"],
+            "process": [],
+            "claims": [],
+            "score_basis": {
+                "category": "process_issue",
+                "delivered": "",
+                "remaining": "",
+                "why_this_score": "",
+                "lowest_supported_score": None,
+                "lower_score_rejected": "",
+                "anchors": [],
+            },
+            "language_review": {
+                "reviewed": True,
+                "criterion_sentence": "超过一小时的输入没有做",
+                "translated_terms": [],
+                "retained_terms": [],
+                "note": "fixture",
+            },
+            "quality_checks": {},
+            "needs_probes": [],
+        }
+
+        candidate, verification = fbr_feedback.expand_decision(task, decision)
+        basis = candidate["feedback"]["score_basis"]
+        self.assertTrue(all(candidate["feedback"]["requirements_status"]))
+        self.assertTrue(all(row["user_text"] for row in candidate["feedback"]["requirements_status"]))
+        self.assertTrue(basis["delivered"])
+        self.assertTrue(basis["remaining"])
+        self.assertTrue(basis["why_this_score"])
+        self.assertEqual(basis["lowest_supported_score"], doc["score"])
+        self.assertTrue(basis["lower_score_rejected"])
+        self.assertTrue(basis["anchors"])
+        self.assertTrue(verification["build_derivations"]["fields"])
+
     def test_work_wait_and_closeout_use_files_not_conversation_history(self):
         task = self.agent_prepared()
         flow = lib.batch_dir(self.root, task.parent.name)/'flow'

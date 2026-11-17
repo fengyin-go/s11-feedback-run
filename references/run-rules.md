@@ -92,9 +92,9 @@ docker exec -i <任务编号> bash -c \
 - 流式输出、stderr、导出的主会话或子会话任何地方含当前起跑 key 原文时，按甲方补充口径视为可交付数据：原始文件和轨迹不改写、不脱敏，收集阶段记录 `api_key_read=true`，备注自动写“模型运行时读取了 apikey”，随后继续快照、录屏、取证和交付。key 不决定运行是否有效，也不因命中而重跑。
 - key 备注由当前运行/轨迹中的起跑 key 原文自动检测，不能从反馈 note 或人工备注复制。检测时只记录布尔事实和命中文件清单，不在错误、表格备注或反馈正文里输出 key 原文。
 - 收集后的平台规则预检扫描 `review-pack.json` 中 `Read/Bash/Grep/Glob` 的 target 和返回摘要。
-  访问 `.claude/projects`、`.claude/todos`、`.claude/sessions`、`.claude/history.jsonl` 或
-  `.claude/memory` 时
-  标记 `runtime_rerun_required`，不进入平台提交。具体流程见
+  访问任务容器内的 `.claude/projects`、`.claude/todos`、`.claude/sessions`、
+  `.claude/history.jsonl` 或 `.claude/memory` 时标记 `runtime_rerun_required`，不进入平台提交。
+  这是被测任务中 Claude Code 的私有运行目录，不是 Codex skill 目录。具体流程见
   [platform-policy-preflight.md](platform-policy-preflight.md)。
 
 ## key
@@ -131,15 +131,30 @@ docker exec -i <任务编号> bash -c \
 
 ## 录屏（R4）
 
-Web 工程必须录真实服务启动再到页面访问和功能操作；构建/语法检查不能替代。复用 [cc-gsb-create](../../cc-gsb-create/references/recording.md) 的真实 PTY + 页面方案。启动段目标至少 10 秒、硬下限 8 秒；服务就绪后页面段至少 8 秒。setup 失败属于准备失败，产物启动失败如实录报错，不重试刷成功。原计划为 `business_demo_status=pending_implementation` 的构建占位会直接拒绝。
+Web 工程必须录真实服务启动再到页面访问和功能操作；构建/语法检查不能替代。启动段目标至少
+10 秒、硬下限 8 秒；服务就绪后页面段默认至少 12 秒。setup 失败属于准备失败，产物启动失败
+如实录报错，不重试刷成功。原计划为 `business_demo_status=pending_implementation` 的构建占位
+会直接拒绝。
 
-页面成功打开后，按题面和实际界面选一条能展示业务结果的操作路线。多页面项目优先覆盖 3–4 个相关页面：本题核心页面优先，再选关联列表、详情、配置或执行结果页；页面不够时按实际数量操作，不把同一页面反复刷新、分页或开关弹窗算成多个页面。单页面项目可以操作多个功能状态，不虚构不存在的入口。
+页面成功打开后，按题面和实际界面选一条能展示业务结果的操作路线。新 S11 Web 方案必须在
+`pages` 中声明全部必看页面；多页面项目优先覆盖 3–4 个相关页面，本题核心页面优先，再选关联
+列表、详情、配置或执行结果页。每个 `step` 用 `page` 标明动作所在的页面，每个页面至少有一个
+动作和可见结果。页面不够时按实际数量操作，不把同一页面反复刷新、分页或开关弹窗算成多个页面。
+单页面项目可以操作多个功能状态，不虚构不存在的入口。
 
 每个选中的页面至少展示一次与本题有关的实际动作及可观察结果，例如检索后列表变化、打开详情核对字段、提交配置后查看保存状态、执行任务后查看回执。已有数据能支持时可演示创建→列表→详情→结果的关联流程；不要只切换菜单或停在空白页。遇到真实错误保留现场，仍可继续演示不依赖失败步骤的其他页面；不要为凑满页数修改产物、绕过前置条件或编造成功结果。
 
 准备方案前先只读核实真实路由、导航与 selector，优先通过页面内导航切换。操作后等待结果元素出现，关键状态使用 `pause_ms: 1000`–`2000` 留出阅读时间；该字段逐动作配置，默认 300 毫秒，允许 0–10000 的整数，实际停留受剩余录制预算约束。动作记录包含当时 URL 和实际停留毫秒数，SPA 同 URL 的不同视图仍按真实内容判断，不仅凭 URL 数统计页数。页面多时通常给页面段约 30–60 秒，总片仍不超过 90 秒；开录前精简重复操作、预留加载和错误等待时间，不能靠截断末尾页面满足时长。
 
 用户授权修订演示时使用 `review/recording-plan.override.json`：`source_sha256` 是原冻结 plan 的 `fbrlib.content_hash`，`authorization` 为用户授权原文，`plan` 为实测入口、URL、页面 selector 和动作。不可改冻结交接文件。覆盖方案和摘要写入 recording.json，更新录屏使下游取证与评价失效。
+
+启动容器前先运行只读计划检查：
+
+```bash
+fbr_record.py --batch b1110-01 --plan-check
+```
+
+它复用正式录制的同一校验器，检查 `pages`、页面动作归属和启动加页面最低预算，不启动 Docker。
 
 
 任务文档的口径：不超过 90 秒、720p、mp4；跑不起来也要录。
@@ -150,23 +165,31 @@ Web 工程必须录真实服务启动再到页面访问和功能操作；构建/
 - 命令报错就录报错。不为了画面好看换命令、不补环境、不重录到成功。`--redo` 用于录屏本身损坏（文件损坏、分辨率不对），或用户明确授权扩充演示内容后按覆盖方案重录；不能因产物报错而重录到成功。
 - 成片：1280×720、H.264、mp4、最多 90 秒。截断 `cut` 或必需命令未执行 `skipped` 均判本次录屏失败，不能以成功录像交付。
 - 录完会回读视频的宽、高、时长，不合规格记进 `problems`，录屏阶段判失败。
-- 支持 `mode: "web"`：同一视频先显示终端提示符和启动命令输入，再显示真实 PTY 启动输出至少 8 秒，最后显示页面及明确动作至少 8 秒。仅发布到 `127.0.0.1` 的本次临时端口；启动命令用 `{host}` / `{port}` 接收地址和端口。不改命令迎合结果。以下仅示意多页方案结构，路由、selector 和预期文本必须换成实际核实的值：
+- 支持 `mode: "web"`：同一视频先显示终端提示符和启动命令输入，再显示真实 PTY 启动输出至少
+  8 秒，最后按 `pages` 覆盖全部声明页面，页面段默认至少 12 秒。仅发布到
+  `127.0.0.1` 的本次临时端口；启动命令用 `{host}` / `{port}` 接收地址和端口。不改命令迎合
+  结果。以下仅示意多页方案结构，路由、selector 和预期文本必须换成实际核实的值：
 
 ```json
 {
   "mode": "web", "setup_cmd": "make setup",
   "serve_cmd": "npm run dev -- --host {host} --port {port}",
   "url": "http://127.0.0.1:{port}/", "ready_selector": "#app", "startup_timeout": 45,
+  "pages": [
+    {"id": "home", "path": "/", "ready_selector": "#app", "min_visible_seconds": 2},
+    {"id": "details", "path": "/details", "ready_selector": "#detail", "min_visible_seconds": 2},
+    {"id": "settings", "path": "/settings", "ready_selector": "#save-status", "min_visible_seconds": 2}
+  ],
   "steps": [
-    {"action": "fill", "selector": "input[name=q]", "value": "demo"},
-    {"action": "click", "selector": "button[type=submit]"},
-    {"action": "expect_text", "selector": "#results", "text": "demo", "pause_ms": 1500},
-    {"action": "click", "selector": "#results a[data-detail]"},
-    {"action": "wait_for", "selector": "#detail", "pause_ms": 1500},
-    {"action": "click", "selector": "nav a[href='/settings']"},
-    {"action": "fill", "selector": "input[name=label]", "value": "demo-label"},
-    {"action": "click", "selector": "button[data-save]"},
-    {"action": "expect_text", "selector": "#save-status", "text": "已保存", "pause_ms": 2000}
+    {"action": "fill", "selector": "input[name=q]", "value": "demo", "page": "home"},
+    {"action": "click", "selector": "button[type=submit]", "page": "home"},
+    {"action": "expect_text", "selector": "#results", "text": "demo", "pause_ms": 1500, "page": "home"},
+    {"action": "click", "selector": "#results a[data-detail]", "page": "home"},
+    {"action": "wait_for", "selector": "#detail", "pause_ms": 1500, "page": "details"},
+    {"action": "click", "selector": "a[href='/settings']", "page": "details"},
+    {"action": "fill", "selector": "input[name=label]", "value": "demo-label", "page": "settings"},
+    {"action": "click", "selector": "button[data-save]", "page": "settings"},
+    {"action": "expect_text", "selector": "#save-status", "text": "已保存", "pause_ms": 2000, "page": "settings"}
   ]
 }
 ```
@@ -174,6 +197,9 @@ Web 工程必须录真实服务启动再到页面访问和功能操作；构建/
 - 页面动作还支持 `select`（原生下拉框的字符串 `value`）、`press`（`key`）、`wait_for`。原生下拉框使用 `select`，避免键盘模拟在不同浏览器环境中未提交选择。启动未就绪、页面错误、动作失败分别留证，不假定页面可用。
 - 每次录制位于 `record/attempts/<UUID>/`。候选视频规格合格且步骤完整才替换正式文件；失败重录保留此前合格视频及其状态。
 - setup 的网络/超时环境失败与原因不明会阻塞评价交付；只有具体编译等产物失败证据才可进入缺陷判断，不能把基础设施失败压到模型评分上。
+- 新 S11 方案必须声明 `pages`；旧 Web 方案没有 `pages` 时按单页兼容模式执行，但不能阻止
+  多页面演示缺失。`coverage_complete=false`、必需页面遗漏、页面预算不足或页面未就绪时，
+  录屏阶段失败；页面已完整覆盖但业务动作真实报错时，照常保留为产品证据。
 
 干净克隆等临时产物默认落在工作目录的 `_verification/runtime-scratch/`；可通过 `FBR_SCRATCH` 指向本次验证目录。录屏或取证成功后按 `cleanup.policy` 回收本题临时克隆，失败现场保留。取证与实跑命令使用的容器不加 `--rm`，步骤结果记录 `container_name`，默认不删除容器；目录回收不删除这些容器。
 

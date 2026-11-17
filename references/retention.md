@@ -31,7 +31,7 @@ GitHub 产物快照已推送并回读、且平台状态为 `QC_PASSED` 后才允
 
 | 触发 | 自动回收 | 必须保留 |
 | --- | --- | --- |
-| 录屏 `record` 成功 | `record/attempts/`、`containers.json`、`last-attempt.json` | `recording.mp4`、`recording.json`、`terminal.raw.log` |
+| 录屏 `record` 成功 | `record/attempts/`、`containers.json`、`last-attempt.json` | `recording.mp4`、`recording.json`、`terminal.raw.log`、`pages/` |
 | 取证 `facts` 成功 | 名称含本题 ID 的 runtime scratch 克隆 | `evidence/` 和其中的命令日志 |
 | 每次交付投影成功 | 超出 `history_keep` 的旧 `delivery-history` | 当前 `results/` 和最近一份历史快照 |
 | 本地交付封存 | 只回收失败录屏候选和本题 scratch，不删除代码现场 | `origin/`、`workspace/`、`run-tree/`、task 骨架、`run/attempts.json`、`run/key-identity.json`、`trace/`、正式录屏、`evidence/`、`review/`、`results/` |

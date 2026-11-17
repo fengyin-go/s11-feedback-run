@@ -227,7 +227,7 @@ def process_audit_errors(doc: dict, facts: dict) -> list[str]:
 
 
 def check_contract(doc: dict, task: dict, facts: dict, audit: dict, probes: list[dict]) -> list[str]:
-    """摘要真实存在不等于语义真实；此处检查可确定的出处，含义交给另一次指定模型复核。"""
+    """摘要真实存在不等于语义真实；此处检查出处，含义交给当前任务 AI 的二次复核。"""
     errors = []
     text = gate.squash(str(doc.get("feedback", "")))
     ev = gate.build_evidence(task, facts, audit, probes)

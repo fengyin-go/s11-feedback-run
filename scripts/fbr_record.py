@@ -294,6 +294,44 @@ def start_container(image: str, clone: Path, port: int | None = None) -> str:
     return name
 
 
+def load_recording_plan(task_dir: Path) -> tuple[dict, dict]:
+    plan = lib.load_json(task_dir / "recording-plan.json")
+    override = lib.load_json(
+        task_dir / "review" / "recording-plan.override.json", default={})
+    if override:
+        if (override.get("source_sha256") != lib.content_hash(plan)
+                or not override.get("authorization")
+                or not isinstance(override.get("plan"), dict)):
+            raise lib.FbrError("录屏方案覆盖缺少授权或不匹配冻结原方案")
+        plan = override["plan"]
+    return plan, override
+
+
+def validate_recording_plan(record: dict, plan: dict, cfg: dict) -> dict:
+    """Validate a plan without starting Docker or touching the workspace."""
+    if plan.get("business_demo_status") == "pending_implementation":
+        raise lib.FbrError("录屏方案仍为基础构建占位，必须补齐真实服务启动和业务演示")
+    web = plan.get("mode") == "web"
+    if web:
+        import fbr_web
+        fbr_web.validate_plan(
+            plan,
+            require_pages=record.get("producer") == "s11-gsb-prompt-create",
+        )
+        minimum = 10 + float(cfg["record"].get("page_min_seconds", 12))
+        if minimum > float(cfg["record"]["max_seconds"]):
+            raise lib.FbrError(
+                f"录屏预算不足：启动与页面最低 {minimum:g} 秒，超过总上限 "
+                f"{cfg['record']['max_seconds']} 秒"
+            )
+    else:
+        demo = [item for item in plan.get("demo", [])
+                if isinstance(item, dict) and item.get("cmd")]
+        if not demo:
+            raise lib.FbrError(f"{record['task_id']}：recording-plan.json 里没有演示命令")
+    return {"mode": "web" if web else "terminal", "plan": plan}
+
+
 @lib.task_locked
 def record_one(task_dir: Path, cfg: dict, redo: bool = False) -> dict:
     record = lib.load_task(task_dir)
@@ -302,24 +340,14 @@ def record_one(task_dir: Path, cfg: dict, redo: bool = False) -> dict:
         return {"task_id": name, "state": "skip", "detail": "已经录过"}
     commit = lib.require_stage(task_dir, "commit")["commit"]
     lib.restore_git_config(task_dir)
-    plan = lib.load_json(task_dir / "recording-plan.json")
-    override = lib.load_json(task_dir / "review" / "recording-plan.override.json", default={})
-    if override:
-        if (override.get("source_sha256") != lib.content_hash(plan)
-                or not override.get("authorization") or not isinstance(override.get("plan"), dict)):
-            raise lib.FbrError("录屏方案覆盖缺少授权或不匹配冻结原方案")
-        plan = override["plan"]
-    if plan.get("business_demo_status") == "pending_implementation":
-        raise lib.FbrError("录屏方案仍为基础构建占位，必须补齐真实服务启动和业务演示")
+    plan, override = load_recording_plan(task_dir)
+    checked_plan = validate_recording_plan(record, plan, cfg)
     plan_digest = lib.content_hash(plan)
-    web = plan.get('mode') == 'web'
+    web = checked_plan["mode"] == "web"
     web_info = {}
     if web:
         import fbr_web
-        fbr_web.validate_plan(plan)
     demo = [item for item in plan.get("demo", []) if isinstance(item, dict) and item.get("cmd")]
-    if not demo and not web:
-        raise lib.FbrError(f"{name}：recording-plan.json 里没有演示命令")
     previous_ok = lib.stage_ok(task_dir, "record")
     if not previous_ok:
         lib.set_stage(task_dir, "record", "dry", reason="正在重新录制")
@@ -370,10 +398,17 @@ def record_one(task_dir: Path, cfg: dict, redo: bool = False) -> dict:
         problems.append(f"时长 {video['duration']} 秒")
     if web and web_info.get('startup_seconds', 0) < 8:
         problems.append('真实启动段不足 8 秒')
-    if web and web_info.get('startup_ready') and web_info.get('page_seconds', 0) < 8:
-        problems.append('页面段不足 8 秒')
+    page_min_seconds = float(rec.get('page_min_seconds', 12))
+    if web and web_info.get('startup_ready') and web_info.get('page_seconds', 0) < page_min_seconds:
+        problems.append(f'页面段不足 {page_min_seconds:g} 秒')
     if web and web_info.get('startup_ready') and not web_info.get('page_segment'):
         problems.append('服务就绪但缺少页面段')
+    if web and web_info.get('page_segment') and not web_info.get('page_ready'):
+        problems.append('页面未能完成加载或就绪元素不可见')
+    if web and web_info.get('coverage_declared') and not web_info.get('coverage_complete'):
+        missing = web_info.get('missing_pages') or []
+        suffix = f"：{'、'.join(missing)}" if missing else ''
+        problems.append('页面覆盖不完整' + suffix)
     if any(step.get('skipped') or step.get('cut') for step in steps):
         problems.append('关键演示被截断或未执行，需要检查方案时长分配')
     setup_ok = not setup_cmd or (bool(setup_runs) and setup_runs[-1]["rc"] == 0)
@@ -407,6 +442,22 @@ def record_one(task_dir: Path, cfg: dict, redo: bool = False) -> dict:
             staging = out_dir / (filename + ".new")
             shutil.copy2(source, staging)
             staging.replace(out_dir / filename)
+    pages_source = attempt_dir / "pages"
+    if pages_source.is_dir():
+        pages_staging = out_dir / "pages.new"
+        shutil.rmtree(pages_staging, ignore_errors=True)
+        shutil.copytree(pages_source, pages_staging)
+        shutil.rmtree(out_dir / "pages", ignore_errors=True)
+        pages_staging.replace(out_dir / "pages")
+        for row in metadata.get("pages", []):
+            if row.get("screenshot"):
+                row["screenshot"] = f"record/pages/{Path(row['screenshot']).name}"
+        metadata["page_screenshots"] = [
+            f"record/pages/{Path(name).name}"
+            for name in metadata.get("page_screenshots", [])
+        ]
+    else:
+        shutil.rmtree(out_dir / "pages", ignore_errors=True)
     lib.save_json(out_dir / "recording.json", metadata)
     lib.set_stage(task_dir, "record", "ok", duration=video["duration"], setup_ok=setup_ok)
     failed = sum(1 for s in steps if s["rc"] not in (0, None))
@@ -420,6 +471,8 @@ def main() -> int:
     parser.add_argument("--root")
     parser.add_argument("--batch")
     parser.add_argument('--doctor', action='store_true')
+    parser.add_argument('--plan-check', action='store_true',
+                        help='只读校验录屏方案，不启动 Docker')
     parser.add_argument("--tasks")
     parser.add_argument("--redo", action="store_true")
     args = parser.parse_args()
@@ -429,10 +482,26 @@ def main() -> int:
         print(json.dumps(report, ensure_ascii=False))
         return 0 if report['ok'] else 1
     if not args.batch:
-        parser.error('必须提供 --batch 或 --doctor')
+        parser.error('必须提供 --batch、--doctor 或 --plan-check')
     try:
         root = lib.find_root(args.root)
         cfg = lib.settings(root)
+        if args.plan_check:
+            rows = []
+            for task_dir in lib.task_dirs(root, args.batch, args.tasks):
+                record = lib.load_task(task_dir)
+                try:
+                    plan, _ = load_recording_plan(task_dir)
+                    checked = validate_recording_plan(record, plan, cfg)
+                    rows.append({"task_id": task_dir.name, "state": "ready",
+                                 "mode": checked["mode"]})
+                except lib.FbrError as exc:
+                    rows.append({"task_id": task_dir.name, "state": "failed",
+                                 "detail": str(exc)})
+            for row in rows:
+                print(f"{row['task_id']}  {row['state']}  "
+                      f"{row.get('mode') or row.get('detail', '')}")
+            return 0 if all(row["state"] == "ready" for row in rows) else 1
         todo = [p for p in lib.task_dirs(root, args.batch, args.tasks) if lib.stage_ok(p, "commit")]
 
         def safe(task_dir: Path) -> dict:
