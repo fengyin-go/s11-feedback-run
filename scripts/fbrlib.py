@@ -103,7 +103,7 @@ DEFAULTS = {
         "history_keep": 1,
         "compact_record_attempts": True,
         "compact_scratch_after_facts": True,
-        "compact_task_after_local_seal": True,
+        "compact_task_after_qc_passed": True,
         "require_remote_snapshot": True,
         "purge_dependencies_on_batch_complete": True,
     },
@@ -271,6 +271,41 @@ def load_task(task_dir: Path, *, validate_layout: bool = True) -> dict:
         raise FbrError(f"task.json 的编号 {record['task_id']} 和目录名 {Path(task_dir).name} 不一致")
     validate_handoff(Path(task_dir), record, validate_layout=validate_layout)
     return record
+
+
+def task_compacted(task_dir: Path) -> bool:
+    """Return whether the live code checkout was intentionally sealed away."""
+    cleanup = load_json(Path(task_dir) / "cleanup.json", default={})
+    return cleanup.get("state") in {"local_compacted", "cleaned"}
+
+
+def load_task_readonly(task_dir: Path) -> dict:
+    """Load frozen task metadata for review, export, and submission checks.
+
+    Compaction intentionally removes origin/workspace. Read-only consumers still
+    need the immutable task contract, but must not require a live checkout.
+    """
+    task_dir = Path(task_dir)
+    return load_task(task_dir, validate_layout=not task_compacted(task_dir))
+
+
+def compacted_source_removed_ok(task_dir: Path, relative: str) -> bool:
+    """Allow a reviewed workspace source to be absent only after a valid seal."""
+    task_dir = Path(task_dir)
+    rel = Path(relative)
+    if rel.is_absolute() or ".." in rel.parts or not rel.parts or rel.parts[0] != "workspace":
+        return False
+    if not task_compacted(task_dir):
+        return False
+    snapshot = load_json(task_dir / "review/snapshot.json", default={})
+    facts = load_json(task_dir / "evidence/facts.json", default={})
+    commit = str(snapshot.get("commit") or "")
+    return bool(
+        snapshot.get("pushed") is True
+        and snapshot.get("artifact_snapshot")
+        and SHA_RE.fullmatch(commit)
+        and facts.get("commit") == commit
+    )
 
 
 def content_hash(value) -> str:

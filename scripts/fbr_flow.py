@@ -297,30 +297,15 @@ def finish_review(task, root, cfg, options):
             raise lib.FbrError('交付核查仍有缺失，来源不足不能猜值：'+(reason or (row or {}).get('数据状态','缺少有效本地行')))
     history['state']='passed';lib.save_json(target,history)
     state = fbr_attestation.validate(task, root, cfg)
-    if state['state'] == 'review_changed':
-        raise lib.FbrError(state['reason'])
     if state['valid']:
         attestation = state['attestation']
-    elif state['state'] in ('missing', 'delivery_changed'):
+    elif state['state'] in ('missing', 'delivery_changed', 'review_changed'):
         attestation = fbr_attestation.materialize(
             task, root, cfg, force=state['state'] == 'delivery_changed')
     else:
         raise lib.FbrError(state['reason'])
-    compacted = None
-    if publishing:
-        import fbr_cleanup
-        try:
-            compacted = fbr_cleanup.compact_local_task(root, options.batch, task, cfg)
-        except (lib.FbrError, OSError, ValueError) as exc:
-            compacted = {"state": "blocked", "reason": str(exc)}
-            lib.save_json(task / "review" / "retention-warning.json", {
-                "at": lib.now_iso(), "state": "blocked", "reason": str(exc),
-            })
-    suffix = ""
-    if compacted and compacted.get("state") == "ok":
-        suffix = f"，已回收 {compacted.get('bytes_removed', 0)} 字节"
     detail = '验收、快照推送及本地字段核查完成' if publishing else '本地验收完成（显式不发布）'
-    return {'task_id':task.name,'state':'ok','detail':detail + suffix}
+    return {'task_id':task.name,'state':'ok','detail':detail}
 
 
 def run_flow(root, args):

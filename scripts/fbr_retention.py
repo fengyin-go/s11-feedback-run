@@ -30,7 +30,7 @@ def enabled(cfg: dict | None, capability: str, *, force: bool = False) -> bool:
     switches = {
         "record": "compact_record_attempts",
         "scratch": "compact_scratch_after_facts",
-        "local": "compact_task_after_local_seal",
+        "local": "compact_task_after_qc_passed",
         "dependencies": "purge_dependencies_on_batch_complete",
     }
     switch = switches.get(capability)
@@ -278,13 +278,65 @@ def purge_dependencies(root: Path, cfg: dict, *, force: bool = False) -> dict:
     return row
 
 
+def _restore_checkout(task_dir: Path, name: str, url: str, commit: str,
+                      staging_root: Path, env: dict[str, str]) -> dict:
+    """Restore one clean `main` checkout without overwriting live state."""
+    target = task_dir / name
+    git_dir = target / ".git"
+    if git_dir.is_dir():
+        head = subprocess.run(
+            ["git", *lib.GIT_SAFE, "-C", str(target), "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=60, env=env,
+        )
+        branch = subprocess.run(
+            ["git", *lib.GIT_SAFE, "-C", str(target), "symbolic-ref", "--short", "HEAD"],
+            capture_output=True, text=True, timeout=60, env=env,
+        )
+        dirty = subprocess.run(
+            ["git", *lib.GIT_SAFE, "-C", str(target), "status", "--porcelain"],
+            capture_output=True, text=True, timeout=60, env=env,
+        )
+        if (head.returncode != 0 or head.stdout.strip() != commit
+                or branch.returncode != 0 or branch.stdout.strip() != "main"
+                or dirty.returncode != 0 or dirty.stdout.strip()):
+            raise lib.FbrError(f"{name} 已存在但不在预期提交或 main 分支，拒绝覆盖")
+        return {"state": "skip", "path": str(target), "commit": commit}
+    if target.exists() or target.is_symlink():
+        raise lib.FbrError(f"{name} 已存在但不是可校验的 Git 仓库，拒绝覆盖")
+    staging_root.mkdir(parents=True, exist_ok=True)
+    staging = Path(tempfile.mkdtemp(prefix=f"{task_dir.name}-{name}-", dir=staging_root))
+    clone = staging / name
+    try:
+        cloned = subprocess.run(
+            ["git", *lib.GIT_SAFE, "clone", "-q", "--no-checkout", url, str(clone)],
+            capture_output=True, text=True, timeout=300, env=env,
+        )
+        if cloned.returncode != 0:
+            raise lib.FbrError(f"恢复 {name} 失败：" + cloned.stderr.strip()[-300:])
+        configured = subprocess.run(
+            ["git", *lib.GIT_SAFE, "-C", str(clone), "config", "core.hooksPath", os.devnull],
+            capture_output=True, text=True, timeout=60, env=env,
+        )
+        if configured.returncode != 0:
+            raise lib.FbrError(f"恢复 {name} 时无法禁用 hooks")
+        checked = subprocess.run(
+            ["git", *lib.GIT_SAFE, "-C", str(clone), "checkout", "-q", "-B", "main", commit],
+            capture_output=True, text=True, timeout=180, env=env,
+        )
+        if checked.returncode != 0:
+            raise lib.FbrError(f"恢复 {name} 时检出提交失败：" + checked.stderr.strip()[-300:])
+        lib.open_permissions(clone)
+        os.replace(clone, target)
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+    return {"state": "restored", "path": str(target), "commit": commit}
+
+
 @lib.task_locked
 def ensure_workspace(task_dir: Path) -> dict:
-    """Restore a compacted task workspace from its verified public artifact snapshot."""
+    """Restore both origin and workspace for a compacted task."""
     task_dir = Path(task_dir).resolve()
     workspace = task_dir / "workspace"
-    if (workspace / ".git").is_dir():
-        return {"state": "skip", "path": str(workspace)}
     # A cleaned task intentionally has no origin/workspace/run-tree. The
     # immutable task.json still carries the prompt, baseline and handoff hash;
     # validate those while deferring the live layout check until after restore.
@@ -303,57 +355,46 @@ def ensure_workspace(task_dir: Path) -> dict:
         url = f"https://github.com/{full}.git"
     root = lib.containing_root(task_dir)
     staging_root = root / "_verification" / "workspace-restore"
-    staging_root.mkdir(parents=True, exist_ok=True)
-    staging = Path(tempfile.mkdtemp(prefix=f"{task_dir.name}-", dir=staging_root))
-    clone = staging / "workspace"
     env = dict(
         os.environ,
         GIT_CONFIG_GLOBAL=os.devnull,
         GIT_CONFIG_NOSYSTEM="1",
         GIT_TERMINAL_PROMPT="0",
     )
-    try:
-        cloned = subprocess.run(
-            ["git", *lib.GIT_SAFE, "clone", "-q", "--no-checkout", url, str(clone)],
-            capture_output=True, text=True, timeout=300, env=env,
-        )
-        if cloned.returncode != 0:
-            raise lib.FbrError("恢复 workspace 失败：" + cloned.stderr.strip()[-300:])
-        configured = subprocess.run(
-            ["git", *lib.GIT_SAFE, "-C", str(clone), "config", "core.hooksPath", os.devnull],
-            capture_output=True, text=True, timeout=60, env=env,
-        )
-        if configured.returncode != 0:
-            raise lib.FbrError("恢复 workspace 时无法禁用 hooks")
-        checked = subprocess.run(
-            ["git", *lib.GIT_SAFE, "-C", str(clone), "checkout", "-q", "-B", "main", commit],
-            capture_output=True, text=True, timeout=180, env=env,
-        )
-        if checked.returncode != 0:
-            raise lib.FbrError("恢复 workspace 时检出产物提交失败：" + checked.stderr.strip()[-300:])
-        if workspace.exists() or workspace.is_symlink():
-            raise lib.FbrError("workspace 已存在，拒绝覆盖")
-        lib.open_permissions(clone)
-        os.replace(clone, workspace)
-    finally:
-        shutil.rmtree(staging, ignore_errors=True)
-    lib.save_git_config(task_dir)
+    initial_commit = str(record.get("initial_commit") or "")
+    if not lib.SHA_RE.fullmatch(initial_commit):
+        raise lib.FbrError(f"{task_dir.name}：初始提交 SHA 不合法")
+    origin_result = _restore_checkout(
+        task_dir, "origin", url, initial_commit, staging_root, env)
+    workspace_result = _restore_checkout(
+        task_dir, "workspace", url, commit, staging_root, env)
+    if origin_result["state"] == "restored" or workspace_result["state"] == "restored":
+        lib.save_git_config(task_dir)
     cleanup_path = task_dir / "cleanup.json"
     cleanup = lib.load_json(cleanup_path, default={})
     if cleanup:
-        cleanup["workspace_restored_at"] = lib.now_iso()
+        now = lib.now_iso()
+        if workspace_result["state"] == "restored":
+            cleanup["workspace_restored_at"] = now
+        if origin_result["state"] == "restored":
+            cleanup["origin_restored_at"] = now
         cleanup["restored_from"] = {
             "repo_url": url,
-            "commit": commit,
+            "origin_commit": initial_commit,
+            "workspace_commit": commit,
             "artifact_snapshot": snapshot.get("artifact_snapshot"),
         }
         lib.save_json(cleanup_path, cleanup)
         result_cleanup = root / "results" / task_dir.parent.name / task_dir.name / "cleanup.json"
         if result_cleanup.is_file():
             lib.save_json(result_cleanup, cleanup)
+    state = ("restored" if origin_result["state"] == "restored"
+             or workspace_result["state"] == "restored" else "skip")
     return {
-        "state": "restored",
+        "state": state,
         "path": str(workspace),
         "commit": commit,
         "repo_url": url,
+        "origin": origin_result,
+        "workspace": workspace_result,
     }

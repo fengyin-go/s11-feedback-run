@@ -383,7 +383,7 @@ def _export_batch_locked(root: Path, target: Path, batch_id: str, cfg: dict) -> 
                 files = _source_files(source, feedback_sha)
                 inputs = {str(p.relative_to(source)): digest(p) for p in files}
                 gateway_key_files = []
-                for name in ("state.json", "task.json", "review/snapshot.json", "run/attempts.json"):
+                for name in ("task.json", "review/snapshot.json", "run/attempts.json"):
                     path = source / name
                     if safe_file(source, path):
                         inputs[name] = digest(path)

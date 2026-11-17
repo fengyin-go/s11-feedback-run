@@ -11,6 +11,9 @@
 - 过程句只写模型实际动作。probe、录屏、当前 AI 的验收动作和基线已有行为不能冒充模型过程。
 - 逐句复核必须检查完整后续和最终状态；无法由原文支持时标 insufficient、缩小范围或补 probe，不能猜。
 - finalize、快照发布和字段核查成功后生成 `review/attestation.json`；提交期只验证它，不重新做本阶段判断。
-- 本地交付封存且远端产物快照已回读后，按 `cleanup.policy` 自动压缩可重建代码现场；原始轨迹、录屏、证据、Feedback 和长期结果包保留。
+- 本地交付封存且远端产物快照已回读后，保留 `origin/`、`workspace/` 和
+  `run-tree/` 供 batch closeout、提交预检及等待提交使用；只有平台
+  `QC_PASSED` 后才压缩可重建代码现场。原始轨迹、录屏、证据、Feedback
+  和长期结果包始终保留。
 - 评分先看最终交付，过程问题按 scoring.md；5 分必须与正文呈现的过程一致。
 - 只加载当前需要的 `reviewer.md`、`feedback-quality.md`、`feedback-writing.md`、`feedback-language-policy.md`、`scoring.md` 和归因规范。

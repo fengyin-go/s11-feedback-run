@@ -19,7 +19,7 @@ RULE_FILES = ("references/scoring.md", "references/feedback-writing.md", "refere
               "references/feedback-language-policy.md", "references/feedback-style-lexicon.json",
               "references/process-attribution-audit.md",
               "scripts/fbr_gate.py", "scripts/fbr_quality.py",
-              "scripts/fbr_feedback.py", "scripts/fbr_reviewer.py", "scripts/fbr_style.py",
+              "scripts/fbr_style.py",
               "scripts/fbr_trace_review.py", "scripts/fbr_sources.py", "scripts/fbr_evidence.py")
 TRACE_RULE_FILES = ("scripts/fbr_trace_review.py", "scripts/fbr_sources.py", "scripts/fbr_evidence.py")
 LEGACY_TRACE_POLICIES = {
@@ -30,12 +30,23 @@ LEGACY_FEEDBACK_POLICIES = {
     "4f8b031762278016d5e63cb784fd04bc2b2f921b33b9a7dda52082fb1427f95e",
     "6a50956ab20e9c7567e9397be7e7be8d3183d84981786b9899809a6c016111d4",
     "e7f4586b18419b0ae217edcfc1e3c6a2f8192810d77b032c11b2e27378882ff2",
+    "1f8f6c16f6288ea06d5b7d16fe605ac346af7665076abf0858d7f72ba0321d67",
+    "a62622667ac8e65e791c147d511d4be8c10abe5540205cbcfbb9019c9c0399ab",
+    "06c72fe6a175664f3234d7a86cd7dae4153702aa19d9ac2d3fdeb9edcf45035a",
+    "5f53e96d45b95dddd9297b3d9c0ea5d8b76fc86e20dc1bff5599e9297a0fe4f6",
 }
 TEST_CLAUSE = re.compile(r"[^。；！？\n]*(?:测试|用例|\btest\w*|\bpytest\b)[^。；！？\n]*", re.I)
 COUNT_CLAIM = re.compile(r"(?:\d+\s*(?:条|个|项)\s*(?:测试|用例)|(?:测试|用例)[^。；]{0,8}\d+|\d+\s*(?:条|个|项)?\s*(?:全[部都]?通过|通过))")
 NEGATIVE_TEST = re.compile(r"(?:未|没有|没|未曾|并未)[^。；]{0,24}(?:测试|用例|验证)|(?:测试|用例)[^。；]{0,16}(?:未执行|没跑|未跑|未重跑|缺失)")
 PROCESS_AUDIT_CHECKS = ("full_trace", "baseline", "timeline", "source_boundary", "scope")
 PROCESS_EXTERNAL_EVIDENCE = re.compile(r"(?:独立\s*)?(?:边界\s*)?probe|验收侧|录制侧", re.I)
+PROCESS_ACCEPTANCE_ENV = re.compile(
+    r"验收(?:环境|环节)|libnspr|libnss|sudo|httpx2|"
+    r"(?:Chromium|Chrome|浏览器|页面)[^。；]{0,50}"
+    r"(?:无法启动|启动失败|依赖缺失|缺少[^。；]{0,20}(?:库|包)|安装超时|可执行环境|包解析|"
+    r"未执行|没有执行|无法执行|未能执行)",
+    re.I,
+)
 PROCESS_PAGE_ACTION = re.compile(r"浏览器操作|页面操作|实际点击|点击[^。；]{0,16}按钮")
 PROCESS_NEGATED_PAGE_ACTION = re.compile(
     r"(?:没有|未|没|并不)[^。；]{0,30}(?:浏览器|页面)?[^。；]{0,20}(?:点击|操作)[^。；]{0,20}(?:按钮|页面)"
@@ -199,6 +210,11 @@ def process_audit_errors(doc: dict, facts: dict) -> list[str]:
             errors.append(label + "缺少具体归因核对说明")
         if PROCESS_EXTERNAL_EVIDENCE.search(sentence):
             errors.append(label + "混入了独立 probe 或验收侧证据；模型过程只能写模型轨迹中的行为")
+        if PROCESS_ACCEPTANCE_ENV.search(sentence):
+            errors.append(
+                label + "混入了验收或运行环境故障；过程只能写被测模型自身的实现、判断和返工，"
+                "不能把本机依赖、浏览器缺失或验收工具问题算到模型过程"
+            )
         if PROCESS_PAGE_ACTION.search(sentence) and not browser_seen and not PROCESS_NEGATED_PAGE_ACTION.search(sentence):
             errors.append(label + "写了页面或浏览器操作，但轨迹中没有对应浏览器动作；应改写为模型实现或最终产物现象")
         if PROCESS_TIMELINE.search(sentence) and isinstance(checks, dict) and checks.get("timeline") is not True:

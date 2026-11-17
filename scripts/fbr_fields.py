@@ -32,7 +32,7 @@ def source(task, item):
 
 def effective_record(task):
     task = Path(task)
-    record = lib.load_task(task)
+    record = lib.load_task_readonly(task)
     path = task / REVISIONS
     if path.is_symlink():
         raise lib.FbrError('字段修订文件不能是符号链接')

@@ -10,7 +10,7 @@ Feedback 的过程句只描述被测模型在这次轨迹中做了什么、为�
 
 2. **验收证据混入模型过程**
 
-   `evidence/probes.jsonl`、录屏和当前任务 AI 的验收动作不在模型轨迹里。过程句不得出现“独立 probe”“边界 probe”“验收侧”等结果并把它接到模型主语链上。probe 只用于 `results`、`issues`、`score_basis` 和逐句来源。
+   `evidence/probes.jsonl`、录屏和当前任务 AI 的验收动作不在模型轨迹里。过程句不得出现“独立 probe”“边界 probe”“验收侧”等结果并把它接到模型主语链上。probe 只用于 `results`、`issues`、`score_basis` 和逐句来源。验收机器的浏览器、Chromium/系统库、`sudo`、`httpx2`、安装超时和端口问题同样不能写成模型过程；这些不是被测模型完成题目的业务行为。
 
 3. **页面操作幻觉**
 

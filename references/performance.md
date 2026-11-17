@@ -8,9 +8,9 @@
 
 批次提交前的结果写在 `results/<批次>/batch-closeout.json`，包含每题凭证摘要、来源摘要、内容摘要、SessionID、领域和查重结论。只有 `ready` 才允许整批上传；单题失败只让该题回到执行期评价或交付修复。
 
-回收使用三个边界：阶段成功、交付投影成功和批次终止，详细规则见 [retention.md](retention.md)。录屏成功后只保留正式视频和元数据；取证成功后回收本题 scratch；每次 `results` 投影成功后把 `delivery-history` 限制为 `cleanup.history_keep` 份；本地交付封存后压缩 `origin/workspace/run-tree`。平台返回 `QC_PASSED` 后，清理 worker 再回读详情，校验结果投影、轨迹、录屏和平台附件摘要，写入最终 `retention.json` 与 `cleanup.json`。
+回收使用三个边界：阶段成功、交付投影成功和批次终止，详细规则见 [retention.md](retention.md)。录屏成功后只保留正式视频和元数据；取证成功后回收本题 scratch；每次 `results` 投影成功后把 `delivery-history` 限制为 `cleanup.history_keep` 份。本地交付封存不删除 `origin/workspace/run-tree/`；平台返回 `QC_PASSED` 后，清理 worker 再回读详情，校验结果投影、轨迹、录屏和平台附件摘要，写入最终 `retention.json` 与 `cleanup.json`，然后删除可重建代码现场。
 
-依赖缓存不在单题清理范围内，只在整批没有活动任务且所有任务都进入 `local_compacted`、`cleaned` 或 `abandoned` 后由批次维护回收。依赖缓存可以按身份重建，回收后不影响现有证据和平台提交；下一次同基线任务会重新准备。`cleanup.policy` 分 `safe`、`balanced`、`minimal`，默认 `minimal`；`--no-publish` 只停用代码现场压缩，阶段 scratch 和历史裁剪仍可执行。任何删除先进入 `_verification/cleanup-trash/`，验证或记账失败时保留现场。
+依赖缓存不在单题清理范围内，只在整批没有活动任务且所有任务都进入 `cleaned`、`abandoned` 或旧批次兼容的 `local_compacted` 后由批次维护回收。依赖缓存可以按身份重建，回收后不影响现有证据和平台提交；下一次同基线任务会重新准备。`cleanup.policy` 分 `safe`、`balanced`、`minimal`，默认 `minimal`；`--no-publish` 同样不会在提交前删除代码现场，阶段 scratch 和历史裁剪仍可执行。任何删除先进入 `_verification/cleanup-trash/`，验证或记账失败时保留现场。
 
 仅轨迹分析调用 reviewer.env；过程证据核查、产物验收、评分、Feedback 和修复均由推进任务的当前 AI 完成，不指定模型或推理强度。轨迹未变化可复用分析；当前 AI 核实的过程断言及引用未变化可复用证据核查；产物和评分变化仍须当前 AI 重新核对。
 

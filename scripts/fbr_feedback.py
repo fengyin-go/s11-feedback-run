@@ -274,7 +274,7 @@ def load_probes(task_dir: Path) -> list[dict]:
 
 
 def load_evidence(task_dir: Path) -> tuple[dict, dict]:
-    record = lib.load_task(task_dir)
+    record = lib.load_task_readonly(task_dir)
     lib.require_stage(task_dir, "facts")
     facts = lib.load_json(Path(task_dir) / "evidence" / "facts.json")
     if facts.get('source_identity'):
@@ -469,13 +469,6 @@ def probe_many(task_dir, cfg, requests, with_setup=True):
             shutil.copy2(done['output_file'],target)
             row.update(output_file=str(target.relative_to(task_dir)),output_sha256=done.get('output_sha256'))
         lib.append_jsonl(task_dir/'evidence/probes.jsonl',row);outputs.append(row)
-    if lib.load_json(task_dir / 'cleanup.json', default={}).get('state') == 'local_compacted':
-        try:
-            import fbr_cleanup
-            fbr_cleanup.compact_local_task(
-                lib.containing_root(task_dir), task_dir.parent.name, task_dir, cfg)
-        except (lib.FbrError, OSError, ValueError):
-            pass
     return outputs
 
 

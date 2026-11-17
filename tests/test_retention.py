@@ -20,19 +20,42 @@ import fbrlib as lib
 class LocalCompaction(SubmitCase):
     def sealed(self):
         task = self.ready()
-        manifest = delivery.export_batch(self.root, BATCH, self.cfg)
-        self.assertIn(task.name, {row["task_id"] for row in manifest["tasks"]})
         lib.save_json(task / "run/attempts.json", [{"verdict": "ok"}])
         lib.save_json(task / "run/key-identity.json",
                       {"sha256": hashlib.sha256(KEY.encode()).hexdigest()})
         (task / "origin").mkdir(exist_ok=True)
         write(task / "origin/cache.bin", "origin")
+        (task / "run-tree").mkdir(exist_ok=True)
+        write(task / "run-tree/cache.bin", "run tree")
         write(task / "run/debug.log", "temporary run log")
         write(task / "record/attempts/old/raw.webm", "old candidate")
         return task
 
-    def test_local_seal_compacts_rebuildable_data_and_keeps_evidence(self):
+    def qc_passed(self, task):
+        manifest = delivery.export_batch(self.root, BATCH, self.cfg)
+        self.assertIn(task.name, {row["task_id"] for row in manifest["tasks"]})
+        lib.save_json(task / "review/upload.json", {
+            "state": "confirmed",
+            "submission_id": "12345",
+            "remote_status": "QC_PASSED",
+        })
+        return manifest
+
+    def test_pre_submit_local_seal_keeps_code_checkouts(self):
         task = self.sealed()
+        manifest = delivery.export_batch(self.root, BATCH, self.cfg)
+        self.assertIn(task.name, {row["task_id"] for row in manifest["tasks"]})
+        result = fbr_cleanup.compact_local_task(
+            self.root, BATCH, task, self.cfg)
+        self.assertEqual(result["state"], "blocked")
+        self.assertIn("尚未完成平台提交", result["reason"])
+        self.assertTrue((task / "origin").is_dir())
+        self.assertTrue((task / "workspace").is_dir())
+        self.assertTrue((task / "run-tree").is_dir())
+
+    def test_qc_passed_compaction_keeps_evidence(self):
+        task = self.sealed()
+        self.qc_passed(task)
         result = fbr_cleanup.compact_local_task(
             self.root, BATCH, task, self.cfg)
         self.assertEqual(result["state"], "ok", result)
@@ -45,7 +68,7 @@ class LocalCompaction(SubmitCase):
         self.assertTrue((task / "evidence/facts.json").is_file())
         self.assertTrue((task / "review/feedback.json").is_file())
         cleanup = lib.load_json(task / "cleanup.json")
-        self.assertEqual(cleanup["state"], "local_compacted")
+        self.assertEqual(cleanup["state"], "cleaned")
         artifact = delivery.delivery_dir(self.root, BATCH) / task.name
         self.assertTrue((artifact / "retention.json").is_file())
         self.assertTrue((artifact / "cleanup.json").is_file())
@@ -57,30 +80,28 @@ class LocalCompaction(SubmitCase):
         snapshot = lib.load_json(task / "review/snapshot.json")
         snapshot.update(pushed=False, artifact_snapshot="")
         lib.save_json(task / "review/snapshot.json", snapshot)
+        self.qc_passed(task)
         result = fbr_cleanup.compact_local_task(
             self.root, BATCH, task, self.cfg)
         self.assertEqual(result["state"], "blocked")
         self.assertTrue((task / "workspace").is_dir())
         self.assertTrue((task / "origin").is_dir())
 
-    def test_cleaned_task_can_load_frozen_record_for_workspace_hydration(self):
+    def test_cleaned_task_can_load_frozen_record_without_live_checkouts(self):
         task = self.sealed()
+        self.qc_passed(task)
         self.assertEqual(
             fbr_cleanup.compact_local_task(self.root, BATCH, task, self.cfg)["state"],
             "ok",
         )
-        with self.assertRaisesRegex(lib.FbrError, "缺少独立 origin 克隆"):
-            lib.load_task(task)
-        frozen = lib.load_task(task, validate_layout=False)
+        self.assertTrue(lib.task_compacted(task))
+        frozen = lib.load_task_readonly(task)
         self.assertEqual(frozen["task_id"], task.name)
-        self.assertEqual(frozen["handoff_hash"],
-                         lib.content_hash(lib.handoff_payload(
-                             frozen,
-                             lib.load_json(task / "recording-plan.json"),
-                         )))
+        self.assertTrue(frozen["prompt"])
 
     def test_compaction_never_re_exports_a_stale_manifest(self):
         task = self.sealed()
+        self.qc_passed(task)
         manifest_path = delivery.delivery_dir(self.root, BATCH) / "delivery-manifest.json"
         manifest = lib.load_json(manifest_path)
         manifest["tasks"] = []
@@ -95,10 +116,12 @@ class LocalCompaction(SubmitCase):
 
     def test_local_compacted_projection_restores_without_upload_receipt(self):
         task = self.sealed()
+        self.qc_passed(task)
         self.assertEqual(
             fbr_cleanup.compact_local_task(self.root, BATCH, task, self.cfg)["state"],
             "ok",
         )
+        (task / "review/upload.json").unlink()
         target = delivery.delivery_dir(self.root, BATCH)
         snapshot = self.root / "_verification/delivery-history" / f"{BATCH}-local"
         shutil.copytree(target, snapshot)
@@ -114,6 +137,7 @@ class LocalCompaction(SubmitCase):
 
     def test_disabled_policy_never_deletes(self):
         task = self.sealed()
+        self.qc_passed(task)
         cfg = {**self.cfg, "cleanup": {
             **self.cfg["cleanup"], "policy": "safe",
         }}
@@ -133,9 +157,39 @@ class LocalCompaction(SubmitCase):
         record["publish"]["repo_url"] = remote.as_uri()
         lib.save_json(task / "task.json", record)
         shutil.rmtree(task / "workspace")
+        shutil.rmtree(task / "origin")
         lib.restore_git_config(task)
         self.assertEqual(sh(task / "workspace", "rev-parse", "HEAD"), snapshot["commit"])
         self.assertTrue((task / "workspace/.git").is_dir())
+
+    def test_hydration_restores_origin_and_workspace_together(self):
+        task = self.sealed()
+        record = lib.load_task(task)
+        snapshot = lib.load_json(task / "review/snapshot.json")
+        remote = self.tmp / "hydrate-remote.git"
+        sh(self.tmp, "init", "--bare", "-q", str(remote))
+        sh(task / "workspace", "push", "-q", str(remote),
+           f"{record['initial_commit']}:refs/heads/base")
+        sh(task / "workspace", "push", "-q", str(remote),
+           f"{snapshot['commit']}:refs/heads/main")
+        self.qc_passed(task)
+        record["publish"]["repo_url"] = remote.as_uri()
+        lib.save_json(task / "task.json", record)
+        self.assertEqual(
+            fbr_cleanup.compact_local_task(self.root, BATCH, task, self.cfg)["state"],
+            "ok",
+        )
+        self.assertFalse((task / "origin").exists())
+        self.assertFalse((task / "workspace").exists())
+        result = fbr_cleanup.hydrate_task(self.root, BATCH, task.name)
+        self.assertEqual(result["state"], "restored", result)
+        self.assertTrue((task / "origin/.git").is_dir())
+        self.assertTrue((task / "workspace/.git").is_dir())
+        self.assertEqual(sh(task / "origin", "rev-parse", "HEAD"),
+                         record["initial_commit"])
+        self.assertEqual(sh(task / "workspace", "rev-parse", "HEAD"),
+                         snapshot["commit"])
+        self.assertEqual(lib.load_task(task)["task_id"], task.name)
 
 
 class StageCompaction(Sandbox):

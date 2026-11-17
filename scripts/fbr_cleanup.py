@@ -294,6 +294,17 @@ def _task_active(task_dir: Path) -> str:
     return ""
 
 
+def _code_cleanup_blocker(task_dir: Path) -> str:
+    """Code checkouts may disappear only after the platform has accepted delivery."""
+    receipt = lib.load_json(task_dir / "review/upload.json", default={})
+    if receipt.get("state") != "confirmed" or not fbr_submit.valid_id(
+            receipt.get("submission_id")):
+        return "尚未完成平台提交，代码现场仍需保留给批检、预检和等待提交阶段"
+    if receipt.get("remote_status") != "QC_PASSED":
+        return f"平台状态不是 QC_PASSED：{receipt.get('remote_status') or '未回读'}"
+    return ""
+
+
 def _cleanup_candidates(root: Path, task_dir: Path) -> list[Path]:
     candidates = [task_dir / "origin", task_dir / "workspace", task_dir / "run-tree"]
     run_dir = task_dir / "run"
@@ -383,7 +394,7 @@ def _local_seal_problems(root: Path, batch_id: str, task_dir: Path,
 @lib.task_locked
 def compact_local_task(root: Path, batch_id: str, task_dir: Path, cfg: dict,
                        *, force: bool = False) -> dict:
-    """Compact rebuildable task data after local delivery is sealed."""
+    """Compact rebuildable task data only after platform QC has passed."""
     root = Path(root).resolve()
     task_dir = Path(task_dir).resolve()
     if not retention.enabled(cfg, "local", force=force):
@@ -391,6 +402,14 @@ def compact_local_task(root: Path, batch_id: str, task_dir: Path, cfg: dict,
     cleanup = lib.load_json(task_dir / "cleanup.json", default={})
     if cleanup.get("state") == "cleaned":
         return {"task_id": task_dir.name, "state": "skip", "bytes_removed": 0, "reason": "已经清理"}
+    platform_blocker = _code_cleanup_blocker(task_dir)
+    if platform_blocker:
+        return {
+            "task_id": task_dir.name,
+            "state": "blocked",
+            "bytes_removed": 0,
+            "reason": platform_blocker,
+        }
     manifest = lib.load_json(
         delivery.delivery_dir(root, batch_id) / "delivery-manifest.json", default={})
     if not manifest.get("batch_id"):
@@ -420,19 +439,16 @@ def compact_local_task(root: Path, batch_id: str, task_dir: Path, cfg: dict,
     candidates = _cleanup_candidates(root, task_dir)
     if not candidates:
         return {"task_id": task_dir.name, "state": "skip", "bytes_removed": 0, "reason": "没有可回收现场"}
-    record = lib.load_task(task_dir)
+    record = lib.load_task_readonly(task_dir)
     snapshot = lib.load_json(task_dir / "review/snapshot.json", default={})
-    _write_retention(root, task_dir, manifest, record, state="local_sealed")
+    receipt = lib.load_json(task_dir / "review/upload.json", default={})
+    _write_retention(root, task_dir, manifest, record, receipt, state="qc_cleaned")
     _verify_retention(root, task_dir.name, batch_id)
     removed = _safe_remove(
         root, task_dir, candidates,
-        {
-            "submission_id": "",
-            "remote_status": "local_sealed",
-            "artifact_snapshot": snapshot.get("artifact_snapshot"),
-        },
-        state="local_compacted",
-        reason="本地交付封存且产物快照已推送",
+        receipt,
+        state="cleaned",
+        reason="平台 QC_PASSED 且产物快照已推送",
     )
     return {
         "task_id": task_dir.name,
@@ -484,6 +500,9 @@ def maintain_batch(root: Path, batch_id: str, cfg: dict, *,
                 state, reason = "blocked", "缺少交付清单"
             else:
                 problems = _local_seal_problems(root, batch_id, task_dir, manifest, cfg)
+                platform_blocker = _code_cleanup_blocker(task_dir)
+                if platform_blocker:
+                    problems.append(platform_blocker)
                 state = "ready" if not problems and candidates else "blocked"
                 reason = "；".join(dict.fromkeys(problems)) if problems else (
                     "" if candidates else "没有可回收现场"
@@ -629,7 +648,7 @@ def prune_batch(root: Path, batch_id: str, tasks: str | None = None, *, execute:
             detail = client.detail(receipt["submission_id"])
             if detail.get("status") != "QC_PASSED":
                 continue
-            task = lib.load_task(task_dir)
+            task = lib.load_task_readonly(task_dir)
             _write_retention(root, task_dir, manifest, task, receipt, detail)
             _verify_retention(root, task_dir.name, batch_id)
             candidates = _cleanup_candidates(root, task_dir)

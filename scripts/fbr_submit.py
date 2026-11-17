@@ -260,7 +260,7 @@ def plan_from_row(root: Path, task_dir: Path, row: dict, manifest: dict) -> dict
     # source inventory too, otherwise a stale projection can validate an old receipt.
     source_files = delivery._source_files(task_dir, entry.get("feedback_sha", ""))
     inputs = {str(p.relative_to(task_dir)): delivery.digest(p) for p in source_files}
-    for name in ("state.json", "task.json", "review/snapshot.json", "run/attempts.json"):
+    for name in ("task.json", "review/snapshot.json", "run/attempts.json"):
         path = task_dir / name
         if delivery.safe_file(task_dir, path):
             inputs[name] = delivery.digest(path)
@@ -276,7 +276,7 @@ def plan_from_row(root: Path, task_dir: Path, row: dict, manifest: dict) -> dict
     video = checked_file(root, task_dir.name, "record/recording.mp4", manifest)
     data = scalar_payload(row)
     if ids.get("continuations"):
-        actual = fbr_trace.read_ids(task_dir / "trace/projects", lib.load_task(task_dir)["prompt"],
+        actual = fbr_trace.read_ids(task_dir / "trace/projects", lib.load_task_readonly(task_dir)["prompt"],
                                     lib.require_stage(task_dir, "run").get("continuations", []))
         if actual["problems"] or any(actual.get(k) != ids.get(k) for k in
                                       ("session_id", "prompt_id", "user_turns", "continuations")):

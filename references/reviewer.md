@@ -73,7 +73,7 @@ fbr_reviewer.py finalize --batch b1110-01 --task s11-000123 --candidate /绝对�
 
 正文语言先按 feedback-language-policy.md 写，再运行 build/lint。内部术语必须落到用户动作、条件或结果，例如写清“上次处理到哪条记录”“页面请求实际落到哪个接口”；不写公司黑话、抽象名词清单和“均已实现/完成”式收口。`language_review.criterion_sentence` 必须逐字出现在正文，词表命中由 `review/style-report.json` 给出，不能自动换词后跳过证据复核。
 
-每个 `process` 句先写真实 `steps` 和 `evidence`：工具 evidence 的 step 必须属于该句 steps，field 只能是 tool/target/output/error，excerpt 必须落在该步骤的真实字段中；没有工具的特殊会话使用 assistant evidence。之后还要在同序的 `process_audit` 中完成五项归因检查：`full_trace`、`baseline`、`timeline`、`source_boundary`、`scope`。验收 probe、录屏和当前 AI 的页面点击只能支撑结果或问题，不能接到模型主语链上；若轨迹中没有浏览器动作，过程句也不能写模型“点击”或“页面操作”。基线已有行为、后续修改造成的回归、绝对化范围表述和“收尾”等时序表述分别按 [process-attribution-audit.md](process-attribution-audit.md) 回查。
+每个 `process` 句先写真实 `steps` 和 `evidence`：工具 evidence 的 step 必须属于该句 steps，field 只能是 tool/target/output/error，excerpt 必须落在该步骤的真实字段中；没有工具的特殊会话使用 assistant evidence。之后还要在同序的 `process_audit` 中完成五项归因检查：`full_trace`、`baseline`、`timeline`、`source_boundary`、`scope`。验收 probe、录屏和当前 AI 的页面点击只能支撑结果或问题，不能接到模型主语链上；验收环境中的 Chromium/系统库、`sudo`、`httpx2`、安装超时和端口问题也不能写成模型过程。若轨迹中没有浏览器动作，过程句也不能写模型“点击”或“页面操作”。基线已有行为、后续修改造成的回归、绝对化范围表述和“收尾”等时序表述分别按 [process-attribution-audit.md](process-attribution-audit.md) 回查。
 
 评分与过程描述必须同向。5 分要求正文也呈现出接近一次性完美跑通；如果正文如实写了错误验证、错判、核心实现返工，或关键竞争没有真正复核，即使最后修好，也最高 4 分，并用 process_issue 说明最终交付可用但过程不完美。不要为了保 5 分删除这些真实经历。
 

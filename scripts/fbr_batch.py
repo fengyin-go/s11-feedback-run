@@ -124,7 +124,8 @@ def print_status(rows: list[dict], batch_id: str) -> None:
 
 
 def task_section(root: Path, task_dir: Path, batch_path: Path, artifact_dir: Path | None = None) -> str:
-    record = lib.load_json(artifact_dir / "task-summary.json") if artifact_dir else lib.load_task(task_dir)
+    record = (lib.load_json(artifact_dir / "task-summary.json")
+              if artifact_dir else lib.load_task_readonly(task_dir))
     source = artifact_dir or task_dir
     facts = lib.load_json(source / "evidence" / "facts.json", default={})
     audit = lib.load_json(source / "evidence" / "audit.json", default={})

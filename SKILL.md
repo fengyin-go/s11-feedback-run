@@ -68,7 +68,11 @@ fbr_flow.py run --batch b1110-01 \
 
 同一平台账号的上次写请求时间持久化在 `~/.codex/solo11/runtime/platform-write-pacing-<账号摘要>.json`。脚本退出、resume、换批次或手工补交后仍继续按上次时间计算。建单明确遇到 429 时优先使用 `Retry-After`，否则按 15、30、45 秒退避；每次重投前按 SessionID 回查，发现已建单就直接回读，不重复 POST。其他 5xx、超时和结果未知仍保留 `uncertain`，不自动重试。
 
-默认启用 `cleanup.policy=minimal`：录屏成功后回收候选，取证成功后回收本题 scratch，每次交付成功后历史快照只保留 `history_keep` 份，本地交付封存后删除可重建代码现场，批次终止后再回收依赖缓存。平台滚动提交确认后也会继续轮询 `QC_PASSED` 并完成最终清理。完整约束见 [retention.md](references/retention.md)。
+默认启用 `cleanup.policy=minimal`：录屏成功后回收候选，取证成功后回收本题 scratch，
+每次交付成功后历史快照只保留 `history_keep` 份；本地交付封存、批次 closeout
+和提交预检期间保留 `origin/`、`workspace/`、`run-tree/`。只有平台实时状态为
+`QC_PASSED` 后，才删除可重建代码现场，批次终止后再回收依赖缓存。完整约束见
+[retention.md](references/retention.md)。
 
 ```bash
 fbr_flow.py run --batch b1110-01 \
@@ -79,9 +83,12 @@ fbr_flow.py run --batch b1110-01 \
 
 单题最终清理只有同时满足以下条件才会写入 `cleaned`：平台实时详情为 `QC_PASSED`、本地回执为 `confirmed`、当前正文/附件/轨迹摘要与回执一致、结果投影全部通过 SHA256 校验、任务没有活动进程。`QC_RUNNING` 会继续轮询；`PENDING_FIX`、`uncertain`、摘要漂移或活动任务只报阻塞。轮询间隔由 `--cleanup-poll-seconds` 控制，默认 60 秒。
 
-清理前把产物快照、题面与复现字段、录屏方案、尝试摘要、diff 和文件摘要归档到 `results/<批次>/<任务>/retention.json`；平台清理时再补 `platform/` 回执。随后删除 `origin/`、`workspace/`、`run-tree/`、大体积 `run/` 现场、失败录屏候选和映射到该题的 runtime scratch；原始轨迹、录屏、证据、Feedback、平台回执和小型任务骨架保留。
+清理前把产物快照、题面与复现字段、录屏方案、尝试摘要、diff 和文件摘要归档到 `results/<批次>/<任务>/retention.json`；平台清理时再补 `platform/` 回执。只有平台 `QC_PASSED` 后才删除 `origin/`、`workspace/`、`run-tree/`、大体积 `run/` 现场、失败录屏候选和映射到该题的 runtime scratch；原始轨迹、录屏、证据、Feedback、平台回执和小型任务骨架保留。
 
-本地封存要求全部阶段通过、长期结果包摘要有效、无活动进程，并要求 GitHub 快照已推送和回读。`--no-publish` 自动禁止删除代码现场。需要重新做代码 probe 时运行 `fbr_cleanup.py hydrate`，从远端 `artifact_snapshot` 恢复 workspace；结束时流程会再次压缩。
+本地封存要求全部阶段通过、长期结果包摘要有效、无活动进程，并要求 GitHub
+快照已推送和回读；封存本身不删除代码现场。`--no-publish` 同样不会删除代码现场。
+需要重新做代码 probe 时运行 `fbr_cleanup.py hydrate`，同时恢复 `origin` 和
+`workspace`；该操作不改变提交前保留策略。
 
 ```
 fbr_run.py preflight                 R0  镜像、版本、context 上限、key、本机依赖
@@ -108,7 +115,7 @@ fbr_batch.py upload --batch …            平台演练；真提交要 --execute
 fbr_sheet.py --batch …                   回执有效时回填远端媒体、实际提交人/时间
 fbr_cleanup.py audit --batch …           只读盘点 QC_PASSED 清理候选
 fbr_cleanup.py maintain --batch …        预览分阶段回收、历史裁剪和批次缓存回收
-fbr_cleanup.py hydrate --batch … --task …  从已推送产物快照恢复 workspace
+fbr_cleanup.py hydrate --batch … --task …  从已推送产物快照恢复 origin 与 workspace
 fbr_cleanup.py restore --batch …         从完整 history 恢复被后续规则缩掉的冻结投影
 fbr_cleanup.py prune --batch …           预览清理，不删除
 fbr_cleanup.py verify --batch …          校验已清理任务的长期结果包
@@ -236,6 +243,9 @@ Feedback 的硬底线：
 - “模型”只在第一次明确主体时出现一次，后续用“它”承接或省略主语。正文不写“轨迹显示”“录屏中”“证据表明”等取证口吻。
 - 结果先按需求说明用户可观察的完成、部分完成、缺失和问题；过程最多 3 句，只保留最有解释力的真实失败、修正和最终影响。已修正的小问题不自动扣分，验证不足不等于功能失败。
 - 每个问题句和过程句必须有真实锚点。过程 evidence 必须落在指定步骤的真实输入/输出；逐句复核必须回到同一原始区间并检查完整后续和最终状态。
+- 过程段只能写被测模型在完成题面时的实现、判断、验证和返工。验收侧的 probe、录屏、
+  Chromium/系统库、sudo、httpx2、浏览器安装或本地页面测试问题不得写成模型行为，
+  也不得据此扣分或写明“未执行”。
 - 5 分必须与正文呈现一致；正文若写出首测失败、错误断言、核心返工或关键竞争未验证，最高 4 分。
 - 正文自然、具体，不写公司黑话、抽象名词清单、空泛完成度和机器报告字段；统一规则见 `feedback-language-policy.md` 和 `feedback-style-lexicon.json`。测试数量必须绑定同次输出，不能拿全仓总数代替本题行为。
 - `language_review.criterion_sentence` 必须逐字出现在正文，说明本轮最看重的业务约束；词表命中必须改写后重新核对证据，不能自动换词。

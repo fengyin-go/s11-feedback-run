@@ -49,6 +49,23 @@ class DeliveryFields(SheetCase):
             self.assertEqual(fbr_flow.review_task(task,self.root,self.cfg,options)['state'],'ok')
         self.assertEqual(events,['acceptance','sheet','push','sheet'])
 
+    def test_review_changed_after_finalize_materializes_current_attestation(self):
+        task = self.gated()
+        options = SimpleNamespace(batch=task.parent.name, publish=False, auto_submit=False,
+                                  delivery_lock=threading.Lock())
+        with mock.patch.object(fbr_sheet,'write_sheet'), \
+             mock.patch.object(fbr_sheet,'build_row',return_value=({'数据状态':'可提交'},'')), \
+             mock.patch.object(fbr_sheet,'row_problems',return_value=[]), \
+             mock.patch.object(
+                 fbr_attestation,'validate',
+                 return_value={'valid':False,'state':'review_changed','reason':'review updated'}), \
+             mock.patch.object(
+                 fbr_attestation,'materialize',
+                 return_value={'state':'accepted'}) as materialize:
+            result = fbr_flow.finish_review(task,self.root,self.cfg,options)
+        self.assertEqual(result['state'],'ok')
+        materialize.assert_called_once()
+
     def test_failed_acceptance_requests_repair_without_pushing(self):
         task=self.gated()
         options=SimpleNamespace(batch=task.parent.name,publish=True,auto_submit=False,

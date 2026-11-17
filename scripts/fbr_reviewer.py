@@ -224,7 +224,13 @@ def provenance_errors(task: Path) -> list[str]:
         return ["轨迹或验收证据变化，须重新验收"]
     for name, digest in receipt.get('source_inputs', {}).items():
         path = task/name
-        if path.is_symlink() or not path.is_file() or file_sha(path) != digest:
+        if path.is_symlink():
+            return ['逐句复核的原始来源已变化：'+name]
+        if not path.is_file():
+            if lib.compacted_source_removed_ok(task, name):
+                continue
+            return ['逐句复核的原始来源已变化：'+name]
+        if file_sha(path) != digest:
             return ['逐句复核的原始来源已变化：'+name]
     errors = quality.certificate_errors(task, receipt)
     if errors:

@@ -107,7 +107,12 @@ fbr_sheet.py --batch b1110-01 --stop
 
 `review/upload.json` 必须是已回读确认、绑定当前交付摘要和全部字段的回执，才会回填远端媒体、实际账号和时间；旧占位字符串、正文变化、附件变化都不能冒充已提交。重新演练已有提交会刷新平台质检状态；没有回读到最终质检结论时，保持平台实际状态。不会自动返修、删除或覆盖远端记录。
 
-本地交付封存时先写 `cleanup.json` 的 `local_compacted` 状态和 `retention.json`，只删除可重建代码现场；平台实时 `QC_PASSED` 后再升级为 `cleaned` 并写批次 `cleanup-manifest.json`。`results/<批次>/<任务>/retention.json`、`platform/upload.json`、`platform/snapshot.json` 及原始轨迹、录屏、证据、Feedback 始终保留。结果表分别显示“本地已封存”或“已提交 / QC_PASSED / 已清理”，不会删除整题记录。
+本地交付封存只写冻结结果，不删除 `origin/`、`workspace/` 或 `run-tree/`；
+这些目录要继续供 batch closeout、提交预检和等待提交使用。只有平台实时
+`QC_PASSED` 后才写 `cleaned`、`retention.json` 和批次
+`cleanup-manifest.json`，再删除可重建代码现场。`results/<批次>/<任务>/retention.json`、
+`platform/upload.json`、`platform/snapshot.json` 及原始轨迹、录屏、证据、Feedback
+始终保留。结果表分别显示“本地已封存”或“已提交 / QC_PASSED / 已清理”，不会删除整题记录。
 
 ## 本地交付清单
 

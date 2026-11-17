@@ -35,8 +35,9 @@ DELIVERY_FILES = (
     "record/recording.mp4",
     "record/recording.json",
     "run/attempts.json",
-    "state.json",
 )
+
+LEGACY_DELIVERY_INPUTS = {"state.json"}
 
 
 def path(task: Path) -> Path:
@@ -222,7 +223,13 @@ def validate(task: Path, root: Path, cfg: dict, *, manifest: dict | None = None)
                 "attestation": document,
             }
         delivery_inputs = _delivery_hashes(task)
-        if delivery_inputs != document.get("delivery_inputs"):
+        recorded_delivery = document.get("delivery_inputs")
+        comparable_delivery = (
+            {key: value for key, value in recorded_delivery.items()
+             if key not in LEGACY_DELIVERY_INPUTS}
+            if isinstance(recorded_delivery, dict) else {}
+        )
+        if delivery_inputs != comparable_delivery:
             return {
                 "valid": False,
                 "state": "delivery_changed",
@@ -236,7 +243,10 @@ def validate(task: Path, root: Path, cfg: dict, *, manifest: dict | None = None)
             raise lib.FbrError(reason)
         if lib.content_hash(review_inputs) != document.get("review_digest"):
             raise lib.FbrError("评审凭证内部摘要不一致")
-        if lib.content_hash(delivery_inputs) != document.get("delivery_digest"):
+        allowed_delivery_digests = {lib.content_hash(delivery_inputs)}
+        if isinstance(recorded_delivery, dict):
+            allowed_delivery_digests.add(lib.content_hash(recorded_delivery))
+        if document.get("delivery_digest") not in allowed_delivery_digests:
             raise lib.FbrError("交付凭证内部摘要不一致")
         plan = _plan(task, root, cfg, manifest)
         feedback = lib.load_json(task / "review/feedback.json")
@@ -254,6 +264,13 @@ def validate(task: Path, root: Path, cfg: dict, *, manifest: dict | None = None)
         }
         for key, value in checks.items():
             if document.get(key) != value:
+                if key in {"source_digest", "content_digest", "artifact_snapshot"}:
+                    return {
+                        "valid": False,
+                        "state": "delivery_changed",
+                        "reason": "交付投影发生变化，需要重做交付核查",
+                        "attestation": document,
+                    }
                 raise lib.FbrError(f"评审凭证与当前交付不一致：{key}")
         return {"valid": True, "state": "accepted", "reason": "", "attestation": document}
     except (lib.FbrError, KeyError, OSError, TypeError, ValueError) as exc:

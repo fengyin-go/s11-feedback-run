@@ -221,6 +221,24 @@ class ProcessAudit(unittest.TestCase):
         self.assertTrue(any("独立 probe" in error for error in
                             quality.process_audit_errors(doc, self.facts())))
 
+    def test_acceptance_environment_failure_cannot_be_model_process(self):
+        for sentence in (
+            "模型因缺少 libnspr4 无法启动浏览器",
+            "模型运行接口检查时发现 httpx2 未安装",
+            "模型在验收环境中遇到 sudo 不可用",
+            "模型最终没有完成验证，页面端到端流程仍未执行",
+        ):
+            doc = self.doc(sentence)
+            doc["process_audit"][0]["sentence"] = doc["process"][0]["sentence"]
+            errors = quality.process_audit_errors(doc, self.facts(browser=True))
+            self.assertTrue(any("验收或运行环境故障" in error for error in errors))
+
+    def test_model_browser_implementation_is_not_mistaken_for_environment_failure(self):
+        doc = self.doc("模型用 Playwright 在 Chromium 中执行页面流程并确认数据回显")
+        doc["process_audit"][0]["sentence"] = doc["process"][0]["sentence"]
+        errors = quality.process_audit_errors(doc, self.facts(browser=True))
+        self.assertFalse(any("验收或运行环境故障" in error for error in errors))
+
     def test_page_action_requires_browser_trace(self):
         doc = self.doc("模型在页面操作里点击权限编排按钮")
         doc["process_audit"][0]["sentence"] = doc["process"][0]["sentence"]
