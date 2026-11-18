@@ -20,6 +20,10 @@ HUB_TOKEN = "selftest-hub-token-000111222333"
 ME = ("-c", "user.name=Model", "-c", "user.email=model@example.com")
 
 
+def session_id(number: int) -> str:
+    return f"aaaaaaaa-0000-4000-8000-{number:012d}"
+
+
 class FakeHub:
     """远端是临时目录里的裸仓库，git 真跑，不联网。"""
 
@@ -56,7 +60,11 @@ class SnapshotCase(Sandbox):
     def collected(self, number=1, **extra):
         task_dir = self.make_task(number, **extra)
         lib.save_git_config(task_dir)
-        self.mark(task_dir, "collect")
+        sid = session_id(number)
+        lib.save_json(task_dir / "trace" / "ids.json", {
+            "session_id": sid, "prompt_id": f"prm-{number:04d}",
+        })
+        self.mark(task_dir, "collect", collect={"session_id": sid, "prompt_id": f"prm-{number:04d}"})
         return task_dir, task_dir / "workspace"
 
     def remote(self, hub, task_dir, publish=True) -> Path:
@@ -88,7 +96,8 @@ class Commit(SnapshotCase):
         self.assertEqual(sh(ws, "rev-parse", "HEAD"), info["commit"])
         self.assertEqual(sh(ws, "rev-parse", "HEAD^"), initial)
         self.assertEqual(sh(ws, "log", "-1", "--format=%an <%ae>|%s"),
-                         "Self Test <selftest@example.com>|" + snap.COMMIT_MESSAGE)
+                         f"Self Test <selftest@example.com>|{session_id(1)}")
+        self.assertEqual(info["commit_message"], session_id(1))
         self.assertEqual(sh(ws, "status", "--porcelain"), "")
         self.assertIn("index.py", (task_dir / "review" / "diff.patch").read_text())
         self.assertEqual(lib.require_stage(task_dir, "commit")["commit"], info["commit"])
@@ -140,6 +149,8 @@ class Commit(SnapshotCase):
         self.assertEqual((info["history_rewritten"], info["host_commit"], info["model_commits"]), (True, True, 0))
         self.assertEqual(sh(ws, "rev-parse", f"{info['commit']}^"), initial)
         self.assertEqual(sh(ws, "diff", "--name-only", initial, info["commit"]).splitlines(), ["a.txt", "b.txt"])
+        self.assertEqual(sh(ws, "log", "-1", "--format=%B", info["commit"]), session_id(1))
+        self.assertEqual(info["commit_message"], session_id(1))
 
     def test_secrets_block_the_commit(self):
         token = "ghp_" + "A1b2" * 9
@@ -280,9 +291,34 @@ class Commit(SnapshotCase):
         task_dir = self.make_task()
         with self.assertRaisesRegex(lib.FbrError, "collect 阶段还没通过"):
             snap.commit_one(task_dir, self.cfg)
-        self.mark(task_dir, "collect")
+        lib.save_json(task_dir / "trace" / "ids.json", {
+            "session_id": session_id(1), "prompt_id": "prm-0001",
+        })
+        self.mark(task_dir, "collect", collect={"session_id": session_id(1), "prompt_id": "prm-0001"})
         with self.assertRaisesRegex(lib.FbrError, "没有起跑前的 git 配置备份"):
             snap.commit_one(task_dir, self.cfg)
+
+    def test_missing_or_mismatched_session_id_blocks_the_snapshot(self):
+        task_dir, ws = self.collected()
+        write(ws / "a.txt", "a\n")
+        head = sh(ws, "rev-parse", "HEAD")
+        (task_dir / "trace" / "ids.json").unlink()
+        self.mark(task_dir, "collect", collect={"prompt_id": "prm-0001"})
+        row = snap.commit_one(task_dir, self.cfg)
+        self.assertEqual((row["state"], row["detail"]),
+                         ("blocked", "s11-000001：缺少记录 SessionID，不能生成产物快照提交"))
+        self.assertEqual(sh(ws, "rev-parse", "HEAD"), head)
+        self.assertFalse((task_dir / "review" / "snapshot.json").exists())
+
+        lib.save_json(task_dir / "trace" / "ids.json", {
+            "session_id": session_id(1), "prompt_id": "prm-0001",
+        })
+        self.mark(task_dir, "collect", collect={"session_id": session_id(2), "prompt_id": "prm-0001"})
+        row = snap.commit_one(task_dir, self.cfg)
+        self.assertEqual(row["state"], "blocked")
+        self.assertIn("记录的 SessionID 不一致", row["detail"])
+        self.assertEqual(sh(ws, "rev-parse", "HEAD"), head)
+        self.assertFalse((task_dir / "review" / "snapshot.json").exists())
 
 
 class Push(SnapshotCase):

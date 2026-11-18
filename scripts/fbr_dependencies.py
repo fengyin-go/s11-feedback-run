@@ -261,6 +261,10 @@ def unexpected_ignored(task, status):
     for line in status.splitlines():
         if not line.startswith('!! '): return True
         name = line[3:].strip('"').rstrip('/')
+        # macOS re-creates Finder metadata when Docker mounts the workspace.
+        # It is not task content and must not invalidate an otherwise clean tree.
+        if name == '.DS_Store' or name.endswith('/.DS_Store'):
+            continue
         if not any(name == p or name.startswith(p+'/') for p in paths): return True
     return False
 

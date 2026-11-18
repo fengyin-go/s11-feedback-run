@@ -116,7 +116,7 @@ docker exec -i <任务编号> bash -c \
    - 单个文件超过 50MB。
    命中就停，列出文件。确实是仓库本来就该带的样例（比如测试用的假证书），在 `review/secret-waivers.json` 写明路径和理由后重跑。真的是密钥就不要自己动手删改，那是在改模型的产物；把情况报给人决定这题怎么处理。
 4. 工作区里嵌套的 git 仓库不进快照，路径记进内部 `excluded`，不进入备注。运行树里由模型自行创建的 `.git` 只记录 `model_git_created`，不进入交付。
-5. 新批次由宿主机生成一次快照提交，作者用 `settings.json` 里的 `git_user_name` / `git_user_email`。旧批次仍保留原有模型提交。
+5. 新批次由宿主机生成一次快照提交，作者用 `settings.json` 里的 `git_user_name` / `git_user_email`。提交信息必须逐字等于该记录的 SessionID，只写 SessionID，不加正文、前缀或后缀；优先读 `trace/ids.json.session_id`，并与 collect 阶段记录的 SessionID 核对，缺失或不一致则阻断。旧批次仍保留原有模型提交。
 6. 初始提交不是最终提交的祖先（仅旧批次可能出现）时，用最终的文件树在初始提交上新建一个提交，`history_rewritten` 记真。
 7. 新运行必须先通过零代码改动检查；零改动不能进入新一轮评分交付。快照中的 `no_change` 仅保留对历史材料和独立快照工具的兼容，不能替代运行有效性门禁。
 

@@ -185,6 +185,7 @@ fbr_run.py collect --batch b1110-01
 `finalize --execute` 和完整流水线默认在验收通过后主动推送 GitHub 产物快照；明确本地模式时使用 `--no-publish`。执行顺序固定为：运行树同步到宿主 workspace → 本地 commit → 录屏和取证 → 独立验收与 Feedback 闸门 → 立即落本地表 → 推送远程快照并回读 SHA/public → 再生成表格并核查全部必填字段。不得在独立验收前自动推送；推送失败保留验收结果，标记交付未通过并重试发布，不重新跑题。平台提交和 GitHub 发布分别遵守本次用户授权。
 
 - 新批次的模型提交数为 0；宿主侧把无 Git 运行树同步成一次快照提交。旧批次 workspace 中已有的模型提交仍原样保留，不 squash/rebase/强推。
+- 宿主机生成的产物快照提交信息必须逐字等于该记录的 SessionID，只写 SessionID，不加正文、前缀或后缀；SessionID 缺失或 `trace/ids.json` 与 collect 阶段记录不一致时阻断提交。
 - 初始提交必须是产物祖先；历史被改写时用最终文件在初始提交上重建，并只记内部 `review/snapshot.json`。
 - 提交前扫描 key、密钥文件、token、超大文件和保留的中间提交；命中即停。确属样例的仅可登记 `secret-waivers.json`，网关 key 原文永不免除。
 - 不要绕过脚本在 workspace 手敲 git；只推进同一 `main`，初始快照始终引用 `task.json.initial_commit`。
@@ -217,12 +218,12 @@ fbr_record.py --batch b1110-01                       # --redo 重录
 
 ## 5. 打分与 Feedback
 
-先读 [references/reviewer.md](references/reviewer.md)、`references/scoring.md`、`references/feedback-writing.md` 和 `references/feedback-language-policy.md`。**只有轨迹分析使用 `reviewer.env`（默认 `gpt-6.1-sol`）**。过程证据核查、需求完成判断、产物验收、交付完整性评分、Feedback 撰写、产物断言逐句复核、门闸修复均由推进任务的当前 AI 完成，不通过该配置调用其他模型，也不固定另一个产物验收模型。人工 spotcheck 仍由实际审核人完成。
+先读 [references/reviewer.md](references/reviewer.md)、`references/scoring.md`、`references/feedback-writing.md` 和 `references/feedback-language-policy.md`。**只有轨迹分析使用 `reviewer.env`（默认 `gpt-6.2-sol`）**。过程证据核查、需求完成判断、产物验收、交付完整性评分、Feedback 撰写、产物断言逐句复核、门闸修复均由推进任务的当前 AI 完成，不通过该配置调用其他模型，也不固定另一个产物验收模型。人工 spotcheck 仍由实际审核人完成。
 
 提交或平台返修前还要通过 [references/feedback-platform-style.md](references/feedback-platform-style.md) 的本地风格检查。4 分必须在最终交付上明确写出一个尚未闭合的缺口、验证边界或用户可见残留后果，并留下至少一个真实文件、命令、对象或返回值。过程返工只能解释缺口来源，不能单独充当平台交付扣分点。`score_basis.category=process_issue` 不能通过平台预检；只能改用有真实正文缺口的 `verification_gap` 或 `delivery_issue`，或在确认最终交付完整后重新评审为 5 分。
 
 1. `fbr_feedback.py card` 汇集题面、需求点、测试对比、演示结果、改动与轨迹索引。
-2. `fbr_reviewer.py review` 自动先对全部主/子轨迹及获准续写做一次全量摄取，建立事件图和精确偏移；reviewer 只读经过裁剪的编辑、测试/构建、错误和修正事件，不统计或补算工具调用次数，并按行号/block 回查候选原文，保存带精确出处、完整后续状态和调用回执的 `review/trace-analysis.json`，随后返回 `needs_task_agent` 检查点。轨迹配置未填写 `model` / `reasoning_effort` 时沿用 `gpt-6.1-sol` / `high`；不可用时只暂停这一阶段，不伪造分析。
+2. `fbr_reviewer.py review` 自动先对全部主/子轨迹及获准续写做一次全量摄取，建立事件图和精确偏移；reviewer 只读经过裁剪的编辑、测试/构建、错误和修正事件，不统计或补算工具调用次数，并按行号/block 回查候选原文，保存带精确出处、完整后续状态和调用回执的 `review/trace-analysis.json`，随后返回 `needs_task_agent` 检查点。轨迹配置未填写 `model` / `reasoning_effort` 时沿用 `gpt-6.2-sol` / `high`；不可用时只暂停这一阶段，不伪造分析。
 3. 当前任务 AI 默认通过 `fbr_work.py next --inline` 读取 `review/review-capsule.json`，再按需查询相关代码 hunk 和真实实跑材料，判需求完成情况与评分。Capsule 已去重包含题面、需求、review contract、测试、改动、演示、probe、过程错误、最终回答和查询入口；不再重复读取 `task-agent-brief.md` 和 `review-contract.json`。先写 `review/decision-input.json`，同时填写 `language_review`：最关键业务约束原句、黑话改写和必要业务词；再运行 `fbr_reviewer.py build` 展开并 lint。只有排错或迁移时才手写完整 candidate。代码已能确证的问题不重复跑服务；缺证据则用既有 probe 补齐后刷新 card 和检查点。5 分仍须至少两个不同的、题面未明说的有效边界 probe，每条反例登记 `prompt_implied: false`。
 4. 当前任务 AI 另做产物与文字复核轮，按 `public_units` 逐句拆出断言，核对原始连续摘录、后续修正、最终影响，以及七项语义要求，保存绑定候选和检查点的 verification。每个 `process` 句除真实 `steps` 外还必须写 `evidence`，逐条指定 `kind=tool`、step、`target/output/error/tool` 字段和原始连续摘录；没有工具步骤时用 `kind=assistant` 绑定真实助手文本。`claim_reviews.sources` 中凡是 `trace/projects/*.jsonl`，必须同时写 `start_line`、`end_line`、`block` 和 `excerpt`。独立复核轮必须引用同一摘录，并通过 `fbr_evidence.py fetch/verify` 回查精确原始区间，不能复读整份原始轨迹。过程句还必须按 [模型过程归因审计](references/process-attribution-audit.md) 完成 `process_audit`：逐句确认主体是模型、基线行为没有被误归给模型、时间线覆盖后续修改、验收 probe/录屏没有混入模型动作，并对“只、仅、从未、收尾”等范围或时序表述扫描完整轨迹。不得将自报“通过”代替逐句证据，不得冒称另一个模型或独立审核人完成。细节见 [reviewer.md](references/reviewer.md) 和 [feedback-quality.md](references/feedback-quality.md)。
 5. `fbr_reviewer.py finalize` 只做确定性校验，不读取 `reviewer.env` 或调用外部模型；通过后保存 `audit.json`、`feedback.json`、`model-review.json` 与 `quality.json`，执行门闸、刷新本地表并主动推送快照，再核查交付字段；明确本地模式时使用 `--no-publish`。finalize 使用不含时间的稳定语义键：完全相同的失败再次提交时只返回已记录错误，不追加历史；已完整交付的同一 candidate/verification 再次提交时直接复用回执，不重复过闸、落表或发布。题面材料、评审 binding、质量/语言规则、批内查重上下文或抽检状态变化都会生成新键。失败返回具体错误，由当前任务 AI 继续修复、补证和复验；材料、规则或正文变化须重新核实，不给旧记录补盖新回执。

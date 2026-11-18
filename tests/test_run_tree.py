@@ -129,7 +129,9 @@ class RunTree(Sandbox):
 
     def test_snapshot_integrates_run_tree_before_host_commit(self):
         task, record, _ = self.prepared()
-        self.mark(task, "collect")
+        sid = "dddddddd-0000-4000-8000-000000000001"
+        lib.save_json(task / "trace/ids.json", {"session_id": sid, "prompt_id": "prm-0001"})
+        self.mark(task, "collect", collect={"session_id": sid, "prompt_id": "prm-0001"})
         write(task / "run-tree/src/clipcut/packer.py", "def pack(path, segment):\n    return [1]\n")
 
         row = snap.commit_one(task, self.cfg)
@@ -141,6 +143,7 @@ class RunTree(Sandbox):
         self.assertTrue(info["host_commit"])
         self.assertEqual(info["run_tree_files"],
                          [{"path": "src/clipcut/packer.py", "status": "M"}])
+        self.assertEqual(sh(task / "workspace", "log", "-1", "--format=%B", info["commit"]), sid)
         self.assertEqual(sh(task / "workspace", "rev-parse", f"{info['commit']}^"),
                          record["initial_commit"])
 

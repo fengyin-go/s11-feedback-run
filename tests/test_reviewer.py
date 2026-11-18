@@ -45,7 +45,7 @@ class Configuration(unittest.TestCase):
         original_home = os.environ.get("CODEX_HOME")
         def run(args, **kwargs):
             self.assertNotIn(secret, " ".join(args))
-            self.assertEqual(args[args.index("--model") + 1], "gpt-6.1-sol")
+            self.assertEqual(args[args.index("--model") + 1], "gpt-6.2-sol")
             self.assertIn('model_reasoning_effort="high"', args)
             self.assertIn('model_provider="solo11_reviewer"', args)
             self.assertIn("--ignore-user-config", args)

@@ -531,11 +531,11 @@ class FactsCase(Sandbox):
             write(workspace / "src/clipcut/segment.py",
                   "def split(total, segment):\n    return list(range(0, total, segment))\n")
         write(workspace / ".env", "LOCAL=1\n")      # 被忽略的文件不进产物，也不进取证用的克隆
-        self.mark(task_dir, "collect")
-        self.assertEqual(fbr_snapshot.commit_one(task_dir, self.cfg)["state"], "ok")
-        write_projects(task_dir / "trace" / "projects", SID, trace_rows(SID, tools=TOOLS, answer=ANSWER))
         lib.save_json(task_dir / "trace" / "ids.json", {"session_id": SID, "prompt_id": "prm-0001",
                                                         "session_file": f"projects/-workspace/{SID}.jsonl"})
+        self.mark(task_dir, "collect", collect={"session_id": SID, "prompt_id": "prm-0001"})
+        self.assertEqual(fbr_snapshot.commit_one(task_dir, self.cfg)["state"], "ok")
+        write_projects(task_dir / "trace" / "projects", SID, trace_rows(SID, tools=TOOLS, answer=ANSWER))
         lib.save_json(task_dir / "record" / "recording.json", recording or RECORDING)
         lib.set_stage(task_dir, "record", "ok", duration=12.5, setup_ok=True)
         return task_dir

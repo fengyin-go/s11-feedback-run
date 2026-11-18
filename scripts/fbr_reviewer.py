@@ -20,7 +20,7 @@ import fbr_evidence
 import fbr_quality as quality
 import fbr_style
 
-MODEL = "gpt-6.1-sol"
+MODEL = "gpt-6.2-sol"
 EFFORT = "high"
 PROVIDER = "solo11_reviewer"
 KEY_ENV = "SOLO11_REVIEW_API_KEY"

@@ -29,7 +29,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import fbrlib as lib  # noqa: E402
 import fbr_run_tree  # noqa: E402
 
-COMMIT_MESSAGE = "snapshot: workspace state after the run"
 MAX_FILE_BYTES = 50 * 1024 * 1024
 SECRET_NAME_RE = re.compile(
     r"(^|/)(\.env(\.(?!example$|sample$|template$|dist$)[\w.-]+)?|id_(rsa|dsa|ecdsa|ed25519)|\.npmrc|\.netrc|\.pypirc"
@@ -38,6 +37,29 @@ SECRET_TEXT_RE = re.compile(
     r"(gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,}|sk-[A-Za-z0-9_-]{32,}|AKIA[0-9A-Z]{16}"
     r"|-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----|xox[baprs]-[A-Za-z0-9-]{20,}"
     r"|\b(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|amqp)://[^\s:/@'\"]+:[^\s@'\"]+@)")
+
+
+def snapshot_commit_message(task_dir: Path, collected: dict | None = None) -> str:
+    """Return the recorded SessionID as the exact host snapshot commit message."""
+    ids = lib.load_json(task_dir / "trace" / "ids.json", default={})
+    collected = collected or lib.require_stage(task_dir, "collect")
+    values = []
+    for source, document in (("trace/ids.json", ids), ("collect 阶段", collected)):
+        if not isinstance(document, dict) or "session_id" not in document:
+            continue
+        session_id = document.get("session_id")
+        if (not isinstance(session_id, str) or not session_id
+                or session_id != session_id.strip()
+                or any(ord(char) < 32 or ord(char) == 127 for char in session_id)):
+            raise lib.FbrError(f"{task_dir.name}：{source} 的 SessionID 不能作为单行提交信息")
+        values.append((source, session_id))
+    if not values:
+        raise lib.FbrError(f"{task_dir.name}：缺少记录 SessionID，不能生成产物快照提交")
+    unique = {session_id for _, session_id in values}
+    if len(unique) != 1:
+        sources = "、".join(source for source, _ in values)
+        raise lib.FbrError(f"{task_dir.name}：{sources} 记录的 SessionID 不一致")
+    return values[0][1]
 
 
 def scan_secrets(workspace: Path, base: str, tree: str, key: str, waived: set[str],
@@ -103,7 +125,12 @@ def commit_one(task_dir: Path, cfg: dict) -> dict:
     name, workspace, initial = record["task_id"], task_dir / "workspace", record["initial_commit"]
     if lib.stage_ok(task_dir, "commit"):
         return {"task_id": name, "state": "skip", "detail": "已经提交过"}
-    lib.require_stage(task_dir, "collect")
+    collected = lib.require_stage(task_dir, "collect")
+    try:
+        commit_message = snapshot_commit_message(task_dir, collected)
+    except lib.FbrError as exc:
+        lib.set_stage(task_dir, "commit", "failed", problems=[str(exc)])
+        return {"task_id": name, "state": "blocked", "detail": str(exc)}
     integration = None
     if fbr_run_tree.enabled(task_dir):
         try:
@@ -146,11 +173,11 @@ def commit_one(task_dir: Path, cfg: dict) -> dict:
                 "-c", "commit.gpgsign=false"]
     host_commit = False
     if rewritten:
-        commit = lib.git_out(workspace, *identity, "commit-tree", tree, "-p", initial, "-m", COMMIT_MESSAGE)
+        commit = lib.git_out(workspace, *identity, "commit-tree", tree, "-p", initial, "-m", commit_message)
         lib.git(workspace, "reset", "-q")
         host_commit = True
     elif tree != lib.git_out(workspace, "rev-parse", "HEAD^{tree}"):
-        lib.git_out(workspace, *identity, "commit", "-q", "--no-verify", "-m", COMMIT_MESSAGE)
+        lib.git_out(workspace, *identity, "commit", "-q", "--no-verify", "-m", commit_message)
         commit = lib.git_out(workspace, "rev-parse", "HEAD")
         host_commit = True
     else:
@@ -166,6 +193,7 @@ def commit_one(task_dir: Path, cfg: dict) -> dict:
     snapshot = {
         "task_id": name, "initial_commit": initial, "commit": commit, "branch": branch,
         "model_commits": model_commits, "host_commit": host_commit, "history_rewritten": rewritten,
+        "commit_message": commit_message if host_commit else "",
         "no_change": commit == initial, "changed_files": len(changed), "excluded": excluded,
         "git_hygiene": hygiene, "committed_at": lib.now_iso(), "pushed": False, "artifact_snapshot": "",
         "workspace_source": "git-free-run-tree" if integration else "git-workspace",
