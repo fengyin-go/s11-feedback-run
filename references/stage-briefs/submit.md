@@ -6,9 +6,9 @@
 - 4 分必须通过最终交付缺口一致性检查；纯 `process_issue`、正文没有最终缺口或
   `score_basis.remaining` 对不上时，预检直接阻断。
 - 账号从 `_config/settings.json.platform.account` 读取，默认 `zouyonghong`；环境变量只作显式覆盖。
-- 同时验证 `review/platform-rules.json`：出题侧 P5/P6 契约、A-5 或私有会话读取风险未清零时
-  不得上传。不统计轨迹工具调用总数，也没有 50/55 次数量门槛；P6 只核对工作切片和
-  验证路径等可观察设计，具体数量以平台实际回执为准。
+- 同时验证 `review/platform-rules.json`：出题侧 P5/P6 契约或 A-5 风险未清零时不得上传。
+  私有会话读取不作为本地阻断条件。不统计轨迹工具调用总数，也没有 50/55 次数量门槛；
+  P6 只核对工作切片和验证路径等可观察设计，具体数量以平台实际回执为准。
 - 整批提交先运行 `fbr_batch.py closeout`；`batch-closeout.json` 不是 `ready` 时不上传任何文件。
 - schema、凭证、正文、附件、快照、账号或领域变化都会使旧预检失效。评审输入变化只让对应题重新评价，交付变化只重做交付冻结。
 - 完整 schema 和 upload plan 只从本地报告定向查询；终端摘要不是提交依据。

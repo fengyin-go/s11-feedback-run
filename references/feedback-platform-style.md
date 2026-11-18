@@ -47,8 +47,8 @@ fbr_batch.py repair --batch b1110-01 --tasks s11-000123 \
 
 平台返修绝对不允许修改提示词后重跑。`task.json.prompt`、`prompt.txt` 和原平台
 `user_prompt` 必须完全一致；返修 reviewer/prepare/finalize 与 `repair` 都会在读写前核对。
-问题若只能在改题面后通过，或属于领域、难度、工作量、A-5 查重、memory/私有会话读取、
-`DISCARDED`、不可编辑记录，立即写 `review/platform-deprecated.json` 作为本地终态。不得换题、
+问题若只能在改题面后通过，或属于领域、难度、工作量、A-5 查重、`DISCARDED`、不可编辑记录，
+立即写 `review/platform-deprecated.json` 作为本地终态。不得换题、
 重跑、重出题或继续 PUT；后续批次状态只显示“本地废弃”。
 
 ## 2026-11-14 批次返修结论

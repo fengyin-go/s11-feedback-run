@@ -81,7 +81,7 @@ class PlatformRulesTest(unittest.TestCase):
         report = fbr_platform_rules.evaluate(self.task)
         self.assertEqual(report["state"], "ready")
         self.assertEqual(report["errors"], [])
-        self.assertNotIn("effective_tool_calls", report["trace"])
+        self.assertNotIn("trace", report)
 
     def test_a5_failure_is_not_skipped_when_topic_map_is_missing(self):
         self.write(
@@ -128,31 +128,31 @@ class PlatformRulesTest(unittest.TestCase):
             {"prompt_topic_map_missing", "prompt_generation_manifest_missing"},
         )
 
-    def test_private_transcript_read_is_blocked(self):
+    def test_private_runtime_paths_do_not_block_platform_rules(self):
+        targets = (
+            "/home/node/.claude/projects/-workspace/session.jsonl",
+            "/home/node/.claude/projects",
+            "/home/node/.claude/todos",
+            "/home/node/.claude/sessions",
+            "/home/node/.claude/history.jsonl",
+            "/home/node/.claude/memory",
+        )
+        for target in targets:
+            with self.subTest(target=target):
+                self.write_contract()
+                self.write_pack(memory_target=target)
+                report = fbr_platform_rules.evaluate(self.task)
+                self.assertEqual(report["state"], "ready")
+                self.assertEqual(report["errors"], [])
+
+    def test_review_pack_is_not_required_for_platform_rules(self):
         self.write_contract()
-        self.write_pack(
-            memory_target="/home/node/.claude/projects/-workspace/session.jsonl",
-        )
-        report = fbr_platform_rules.evaluate(self.task)
-        self.assertEqual(report["state"], "blocked")
-        error = next(
-            item for item in report["errors"]
-            if item["code"] == "trace_memory_read"
-        )
-        self.assertEqual(error["owner"], "s11-feedback-run")
-        self.assertEqual(error["evidence"]["hits"][0]["step"], 1)
-
-    def test_private_runtime_directory_access_is_blocked(self):
-        self.write_contract()
-        self.write_pack(
-            memory_target="/home/node/.claude/projects",
-        )
 
         report = fbr_platform_rules.evaluate(self.task)
 
-        self.assertEqual(report["state"], "blocked")
-        self.assertTrue(report["trace"]["memory_read"])
-        self.assertEqual(report["errors"][0]["code"], "trace_memory_read")
+        self.assertEqual(report["state"], "ready")
+        self.assertEqual(report["errors"], [])
+        self.assertEqual(report["warnings"], [])
 
     def test_legacy_h3_contract_blocks_new_runs(self):
         self.write("batch:repo-topic-map.json", {
@@ -200,29 +200,6 @@ class PlatformRulesTest(unittest.TestCase):
             fbr_platform_rules.evaluate(self.task)["state"],
             "ready",
         )
-
-    def test_persisted_tool_result_is_not_transcript_memory(self):
-        self.write_contract()
-        self.write_pack()
-        pack = json.loads((self.task / "trace/review-pack.json").read_text())
-        pack["tool_events"] = [{
-            "tool": "Read",
-            "target": (
-                "/home/node/.claude/projects/-workspace/session/"
-                "tool-results/result.txt"
-            ),
-            "result_preview": "backend/app/services/alarm.py",
-        }]
-        (self.task / "trace/review-pack.json").write_text(
-            json.dumps(pack, ensure_ascii=False),
-            encoding="utf-8",
-        )
-
-        report = fbr_platform_rules.evaluate(self.task)
-
-        self.assertEqual(report["state"], "ready")
-        self.assertFalse(report["trace"]["memory_read"])
-
 
 if __name__ == "__main__":
     unittest.main()

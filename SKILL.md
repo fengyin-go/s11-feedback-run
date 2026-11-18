@@ -60,20 +60,17 @@ fbr_flow.py run --batch b1110-01 \
 
 - 校验评审凭证绑定的题面、轨迹、事实、Feedback、质量回执、抽检、快照和媒体摘要；
 - 复核白名单交付投影、18 个必填字段、SessionID 和当前批内/历史查重；
-- 复核出题 H3/工作切片、A-5 查重结论和私有会话读取；不统计、不记录也不推断工具调用
-  总数，不设 50/55 次之类的数量门槛。命中出题侧 P5、工作切片、A-5 或 memory 风险时
+- 复核出题 H3/工作切片和 A-5 查重结论；不统计、不记录也不推断工具调用总数，不设 50/55
+  次之类的数量门槛。命中出题侧 P5、工作切片或 A-5 风险时
   只阻断当前题，不进入附件上传和建单；
 - 登录平台读取实时 schema、账号领域和已有 SessionID，但预检阶段不上传、不建单；
 - 结果写入 `review/submit-preflight.json`，绑定 `feedback_sha`、`source_digest`、`content_digest`、产物快照和 schema fingerprint。
 
 只有预检 `ready` 的单条才进入平台上传。评审输入变化时该题回到当前 AI 重新评价；仅交付快照等交付字段变化时只重做交付冻结，不重新判断需求。平台表单、账号或附件变化会使预检失效。预检失败只阻断这一条，不停止其他题。人工整批提交先运行 `fbr_batch.py closeout`，批量检查通过后才允许开始上传。
 
-本地平台规则预检只从 `review-pack.json` 读取有界过程事件，不整读原始轨迹，也不汇总工具
-调用次数。reviewer 输入只包含编辑、测试/构建、错误和助手修正事件，不下发日常读取事件；
-访问任务容器私有运行目录
-`.claude/projects/todos/sessions/history.jsonl/memory`、A-5 未通过或新批次 H3 v3/workload
-契约缺失时写入 `review/platform-rules.json` 并阻断。这里的 `.claude` 是被测任务容器内
-Claude Code 的运行目录，不是 Codex skill 目录。归属边界见
+本地平台规则预检只核对冻结出题契约，不扫描轨迹中的 `.claude/projects` 或其他私有会话
+路径，也不汇总工具调用次数。A-5 未通过或新批次 H3 v3/workload 契约缺失时写入
+`review/platform-rules.json` 并阻断。归属边界见
 [platform-policy-preflight.md](references/platform-policy-preflight.md)。
 
 同一平台账号的上次写请求时间持久化在 `~/.codex/solo11/runtime/platform-write-pacing-<账号摘要>.json`。脚本退出、resume、换批次或手工补交后仍继续按上次时间计算。建单明确遇到 429 时优先使用 `Retry-After`，否则按 15、30、45 秒退避；每次重投前按 SessionID 回查，发现已建单就直接回读，不重复 POST。其他 5xx、超时和结果未知仍保留 `uncertain`，不自动重试。
@@ -291,7 +288,7 @@ Feedback 的硬底线：
 - 绝对禁止修改 `task.json.prompt`、`prompt.txt`、平台 `user_prompt` 后重新运行、换题或新建会话。
   返修入口会对照 `review/upload.json` 中的原提示词，发现变化立即停止。
 - `problem_type=DOMAIN_MISMATCH`、P3/P4/P5 难度不成立、P6 工作量不足、A-5 查重、
-  memory/私有会话读取、`DISCARDED`，以及 `PENDING_FIX` 但不可编辑，均不属于字段返修。
+  `DISCARDED`，以及 `PENDING_FIX` 但不可编辑，均不属于字段返修。
   即使平台显示 `editable=true`，也不能通过改 Feedback、领域枚举或反复 PUT 绕过。
 - 上述任一失败出现时立即写入 `review/platform-deprecated.json`，记录原 SubmissionID、
   失败 `qc_checks`、原提示词摘要、原因和 `action=discard_locally`。这是终态：不修改提示词、

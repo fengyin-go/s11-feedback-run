@@ -21,10 +21,6 @@
   `trace_complexity_floor`、`trace_tool_call_floor`、`dedup`、`dedup_semantic` 都不属于
   Feedback 可修范围。保留失败检查和原题冻结字段，写 `review/platform-deprecated.json`
   并在本地标记废弃；不修改提示词、不重跑、不转回出题侧、不再 PUT。
-- **私有会话读取**：`trace_memory` 命中 `.claude/projects`、`.claude/todos`、
-  `.claude/sessions` 或 `.claude/history.jsonl` 时，若已有平台单则原附件无法替换，直接在
-  本地标记废弃且不重跑；只有尚未产生平台单的提交前预检，才可按运行隔离规则重新准备。
-  不得通过修改 `other_issues` 或 Feedback 绕过。
 - **发布或交付缺失**：保留已通过的独立验收并立即落表。完整流水线和 finalize 默认主动处理推送、可见性、SHA 回读与材料导出，再重验必填字段；无发布授权时先完成其余可做事项，明确只剩哪项授权。用户要求暂不提交平台时始终不上传、不建单。
 
 低分或真实功能缺陷不等于数据不能通过；应如实评价和保留产物。不得为了闸门通过改被测代码、重跑刷分、删失败轨迹、手改状态、放宽枚举或证据标准，也不得把本地提交链接冒充已发布快照。

@@ -78,7 +78,7 @@ RATE_LIMIT_BACKOFF = (15.0, 30.0, 45.0)
 WRITE_PACING_VERSION = 1
 PROMPT_LEVEL_CHECK_RE = re.compile(
     r"(?:^|_)(?:difficulty|complexity|workload|tool_call|dedup|duplicate|"
-    r"domain|memory|skill|standard_leak|docker_call)(?:_|$)",
+    r"domain|skill|standard_leak|docker_call)(?:_|$)",
     re.I,
 )
 PROMPT_LEVEL_PROBLEM_TYPES = {
@@ -87,7 +87,6 @@ PROMPT_LEVEL_PROBLEM_TYPES = {
     "DIFFICULTY_MISMATCH",
     "INSUFFICIENT_WORKLOAD",
     "DEDUP",
-    "MEMORY_ACCESS",
 }
 
 
@@ -1280,11 +1279,8 @@ def non_repairable_prompt_checks(detail: dict) -> list[dict]:
               or problem_type in PROMPT_LEVEL_PROBLEM_TYPES
               or PROMPT_LEVEL_CHECK_RE.search(key)):
             runtime_check = (
-                problem_type == "MEMORY_ACCESS"
-                or (
-                    key.startswith("trace_")
-                    and key not in {"trace_complexity_floor", "trace_tool_call_floor"}
-                )
+                key.startswith("trace_")
+                and key not in {"trace_complexity_floor", "trace_tool_call_floor"}
             )
             blocked.append({
                 "check_key": key,

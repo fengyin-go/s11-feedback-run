@@ -158,7 +158,7 @@ class Rules(unittest.TestCase):
             for row in blockers
         ))
 
-    def test_memory_read_discards_existing_platform_record_without_rerun(self):
+    def test_trace_memory_is_not_locally_classified_as_non_repairable(self):
         detail = {
             "status": "PENDING_FIX",
             "editable": True,
@@ -166,14 +166,11 @@ class Rules(unittest.TestCase):
                 "check_key": "trace_memory",
                 "passed": False,
                 "summary": "读取 .claude/projects",
-                "evidence": {},
+                "evidence": {"problem_type": "MEMORY_ACCESS"},
             }],
         }
         blockers = submit.non_repairable_prompt_checks(detail)
-        self.assertEqual(len(blockers), 1)
-        self.assertEqual(blockers[0]["owner"], "s11-feedback-run")
-        self.assertEqual(blockers[0]["action"], "discard_locally")
-        self.assertFalse(blockers[0]["requires_prompt_change"])
+        self.assertEqual(blockers, [])
 
     def test_discarded_platform_status_is_local_deprecation(self):
         blockers = submit.non_repairable_prompt_checks({

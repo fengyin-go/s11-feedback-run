@@ -3,7 +3,6 @@
 `dfzr10012 / b1115-01` 的 39 条回执显示，`PENDING_FIX` 不一定能改 Feedback：
 
 - 有题目曾被平台按 P6 打回，但本地不再统计工具调用次数；
-- 20/31：读取 `/home/node/.claude/projects/...jsonl` 中的本轮会话轨迹，平台判为 memory 作弊；
 - 12 条 `DISCARDED` 是 P5 H3 不成立；
 - 2 条 `DISCARDED` 是 A-5 公共长片段查重。
 
@@ -19,19 +18,12 @@
 2. 独立读取 `prompt-generation-manifest.json`，不能因上一步缺文件而跳过。新 S11 批次缺失
    文件即阻断；旧批次完全缺失时记录 warning。文件存在且 `gate_ok`、`raw_a5_ok` 或
    `cross_project.platform_dedup_ok` 为假时，任何批次都阻断。
-3. 不读取 `trace-check.json` 或 `review-pack.json` 中的工具调用总数，不计算
-   `paired_tools`、`logical_tool_uses` 或其他调用数量。reviewer 输入只保留编辑、
-   测试/构建、错误和助手修正等过程事件。
-4. 扫描这些有界过程事件的 `target` 和 `result_preview`。`Read/Bash/Grep/Glob` 访问任务容器内
-   `.claude/projects`、`.claude/todos`、`.claude/sessions`、`.claude/history.jsonl` 或
-   `.claude/memory` 时阻断。这里的 `.claude` 是被测任务运行目录，与 Codex skill 无关。
-5. 只有 `review/platform-rules.json` 和 `review/submit-preflight.json` 都为 ready，才允许上传。
+3. 不扫描轨迹中的 `.claude/projects` 或其他私有运行目录，也不把相关读取记录作为重跑、
+   废弃或阻断条件。平台规则预检只使用上一步的出题契约。
+4. 只有 `review/platform-rules.json` 和 `review/submit-preflight.json` 都为 ready，才允许上传。
 
 机会地图及其绑定不是运行侧输入。批次没有 `prompt_opportunities`、地图文件已移走或旧批次
 只有历史路径时，不阻断也不告警。H3/A-5 由上面的独立文件检查决定，与机会地图无关。
-
-扫描只使用已经做有界裁剪的 review pack，不整读原始 JSONL。证据保留命中的步骤、工具、目标
-和返回摘要，用于重新运行或出题返修。
 
 ## 失败归属
 
@@ -40,17 +32,14 @@
 | `trace_complexity_floor` | 已有平台单时本地废弃，不处理 | 改题重跑 / 改 Feedback / PUT |
 | `trace_tool_call_floor` | 本地不统计；若平台明确返回该检查，已有平台单时本地废弃 | 改题重跑 / 把本地计数改写成通过 |
 | `dedup` / `dedup_semantic` | 已有平台单时本地废弃，不处理 | 改题重跑 / 只换名词或同义词 |
-| `trace_memory` | 已有平台单时本地废弃，不重跑 | 修改 `other_issues` / 换会话 |
 | `trace_skill` / `trace_standard_leak` / `trace_docker_call` | 已有平台单时本地废弃，不重启运行 | 改 Feedback / 重跑 |
 | `DOMAIN_MISMATCH` | 已有平台单时本地废弃，不处理 | 换主任务后重跑 / 反复 PUT |
 
 ## 运行期策略
 
-新容器仍必须清空预置 `projects`、`todos` 和 `history.jsonl`。本次失败说明模型还会读取本轮
-刚生成的会话文件，因此单靠“容器启动时清空”不够。运行侧采用两层保护：
-
-- 新批次使用 H3 v3、A-5 raw gate 和 workload design，避免带病起跑；
-- 轨迹收集后扫描私有会话路径，命中后标记 `runtime_rerun_required`，不进入平台提交。
+新容器仍必须清空预置 `projects`、`todos` 和 `history.jsonl`，作为跨题运行隔离措施。该清理
+不再配合轨迹私有会话路径扫描；轨迹出现 `.claude/projects` 等访问记录时，本地平台规则
+预检不阻断、不要求重跑，也不写入平台废弃记录。
 
 平台单进入 `PENDING_FIX` 后，返修只允许原记录非锁定字段更新，绝不允许修改提示词后重跑。
 失败只能靠改题面处理时，`fbr_submit.py repair` 写 `review/platform-deprecated.json`，

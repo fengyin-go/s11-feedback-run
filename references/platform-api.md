@@ -127,7 +127,7 @@ fbr_batch.py repair --batch b1110-01 --tasks s11-000123 \
 
 `PENDING_FIX` 仍要区分可编辑字段失败和题目级失败。
 `qc_checks[].evidence.problem_type=DOMAIN_MISMATCH` 表示题面主体与所属领域不符；P3/P4/P5
-难度、P6 工作量、A-5 查重、memory 或私有会话读取也无法通过替换锁定附件来返修。
+难度、P6 工作量、A-5 查重也无法通过替换锁定附件来返修。
 `DISCARDED` 以及 `PENDING_FIX + editable=false` 同样不可返修。`repair_one` 遇到这些情况
 返回 `discarded`，写入 `review/platform-deprecated.json` 并保留失败检查；该终态不修改提示词、
 不重跑、不转回出题侧、不继续 PUT。重复调用 `repair` 只回读本地废弃凭证，不登录平台。

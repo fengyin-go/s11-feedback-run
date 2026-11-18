@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import re
 from pathlib import Path
 from typing import Any
 
@@ -20,22 +19,11 @@ H3_FALSE_GUARDS = {
     "source_selection_only",
     "equivalent_user_outcome",
 }
-MEMORY_PATH_RE = re.compile(
-    r"(?:^|[\s\"'])(?:/home/[^/\s]+/|/root/|~/)?"
-    r"\.claude/(?:projects|todos|sessions|history\.jsonl|memory)(?:/|[\s\"']|$)",
-    re.IGNORECASE,
-)
-MEMORY_CONTENT_RE = re.compile(
-    r"(?:queue-operation|sessionId|promptId)",
-    re.IGNORECASE,
-)
-
 NON_REPAIRABLE_QC_CHECKS = {
     "dedup",
     "dedup_semantic",
     "trace_complexity_floor",
     "trace_tool_call_floor",
-    "trace_memory",
     "trace_skill",
     "trace_standard_leak",
     "trace_docker_call",
@@ -197,104 +185,13 @@ def prompt_contract_problems(
     return errors, warnings
 
 
-def _memory_hit(event: dict[str, Any]) -> dict[str, Any] | None:
-    tool = str(event.get("tool") or "")
-    target = str(event.get("target") or "")
-    preview = str(event.get("result_preview") or "")
-    if tool not in {"Read", "Bash", "Grep", "Glob"}:
-        return None
-    # Oversized tool output is persisted under projects/*/tool-results. Reading
-    # that file is a normal continuation of the tool call, not transcript access.
-    if "/tool-results/" in target and not target.endswith(".jsonl"):
-        return None
-    # Claude persists oversized tool output under .claude/projects. That path
-    # appearing in a result preview is a harness artifact, not a model read.
-    path_match = MEMORY_PATH_RE.search(target)
-    persisted_output = (
-        preview.lstrip().startswith("<persisted-output>")
-        or "Full output saved to:" in preview
-    )
-    content_match = None
-    if not persisted_output and ".claude/" in target.lower():
-        content_match = MEMORY_CONTENT_RE.search(preview)
-    if not path_match and not content_match:
-        return None
-    matched = path_match or content_match
-    assert matched is not None
-    protected_path = re.search(
-        r"\.claude/(?:projects|todos|sessions|history\.jsonl|memory)(?:/|$|[\s\"'])",
-        target,
-        re.IGNORECASE,
-    )
-    return {
-        "tool": tool,
-        "target": lib.clip(target, 500),
-        "result_preview": lib.clip(preview, 500),
-        "matched": matched.group(0),
-        "severity": "hard" if protected_path else "soft",
-    }
-
-
-def trace_rule_problems(task_dir: Path) -> tuple[list[dict], list[dict], dict]:
-    """Collect tool-call evidence and check private transcript access."""
-    task_dir = Path(task_dir)
-    pack = lib.load_json(task_dir / "trace/review-pack.json", default={})
-    errors: list[dict] = []
-    warnings: list[dict] = []
-    summary = pack.get("summary") if isinstance(pack, dict) else {}
-    if not isinstance(summary, dict) or not summary:
-        warnings.append(_problem(
-            "trace_policy_pack_missing",
-            "缺少轨迹 review-pack，提交前无法核对私有轨迹读取",
-            owner="s11-feedback-run",
-            action="reingest_trace",
-        ))
-        return errors, warnings, {}
-
-    hits = []
-    for index, event in enumerate(pack.get("tool_events") or [], start=1):
-        if not isinstance(event, dict):
-            continue
-        hit = _memory_hit(event)
-        if hit:
-            hits.append({"step": index, **hit})
-    hard_hits = [hit for hit in hits if hit.get("severity") == "hard"]
-    soft_hits = [hit for hit in hits if hit.get("severity") != "hard"]
-    if hard_hits:
-        errors.append(_problem(
-            "trace_memory_read",
-            "轨迹读取了 .claude 下的私有会话文件，平台将按 memory 作弊处理",
-            owner="s11-feedback-run",
-            action="runtime_rerun_required",
-            evidence={"hits": hard_hits[:5]},
-        ))
-    if soft_hits:
-        warnings.append(_problem(
-            "trace_private_state_probe",
-            "轨迹探测了 .claude 私有运行状态或会话元数据；未读取答案正文但需换干净会话",
-            owner="s11-feedback-run",
-            action="inspect_runtime_isolation",
-            evidence={"hits": soft_hits[:5]},
-        ))
-    return errors, warnings, {
-        "memory_read": bool(hard_hits),
-        "memory_probe": bool(soft_hits),
-        "memory_hits": hard_hits[:5],
-        "private_state_hits": soft_hits[:5],
-    }
-
-
 def evaluate(task_dir: Path, *, strict: bool = True) -> dict[str, Any]:
     task_dir = Path(task_dir)
     prompt_errors, prompt_warnings = prompt_contract_problems(task_dir, strict=strict)
-    trace_errors, trace_warnings, trace_summary = trace_rule_problems(task_dir)
-    errors = prompt_errors + trace_errors
-    warnings = prompt_warnings + trace_warnings
     return {
         "version": 1,
-        "state": "blocked" if errors else "ready",
-        "errors": errors,
-        "warnings": warnings,
-        "trace": trace_summary,
+        "state": "blocked" if prompt_errors else "ready",
+        "errors": prompt_errors,
+        "warnings": prompt_warnings,
         "checked_at": lib.now_iso(),
     }

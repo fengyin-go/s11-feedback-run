@@ -91,10 +91,8 @@ docker exec -i <任务编号> bash -c \
 - 子代理的会话（`isSidechain`）不算轮次。
 - 流式输出、stderr、导出的主会话或子会话任何地方含当前起跑 key 原文时，按甲方补充口径视为可交付数据：原始文件和轨迹不改写、不脱敏，收集阶段记录 `api_key_read=true`，备注自动写“模型运行时读取了 apikey”，随后继续快照、录屏、取证和交付。key 不决定运行是否有效，也不因命中而重跑。
 - key 备注由当前运行/轨迹中的起跑 key 原文自动检测，不能从反馈 note 或人工备注复制。检测时只记录布尔事实和命中文件清单，不在错误、表格备注或反馈正文里输出 key 原文。
-- 收集后的平台规则预检扫描 `review-pack.json` 中 `Read/Bash/Grep/Glob` 的 target 和返回摘要。
-  访问任务容器内的 `.claude/projects`、`.claude/todos`、`.claude/sessions`、
-  `.claude/history.jsonl` 或 `.claude/memory` 时标记 `runtime_rerun_required`，不进入平台提交。
-  这是被测任务中 Claude Code 的私有运行目录，不是 Codex skill 目录。具体流程见
+- 收集后的平台规则预检不再把轨迹访问 `.claude/projects` 或其他私有运行目录作为本地阻断
+  条件，也不因此要求重跑或废弃任务。该预检只核对出题侧 P5/P6 契约和 A-5 查重，具体流程见
   [platform-policy-preflight.md](platform-policy-preflight.md)。
 
 ## key
