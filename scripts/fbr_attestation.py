@@ -22,6 +22,7 @@ REVIEW_FILES = (
     "evidence/audit.json",
     "evidence/probes.jsonl",
     "review/feedback.json",
+    "review/code-review.json",
     "review/model-review.json",
     "review/quality.json",
     "review/style-report.json",

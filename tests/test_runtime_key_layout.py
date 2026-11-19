@@ -1,4 +1,4 @@
-"""独立复核回归：收集必须能用起跑 key 扫描；宿主 git 拒绝 commondir 布局。"""
+"""独立复核回归：收集可在网关凭据轮换或移除后完成；宿主 git 拒绝 commondir 布局。"""
 
 from __future__ import annotations
 
@@ -24,37 +24,23 @@ class KeyAndGitLayout(DockerCase):
         shutil.copytree(source, target)
         return task, next(target.rglob("*.jsonl"))
 
-    def test_collect_without_key_keeps_original_and_container(self):
+    def test_collect_after_rotation_preserves_original(self):
+        task, raw = self.collected_candidate()
+        original = raw.read_bytes()
+        write(self.key_file, 'apikey=replacement-key-for-safety-test\n')
+        row = fbr_run.collect_one(task, self.cfg)
+        self.assertEqual(row['state'], 'ok')
+        self.assertEqual(raw.read_bytes(), original)
+        self.assertNotIn(KEY, str(row))
+
+    def test_collect_without_key_or_fingerprint(self):
         task, raw = self.collected_candidate()
         original = raw.read_bytes()
         self.key_file.unlink()
-        row = fbr_run.collect_one(task, self.cfg)
-        self.assertEqual(row["state"], "blocked")
+        (task / 'run/key-identity.json').unlink()
+        self.assertEqual(fbr_run.collect_one(task, self.cfg)['state'], 'ok')
         self.assertEqual(raw.read_bytes(), original)
-        self.assertEqual(self.docker.docker_calls("rm"), [])
-        self.assertEqual(self.docker.docker_calls("cp"), [])
-        self.assertIn(task.name, self.docker.containers)
-        self.assertFalse((task / "trace/ids.json").exists())
-        self.assertNotIn(KEY, str(row))
-
-    def test_collect_with_replaced_key_is_blocked(self):
-        task, raw = self.collected_candidate()
-        original = raw.read_bytes()
-        write(self.key_file, "apikey=replacement-key-for-safety-test\n")
-        row = fbr_run.collect_one(task, self.cfg)
-        self.assertEqual(row["state"], "blocked")
-        self.assertEqual(raw.read_bytes(), original)
-        self.assertEqual(self.docker.docker_calls("rm"), [])
-        self.assertIn(task.name, self.docker.containers)
-        self.assertNotIn(KEY, str(row))
-
-    def test_collect_without_start_fingerprint_is_blocked(self):
-        task, raw = self.collected_candidate()
-        (task / "run/key-identity.json").unlink()
-        row = fbr_run.collect_one(task, self.cfg)
-        self.assertEqual(row["state"], "blocked")
-        self.assertEqual(self.docker.docker_calls("cp"), [])
-        self.assertEqual(self.docker.docker_calls("rm"), [])
+        self.assertTrue((task / 'trace/ids.json').is_file())
 
     def test_run_records_nonsecret_key_fingerprint(self):
         task = self.make_task()

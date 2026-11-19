@@ -9,7 +9,7 @@
 边界：
 - 一题一个新容器，容器名就是任务编号；不加 --rm，轨迹导出并核对通过后才 docker rm（不带 -f）。
 - 模型只挂载从初始提交生成的无 .git 运行树；宿主 Git workspace 在运行期间不变。
-- key 只通过 --env-file 传入；输出或轨迹出现 key 时保留原始材料并记为“读取了 apikey”，允许交付。
+- key 只通过 --env-file 传入；原始轨迹按原样收集、导出和上传，包括含网关 key 的轨迹。交付不扫描网关 key，也不要求取得当时的 key。
 - 模型中断可在同一会话累计最多继续两次；工程异常和零代码改动归档重跑，含首次最多 max_attempts 次。
 - 重跑前把这次的轨迹和运行树改动归档到 run/attempt-N/，导出失败就停下，不删容器。
 """
@@ -34,6 +34,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import fbr_quota as quota
 import fbrlib as lib  # noqa: E402
 import fbr_trace  # noqa: E402
 import fbr_runtime as runtime
@@ -101,10 +102,6 @@ def container_exists(name: str) -> bool:
     return lib.run(["docker", "container", "inspect", "--format", "{{.State.Status}}", name], timeout=30).returncode == 0
 
 
-def evidence_has_key(paths, secret: str) -> bool:
-    return any(lib.key_occurrences(path, secret) for path in paths)
-
-
 def prepare_legacy_progress_recovery(task_dir: Path, cfg: dict, *, execute: bool) -> dict:
     """Issue one re-dispatch token iff an old controller killed a progressing run."""
     path = task_dir / "run/legacy-progress-recovery.json"
@@ -162,7 +159,7 @@ def use_legacy_progress_recovery(task_dir: Path, attempt: int) -> bool:
 
 
 def bound_key(task_dir: Path, cfg: dict, *, start: bool = False) -> str:
-    """只能用起跑时的同一 key 核对泄露；缺 key 或换 key 不能降级为空扫描。"""
+    """核对本次模型派发使用的网关身份。"""
     path = lib.key_path(cfg)
     if not path.is_file() or stat.S_IMODE(path.stat().st_mode) != 0o600:
         raise lib.FbrError("key 文件不存在或权限不是 600，保留原始证据与容器，不继续")
@@ -178,7 +175,7 @@ def bound_key(task_dir: Path, cfg: dict, *, start: bool = False) -> str:
     elif start and not (task_dir / "run" / "attempts.json").exists():
         lib.save_json(identity_path, {"sha256": fingerprint})
     else:
-        raise lib.FbrError("缺少起跑 key 的 SHA256 指纹，无法确认泄露扫描有效，保留原始证据与容器")
+        raise lib.FbrError("缺少起跑 key 的 SHA256 指纹，无法核对模型运行身份，保留原始证据与容器")
     return secret
 
 
@@ -265,7 +262,7 @@ exec claude --safe-mode --disable-slash-commands --setting-sources '' \
     return ["docker", "exec", "-i", name, "bash", "-c", shell, "fbr-continue", session_id]
 
 
-def archive_attempt(task_dir: Path, record: dict, number: int, secret: str = "") -> None:
+def archive_attempt(task_dir: Path, record: dict, number: int) -> None:
     """把一次不算数的运行归档，然后把容器和工作区恢复到可以重跑的状态。"""
     name, workspace = record["task_id"], task_dir / "workspace"
     target = task_dir / "run" / f"attempt-{number}"
@@ -423,7 +420,6 @@ def recover_one(task_dir: Path, cfg: dict) -> dict:
     done = lib.load_json(Path(current.get('result', '/nonexistent')), default={})
     if done.get('id') != current.get('request_id') or 'rc' not in done:
         return {**row, 'state': 'blocked', 'detail': 'worker 已退出但无匹配回执，保留容器和全部证据'}
-    secret = bound_key(task_dir, cfg)
     stdout, stderr = Path(current['stdout']), Path(current['stderr'])
     segment = fbr_trace.read_stream(stdout)
     tail = stderr.read_text(errors='replace')[-4000:]
@@ -485,17 +481,19 @@ def recover_one(task_dir: Path, cfg: dict) -> dict:
             runtime.Gateway(cfg).event('success')
         return {**row, 'state': 'ok', 'detail': '匹配退出回执，运行已恢复收口'}
     if decision['verdict'] == 'retry':
-        archive_attempt(task_dir, record, current['attempt'], secret)
+        archive_attempt(task_dir, record, current['attempt'])
         lib.set_stage(task_dir, 'run', 'deferred', reason=decision['reason'])
         return {**row, 'state': 'deferred', 'detail': '失败运行已归档，可在剩余预算和次数内 resume'}
     if decision['verdict'] == 'abandon':
-        archive_attempt(task_dir, record, current['attempt'], secret)
+        archive_attempt(task_dir, record, current['attempt'])
         current.update(state='abandoned')
         lib.save_json(current_path, current)
         lib.set_stage(task_dir, 'run', 'abandoned', reason=decision['reason'],
                       detail=decision['detail'], abandoned_at=lib.now_iso())
+        quota.release(task_dir, cfg)
         return {**row, 'state': 'abandoned', 'detail': decision['detail']}
     lib.set_stage(task_dir, 'run', 'failed', reason=decision['reason'])
+    quota.release(task_dir, cfg)
     return {**row, 'state': 'blocked', 'detail': decision['detail']}
 
 
@@ -550,16 +548,25 @@ def run_one(task_dir: Path, cfg: dict) -> dict:
         lib.save_json(run_dir / 'retry-ledger.json', admission)
         if not admission['allowed'] and not (legacy_grant or resume):
             lib.set_stage(task_dir, 'run', 'deferred', reason=admission['reason'])
+            if admission['reason'] == 'max_attempts':
+                quota.release(task_dir, cfg)
             return {'task_id': name, 'state': 'deferred', 'detail': admission['reason']}
         if not (legacy_grant or resume) and (time.time() >= cfg.get('_deadline', float('inf'))
                 or (cfg.get('_drain') and Path(cfg['_drain']).exists())):
             return {'task_id': name, 'state': 'deferred', 'detail': '批次已排空或预算到顶，不起新轮'}
         if budget["active_seconds"] >= cfg["run"]["task_budget"] and not (legacy_grant or resume):
             lib.set_stage(task_dir, "run", "deferred", reason="单题累计运行预算耗尽，恢复不会清零预算")
+            quota.release(task_dir, cfg)
             return {"task_id": name, "state": "deferred", "detail": "单题累计运行预算耗尽"}
         if cfg['run'].get('gateway_wait_task_total') is not None and budget.get('waiting_seconds', 0) >= cfg['run']['gateway_wait_task_total']:
             lib.set_stage(task_dir, 'run', 'deferred', reason='单题累计网关等待预算耗尽，未派发新的尝试')
             return {'task_id': name, 'state': 'deferred', 'detail': '单题累计网关等待预算耗尽，保留次数与容器，不发送题面'}
+        try:
+            waiting = quota.reserve(task_dir, cfg)
+        except lib.FbrError as exc:
+            waiting = quota.retry(f'平台额度待核对：{exc}')
+        if waiting:
+            return {'task_id': name, **waiting}
         number = (resume or {}).get('attempt') or max([a.get('n', 0) for a in attempts] or [0]) + 1
         if legacy_grant and not use_legacy_progress_recovery(task_dir, number):
             return {"task_id": name, "state": "deferred", "detail": "进度恢复令牌已被消费"}
@@ -649,6 +656,7 @@ def run_one(task_dir: Path, cfg: dict) -> dict:
                 lib.save_json(run_dir / "continuations.json", continuations)
                 lib.set_stage(task_dir, "run", "failed", problems=["模型中断，已达“继续”次数上限"],
                               continuations=continuations)
+                quota.release(task_dir, cfg)
                 return {"task_id": name, "state": "failed", "detail": "模型中断，已达“继续”次数上限；保留容器与全部内容，不重跑刷结果"}
             # 续写前先保存原始轨迹；key 命中由收集阶段生成对外备注。
             exported = run_dir / f"interruption-{number}-{index}"
@@ -712,18 +720,20 @@ def run_one(task_dir: Path, cfg: dict) -> dict:
                           continuations=continuations)
             return {"task_id": name, "state": "ok", "detail": f"第 {number} 次运行算数"}
         if verdict["verdict"] == "abandon":
-            archive_attempt(task_dir, record, number, secret)
+            archive_attempt(task_dir, record, number)
             current.update(state='abandoned', verdict='abandon')
             lib.save_json(run_dir / "current.json", current)
             lib.set_stage(task_dir, 'run', 'abandoned', reason=verdict['reason'],
                           detail=verdict['detail'], abandoned_at=lib.now_iso(), attempts=number)
+            quota.release(task_dir, cfg)
             return {"task_id": name, "state": "abandoned", "detail": verdict["detail"]}
         if verdict["verdict"] == "stop":
             if gateway and verdict['reason'] == '网关鉴权失败':
                 gateway.event('auth')
             lib.set_stage(task_dir, "run", "failed", reason=verdict["reason"], problems=[verdict["detail"]])
+            quota.release(task_dir, cfg)
             return {"task_id": name, "state": "failed", "detail": verdict["detail"] + "（容器没删）"}
-        archive_attempt(task_dir, record, number, secret)
+        archive_attempt(task_dir, record, number)
         assessment = fbr_retry.classify_attempt(attempts[-1])
         if gateway and assessment['category'] in ('throttle', 'infra'):
             gateway.event('limit' if runtime.LIMIT.search(tail) else 'soft' if runtime.SOFT.search(tail) else 'network')
@@ -754,17 +764,9 @@ def collect_one(task_dir: Path, cfg: dict, keep_container: bool = False) -> dict
         except lib.FbrError as exc:
             lib.set_stage(task_dir, "collect", "failed", problems=[str(exc)])
             return {"task_id": name, "state": "failed", "detail": str(exc)}
-    try:
-        secret = bound_key(task_dir, cfg)
-    except lib.FbrError as exc:
-        lib.set_stage(task_dir, "collect", "failed", problems=[str(exc)], key_check_blocked=True)
-        return {"task_id": name, "state": "blocked", "detail": str(exc)}
     trace_dir = task_dir / "trace"
     target = trace_dir / "projects"
     trace_dir.mkdir(exist_ok=True)
-    existing = list(target.rglob("*")) if target.is_dir() else []
-    existing.extend(task_dir / "run" / item for item in ("stream.jsonl", "stderr.log"))
-    api_key_read = evidence_has_key(existing, secret)
     if container_exists(name):
         if target.exists():
             shutil.rmtree(target)   # 上次导出的半成品；原件还在容器里
@@ -776,7 +778,6 @@ def collect_one(task_dir: Path, cfg: dict, keep_container: bool = False) -> dict
     elif not target.is_dir():
         lib.set_stage(task_dir, "collect", "failed", problems=["容器不在了，本地也没有导出的轨迹"])
         return {"task_id": name, "state": "failed", "detail": "容器不在了，本地也没有导出的轨迹"}
-    api_key_read = api_key_read or evidence_has_key(target.rglob("*"), secret)
     ids = fbr_trace.read_ids(target, record["prompt"], run_info.get("continuations", []))
     problems = list(ids["problems"])
     if run_info.get("session_id") and ids["session_id"] and run_info["session_id"] != ids["session_id"]:
@@ -789,15 +790,15 @@ def collect_one(task_dir: Path, cfg: dict, keep_container: bool = False) -> dict
     lib.save_json(trace_dir / "ids.json", {
         "session_id": ids["session_id"], "prompt_id": ids["prompt_id"], "session_file": ids["session_file"],
         "user_turns": ids["user_turns"], "rows": ids["rows"], "cli_version": ids["cli_version"],
-        "continuations": ids["continuations"], "api_key_read": api_key_read,
-        "key_detected": api_key_read, "exported_at": lib.now_iso()})
+        "continuations": ids["continuations"], "exported_at": lib.now_iso()})
+    quota.collected(task_dir, cfg, ids)
     removed = False
     if not keep_container and container_exists(name):
         lib.run(["docker", "stop", name], timeout=60)
         result = lib.run(["docker", "rm", name], timeout=60)
         removed = result.returncode == 0
     lib.set_stage(task_dir, "collect", "ok", session_id=ids["session_id"], prompt_id=ids["prompt_id"],
-                  container_removed=removed, api_key_read=api_key_read)
+                  container_removed=removed)
     return {"task_id": name, "state": "ok", "detail": f"SessionID {ids['session_id']}"}
 
 
@@ -955,6 +956,7 @@ def main() -> int:
         print("预检：")
         if not print_checks(preflight(cfg)):
             raise lib.FbrError("预检没过，不起跑")
+        print(quota.status_text(quota.live_status(root)), flush=True)
         process_path = directory / 'process.json'
         process_info = {'pid': os.getpid(), 'identity': runtime.process_identity(),
                         'started_at': lib.now_iso(), 'command': args.command}

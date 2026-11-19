@@ -100,7 +100,10 @@ class Attestation(SubmitCase):
         second = self.ready(2, TEXT_B)
         ids_path = second / "trace/ids.json"
         ids = lib.load_json(ids_path)
+        source = second / 'trace' / ids['session_file']
+        old_session = ids['session_id']
         ids["session_id"] = "s11-test-session-context-2"
+        source.write_text(source.read_text().replace(old_session, ids['session_id']))
         lib.save_json(ids_path, ids)
         self.refresh_source_fixture(second)
         self.review_receipt(second)

@@ -76,6 +76,14 @@ class Contract(unittest.TestCase):
             doc["score_basis"]["lowest_supported_score"] = score
             self.assertTrue(self.errors(doc))
 
+    def test_v2_rejects_process_issue_as_platform_category(self):
+        doc = self.doc()
+        doc["feedback_policy_version"] = 2
+        doc["score"] = 4
+        doc["score_basis"]["category"] = "process_issue"
+        doc["score_basis"]["lowest_supported_score"] = 4
+        self.assertTrue(any("v2 不允许把 process_issue" in error for error in self.errors(doc)))
+
     def test_absent_verification_has_evidence_without_fabricated_output(self):
         doc, f = self.doc(), facts()
         sentence = "最后一次改动后没有再跑测试"

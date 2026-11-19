@@ -114,6 +114,8 @@ def review_text(text: str, score: int | None = None) -> dict:
         "hits": [],
         "metrics": {},
     }
+    if re.search(r'(?:日期|配额日)(?:始终|一直|仍然|仍)?停当天', body):
+        _append(report, code='missing_preposition', message='日期停当天缺少介词，核实后改为停在当天', phrase='停当天', suggestion='停在当天')
     for group in policy().get("hard_groups") or []:
         hits = _term_hits(body, list(group.get("terms") or []))
         for hit in hits:

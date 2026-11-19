@@ -477,6 +477,41 @@ class Submission(SubmitCase):
                 older["data"].update(domain=domain, sub_direction=value)
                 self.assertEqual(submit.validate_plan(older, SCHEMA), [])
 
+    def test_late_probe_rejection_reuses_attachments_next_day(self):
+        import fbr_quota as quota
+        task = self.ready()
+        ids = lib.load_json(task / 'trace/ids.json')
+        source = task / 'trace' / ids['session_file']
+        source.write_text(source.read_text().replace('2026-11-10T10:', '2026-11-10T13:'))
+        self.refresh_source_fixture(task)
+        self.review_receipt(task)
+        quota.now.return_value = quota.datetime(2026, 11, 10, 22, tzinfo=quota.BJ)
+        quota.snapshot.return_value = (70, {str(n): f'other-{n}' for n in range(101, 171)}, 0)
+        client = FakeClient()
+        with mock.patch.object(client, 'create', side_effect=fbr_platform.PlatformHTTPError(429, daily_limit=True)) as create:
+            self.assertEqual(self.execute(client)['tasks'][0]['state'], 'quota_wait')
+            self.assertEqual(self.execute(client)['tasks'][0]['state'], 'quota_wait')
+            self.assertEqual(create.call_count, 1)
+        self.assertEqual(self.receipt(task)['state'], 'uploaded')
+        quota.now.return_value += quota.DAY
+        quota.snapshot.return_value = (0, {}, 0)
+        self.assertEqual(self.execute(client)['tasks'][0]['state'], 'confirmed')
+        self.assertEqual(len(client.uploads), 2)
+        self.assertEqual(len(client.creates), 1)
+
+    def test_expiry_is_rechecked_after_write_pacing(self):
+        import fbr_quota as quota
+        task, client = self.ready(), FakeClient()
+        original = submit.wait_for_write_slot
+        def cross_midnight(*args):
+            slot = original(*args)
+            quota.now.return_value += quota.DAY
+            return slot
+        with mock.patch.object(submit, 'wait_for_write_slot', side_effect=cross_midnight):
+            self.assertEqual(self.execute(client)['tasks'][0]['state'], 'expired')
+        self.assertEqual(client.creates, [])
+        self.assertEqual(self.receipt(task)['state'], 'uploaded')
+
     def test_default_dry_run_never_uploads_or_creates(self):
         task_dir, client = self.ready(), FakeClient()
         out = self.run_submit(client, limit=1)
@@ -548,7 +583,10 @@ class Submission(SubmitCase):
         tasks = [self.ready(1, TEXT_A), self.ready(2, TEXT_B)]
         ids_path = tasks[1] / "trace/ids.json"
         ids = lib.load_json(ids_path)
+        source = tasks[1] / 'trace' / ids['session_file']
+        old_session = ids['session_id']
         ids["session_id"] = "s11-test-session-2"
+        source.write_text(source.read_text().replace(old_session, ids['session_id']))
         lib.save_json(ids_path, ids)
         self.refresh_source_fixture(tasks[1])
         self.review_receipt(tasks[1])
@@ -674,11 +712,50 @@ class Submission(SubmitCase):
                     self.execute(client)
                 self.assertEqual((client.uploads, client.creates), ([], []))
 
+    def test_failed_generation_receipt_blocks_batch_and_rolling_before_upload(self):
+        task, client = self.ready(), FakeClient()
+        lib.save_json(task.parent / 'prompt-generation-manifest.json', {'raw_a5_ok': False})
+        with self.assertRaisesRegex(lib.FbrError, 'A-5'):
+            self.execute(client)
+        result = submit.submit_ready(self.root, BATCH, task.name, execute=True,
+                                     confirm='SUBMIT', client=client, interval=0)
+        self.assertNotEqual(result['state'], 'confirmed')
+        self.assertEqual((client.uploads, client.creates), ([], []))
+
+    def test_local_review_can_finish_with_unpublished_snapshot(self):
+        import threading
+        from types import SimpleNamespace
+        import fbr_flow
+        task = self.ready()
+        snapshot = lib.load_json(task / 'review/snapshot.json')
+        lib.save_json(task / 'review/snapshot.json', {**snapshot, 'pushed': False, 'artifact_snapshot': ''})
+        result = fbr_flow.finish_review(task, self.root, self.cfg, SimpleNamespace(
+            batch=BATCH, publish=False, delivery_lock=threading.Lock()))
+        self.assertEqual(result['state'], 'ok')
+        self.assertEqual(lib.load_json(task / 'review/delivery-repair.json')['state'], 'local_accepted')
+        self.assertFalse((task / 'review/upload.json').exists())
+
+    def test_original_trace_with_gateway_key_submits_without_gateway_file(self):
+        from fixtures import KEY
+        task, client = self.ready(), FakeClient()
+        ids = lib.load_json(task / 'trace/ids.json')
+        trace = task / 'trace' / ids['session_file']
+        with trace.open('a') as out:
+            out.write(json.dumps({'type': 'debug', 'fixture': KEY}) + '\n')
+        self.refresh_source_fixture(task)
+        self.review_receipt(task)
+        self.key_file.unlink()
+        self.execute(client)
+        self.assertEqual(len(client.creates), 1)
+        self.assertEqual(client.records[0]['data']['other_issues'], '')
+        artifact = self.root / 'results' / BATCH / task.name / 'trace' / ids['session_file']
+        self.assertEqual(artifact.read_bytes(), trace.read_bytes())
+
     def test_same_session_without_bound_receipt_refuses_duplicates(self):
         task_dir, client = self.ready(), FakeClient()
         ids = lib.load_json(task_dir / "trace/ids.json")
         client.records = [{"id": 99, "data": {"session_id": ids["session_id"], "domain": "游戏、图形与多媒体"}}]
-        with self.assertRaisesRegex(lib.FbrError, "SessionID已存在"):
+        with self.assertRaisesRegex(lib.FbrError, r"SessionID\s*已存在于平台记录 99"):
             self.execute(client)
         self.assertEqual((client.uploads, client.creates), ([], []))
 

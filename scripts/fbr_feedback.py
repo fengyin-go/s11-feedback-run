@@ -7,7 +7,7 @@
 
 当前任务 AI 生成候选并逐句复核，fbr_reviewer.py finalize 校验后保存：
 - evidence/audit.json   逐条需求的结论 + 锚点、实跑过的反例、虚假成功判断
-- review/feedback.json  score、feedback 正文、issues（问题句）、process（过程句）、note（仅内部材料）
+- review/feedback.json  score、feedback 正文、issues（问题句）、process（过程句）、code_review、note（仅内部材料）
 闸门通过才把 feedback 阶段记成 ok，结果表只收通过的。
 """
 
@@ -33,7 +33,63 @@ AUDIT_TEMPLATE = {
                           "probe": "P1", "found_problem": False}],
     "false_success": "无 | 轻微 | 较大 | 严重", "false_success_note": "", "false_success_anchors": [],
 }
+CODE_REVIEW_TEMPLATE = {
+    "version": 1,
+    "baseline_compared": False,
+    "changed_files_reviewed": [
+        {
+            "path": "src/x.py",
+            "requirement_ids": ["R1"],
+            "result": "reviewed | not_applicable",
+            "consumer_check": "改动对应的实际调用方、触发条件和最终结果",
+            "note": "检查了哪个入口、分支、数据写入点和测试",
+            "finding_ids": [],
+        }
+    ],
+    "requirement_checks": [
+        {
+            "requirement_id": "R1",
+            "status": "pass | defect | blocked",
+            "call_chain": ["入口", "服务或处理函数", "数据落点"],
+            "checks": [
+                {
+                    "id": "entrypoint_wiring",
+                    "status": "pass | violation | not_applicable",
+                    "evidence": "代码事实及实际行为，不写泛化评价",
+                },
+                {
+                    "id": "test_quality",
+                    "status": "pass | violation | not_applicable",
+                    "evidence": "相关测试实际覆盖和断言了哪项业务结果",
+                },
+            ],
+            "finding_ids": [],
+        }
+    ],
+    "findings": [
+        {
+            "id": "F1",
+            "requirement_ids": ["R1"],
+            "kind": "logic_error | integration_gap | contract_mismatch | data_integrity | "
+                    "transaction | concurrency_race | idempotency | recovery | compatibility_regression | "
+                    "validation_gap | false_success | minor_format",
+            "evidence_level": "reproduced | code_reachable",
+            "trigger": "可触发该问题的用户动作或数据条件",
+            "expected": "题面要求的正确结果",
+            "actual": "最终产物实际产生的结果",
+            "impact": "用户会看到或无法完成什么",
+            "anchors": [{"type": "file", "path": "src/x.py"}],
+        }
+    ],
+    "verification_gap": {
+        "unresolved_observable": "已排除代码后仍无法观察到的用户结果",
+        "attempted_probes": ["P1"],
+        "blocked_reason": "nondeterministic_unobservable | required_external_service_unavailable | "
+                          "artifact_cannot_expose_result | execution_environment_unsupported",
+    },
+}
 FEEDBACK_TEMPLATE = {
+    "feedback_policy_version": gate.CURRENT_FEEDBACK_POLICY,
     "score": 4, "feedback": "正文",
     "requirements_status": [
         {"requirement_id": "R1", "status": "completed | partial | missing | unverified",
@@ -42,18 +98,20 @@ FEEDBACK_TEMPLATE = {
     ],
     "results": [{"sentence": "正文中描述最终行为的原句", "requirement_ids": ["R1"],
                  "anchors": [{"type": "demo", "index": 1}]}],
-    "score_basis": {"category": "delivery_issue | verification_gap | process_issue | complete",
+    "score_basis": {"category": "delivery_issue | verification_gap | complete",
                     "delivered": "哪些主要要求实际做到", "remaining": "真实缺口、验证边界或已验证完整范围",
                     "why_this_score": "结合最终交付影响解释本档，不能按过程出错次数扣分",
                     "lowest_supported_score": 4,
                     "lower_score_rejected": "说明再低一档为什么缺少确凿证据；1 分写已到最低档",
                     "anchors": [{"type": "demo", "index": 1}]},
     "test_claims": [{"sentence": "正文涉及测试的完整分句，没有则整个列表为空", "requirement_ids": ["R1"],
+                     "use": "delivery | process", "public_behavior": "作为交付证据时引用正文实际业务结果",
                      "behavior": "该测试实际检查的本题行为", "source": {"kind": "probe", "id": "P1"},
                      "output_excerpt": "该次执行的真实输出摘录",
                      "count": None, "count_quote": "仅当正文提到数量时给出原始计数行"}],
-    "issues": [{"sentence": "正文里的原句", "trigger": "在哪一步、什么条件下出的问题", "behavior": "模型实际做了什么",
-                "impact": "对使用的人意味着什么", "anchors": [{"type": "req", "id": "R2"}, {"type": "step", "step": 31}]}],
+    "issues": [{"sentence": "正文里的原句", "trigger": "哪个用户动作或数据条件触发", "behavior": "最终实现实际返回、写入或遗漏了什么",
+                "impact": "对使用的人意味着什么", "finding_id": "F1",
+                "anchors": [{"type": "req", "id": "R2"}, {"type": "file", "path": "src/x.py"}]}],
     "process": [{"sentence": "正文里讲过程的原句", "steps": [12, 13],
                  "evidence": [
                      {"kind": "tool", "step": 12, "field": "target", "excerpt": "原始工具输入中的连续摘录"},
@@ -64,6 +122,7 @@ FEEDBACK_TEMPLATE = {
                                   "source_boundary": True, "scope": True},
                        "note": "说明已回查哪些原始步骤、基线及后续最终状态"}],
     "note": "",
+    "code_review": CODE_REVIEW_TEMPLATE,
 }
 ANCHOR_HELP = """锚点写法（每个都会被核对，对不上就过不了闸门）：
   {"type": "file", "path": "src/a.py"}        本次改动里的文件
@@ -78,6 +137,53 @@ ANCHOR_HELP = """锚点写法（每个都会被核对，对不上就过不了闸
   {"type": "demo", "index": 2}                演示的第 2 条命令"""
 
 
+def _reviewable_changes(facts: dict) -> list[dict]:
+    suffixes = gate.CODE_REVIEW_SOURCE_SUFFIXES
+    return sorted([
+        row for row in facts["changes"]["files"]
+        if Path(str(row.get("path") or "")).suffix.lower() in suffixes
+    ], key=lambda row: str(row.get("path") or ""))
+
+
+def code_review_focus(record: dict, facts: dict) -> list[dict]:
+    """Explain where to look in code without pretending the review is complete."""
+    text = " ".join([
+        str(record.get("prompt") or ""),
+        json.dumps(record.get("requirements") or [], ensure_ascii=False),
+        json.dumps(record.get("review_contract") or {}, ensure_ascii=False),
+    ]).lower()
+    checks = [
+        "entrypoint_wiring", "input_contract", "data_flow", "state_transition",
+        "error_path", "cross_module_consistency", "test_quality",
+    ]
+    groups = (
+        (("并发", "同时", "竞争", "concurr", "race"), ["transaction_boundary", "unique_constraint", "concurrency_probe"]),
+        (("幂等", "重复", "重放", "idempot"), ["idempotency_branch", "replay_state", "duplicate_write"]),
+        (("恢复", "重试", "回滚", "recover", "retry", "rollback"), ["failure_state", "resume_checkpoint", "rollback_path"]),
+        (("导出", "csv", "下载", "export"), ["output_contract", "csv_quoting", "field_mapping"]),
+        (("版本", "历史", "快照", "version", "snapshot"), ["version_selection", "stale_write", "history_visibility"]),
+        (("权限", "停用", "越权", "授权", "permission", "auth"), ["authorization_gate", "disabled_state", "scope_check"]),
+        (("迁移", "兼容", "migration", "compat"), ["migration_order", "compatibility_path", "rollback"]),
+        (("统计", "汇总", "聚合", "指标", "aggregate"), ["aggregation_scope", "source_consistency", "numeric_result"]),
+    )
+    for terms, additions in groups:
+        if any(term in text for term in terms):
+            checks += additions
+    changes = [
+        {
+            "path": row.get("path"),
+            "status": row.get("status"),
+            "added": row.get("added"),
+            "deleted": row.get("deleted"),
+        }
+        for row in _reviewable_changes(facts)
+    ]
+    return [{"priority": "必须", "check": check} for check in dict.fromkeys(checks)] + [
+        {"priority": "先审", "file": row["path"], "status": row["status"]}
+        for row in changes
+    ]
+
+
 def decision_template(task_dir: Path) -> dict:
     record, facts = load_evidence(task_dir)
     contract = record.get("review_contract") or {}
@@ -87,7 +193,9 @@ def decision_template(task_dir: Path) -> dict:
         if isinstance(row, dict) and row.get("source") and row.get("public")
     ]
     probes = load_probes(task_dir)
+    review_files = _reviewable_changes(facts)
     return {
+        "feedback_policy_version": gate.CURRENT_FEEDBACK_POLICY,
         "requirements": [
             {"id": req["id"], "verdict": "做到 | 有问题 | 看不出来", "level": "",
              "note": "", "user_text": "", "anchors": []}
@@ -108,6 +216,38 @@ def decision_template(task_dir: Path) -> dict:
             "delivered": "", "remaining": "", "why_this_score": "",
             "lowest_supported_score": 4, "lower_score_rejected": "", "anchors": [],
         },
+        "code_review": {
+            "version": 1,
+            "baseline_compared": False,
+            "changed_files_reviewed": [
+                {
+                    "path": row.get("path"),
+                    "requirement_ids": [],
+                    "result": "",
+                    "note": "",
+                    "consumer_check": "",
+                    "finding_ids": [],
+                }
+                for row in review_files
+            ],
+            "requirement_checks": [
+                {
+                    "requirement_id": req["id"],
+                    "status": "",
+                    "call_chain": [],
+                    "checks": [],
+                    "finding_ids": [],
+                }
+                for req in record["requirements"]
+            ],
+            "findings": [],
+            "verification_gap": {
+                "unresolved_observable": "",
+                "attempted_probes": [],
+                "blocked_reason": "",
+            },
+        },
+        "code_review_focus": code_review_focus(record, facts),
         "claims": [],
         "language_review": {
             "reviewed": False,
@@ -122,6 +262,11 @@ def decision_template(task_dir: Path) -> dict:
         "note": "",
         "needs_probes": [],
         "template_notes": {
+            "feedback": "第一段用一句概括实际交付，有问题再写触发条件和影响。空行后用模型开头，一句写主要动作，有过程问题再补一句。",
+            "test_claims": "逐条标记 use=delivery 或 process；delivery 填 public_behavior，逐字引用正文中对应的实际业务结果。",
+
+            "code_review": "先看 diff.patch 和调用链，逐需求完成 code_review；发现代码问题优先写 finding、audit 和 issues，不能改写成 verification_gap",
+            "score_category": "现行口径须以实际探测支持 verification_gap；必须根据 code_review 明确选择 complete、delivery_issue 或 verification_gap",
             "trace_reference": "claims[].sources[] 写 path/excerpt；脚本只在摘录唯一时自动补行号和 block",
             "process_audit": "process[] 内写 audit:{checks:{full_trace,baseline,timeline,source_boundary,scope},note}",
             "language_review": "criterion_sentence 必须逐字出现在正文；translated_terms 登记黑话改写，retained_terms 登记必须保留的业务词",
@@ -132,6 +277,7 @@ def decision_template(task_dir: Path) -> dict:
             "probes": [{"id": row.get("id"), "cmd": row.get("cmd"), "rc": row.get("rc")}
                        for row in probes],
             "changed_files": [row.get("path") for row in facts["changes"]["files"]],
+            "review_files": [row.get("path") for row in review_files],
             "demo": [{"index": index, "cmd": row.get("cmd"), "rc": row.get("rc")}
                      for index, row in enumerate(facts["demo"]["steps"], 1)],
         },
@@ -290,6 +436,11 @@ def expand_decision(task_dir: Path, decision: dict) -> tuple[dict, dict]:
         if isinstance(item, dict)
     }
     text = str(decision.get("feedback") or "")
+    policy_version = decision.get("feedback_policy_version")
+    try:
+        policy_version = int(policy_version or 1)
+    except (TypeError, ValueError):
+        policy_version = 1
     requirements = []
     statuses = []
     audit_rows = []
@@ -350,12 +501,17 @@ def expand_decision(task_dir: Path, decision: dict) -> tuple[dict, dict]:
     remaining_rows = [row for row in statuses if row.get("status") != "completed"]
     if not str(basis.get("remaining") or "").strip():
         final_gaps = gate.remaining_gap_sentences(text) if score == 4 else []
+        if policy_version >= gate.CURRENT_FEEDBACK_POLICY:
+            final_gaps = [row['sentence'] for row in issues if row.get('sentence')]
+            if basis.get('category') == 'verification_gap':
+                gap = ((decision.get('code_review') or {}).get('verification_gap') or {}).get('unresolved_observable')
+                final_gaps = [gap] if isinstance(gap, str) and gap in text else []
         basis["remaining"] = final_gaps[-1] if final_gaps else (
             "；".join(row["user_text"] for row in remaining_rows) or
             "现有证据未发现已证实的功能缺口"
         )
         derived_fields.append("score_basis.remaining")
-    if basis.get("category") not in {
+    if policy_version < gate.CODE_REVIEW_POLICY_VERSION and basis.get("category") not in {
         "complete", "process_issue", "verification_gap", "delivery_issue",
     }:
         process_problem = any(
@@ -419,6 +575,7 @@ def expand_decision(task_dir: Path, decision: dict) -> tuple[dict, dict]:
             language_review["criterion_sentence"] = contract["key_business_constraint"]
             derived_fields.append("language_review.criterion_sentence")
     feedback = {
+        "feedback_policy_version": policy_version,
         "score": score,
         "feedback": text,
         "requirements_status": statuses,
@@ -428,6 +585,7 @@ def expand_decision(task_dir: Path, decision: dict) -> tuple[dict, dict]:
         "issues": issues,
         "process": process,
         "process_audit": process_audit,
+        "code_review": decision.get("code_review") or {},
         "note": decision.get("note") or "",
     }
     claims = _normalize_rows(text, _enrich_claim_sources(task_dir, decision.get("claims")))
@@ -545,6 +703,17 @@ def build_card(record: dict, facts: dict, probes: list[dict]) -> str:
             out.append(f"- {label}：{row['file']}：{row['line']}")
     out.append("- 完整 diff 在 review/diff.patch")
 
+    out += ["", "## 代码缺陷审查（评分前必须完成）", "",
+            "- 先审最终产物，再看模型过程；每个相关改动文件都要给出 reviewed 或 not_applicable 及理由。",
+            "- 沿入口追到数据写入、返回或导出位置，区分基线已有与本次引入的问题。",
+            "- 发现可达代码问题优先写 code_review.findings、audit 和 issues；不能改写成 verification_gap。"]
+    focus = code_review_focus(record, facts)
+    for row in focus:
+        if "file" in row:
+            out.append(f"  - 先审 {row['file']}（{row['status']}）")
+        else:
+            out.append(f"  - 必查代码点：{row['check']}")
+
     out += ["", "## 过程（轨迹）", "",
             f"- 模型自己跑过测试：{'是' if check['tests_run'] else '否'}；最后一次改动在第 {check['last_edit_step']} 步，"
             f"之后{'又验证过' if check['verified_after_last_edit'] else '没有再验证'}；"
@@ -593,10 +762,12 @@ def build_capsule(record: dict, facts: dict, probes: list[dict]) -> dict:
     demo = facts["demo"]
     errors = [step for step in facts["trace"]["steps"] if step.get("is_error")]
     return {
-        "version": 2,
+        "version": 3,
         "task_id": record["task_id"],
         "guidance": fbr_style.generation_guidance(),
         "build_contract": [
+            "评分前先完成 code_review：审完全部相关改动文件和每条需求的调用链，再选择分数类别。",
+            "已有代码或功能缺陷优先写 delivery_issue；所有相关代码排除后，才允许 verification_gap。",
             "requirements_status、process_audit、score_basis 缺省项由 requirements/process/claims 生成，不要重复手填。",
             "process.evidence 会自动定位原始轨迹并合并到同一句 claim.sources。",
             "score_basis.anchors 优先从 requirements 和 results 的 anchors 取；没有有效锚点时仍会阻断。",
@@ -607,6 +778,23 @@ def build_capsule(record: dict, facts: dict, probes: list[dict]) -> dict:
             for req in record["requirements"]
         ],
         "contract": record.get("review_contract") or {},
+        "code_review": {
+            "required": True,
+            "policy_version": gate.CURRENT_FEEDBACK_POLICY,
+            "review_files": [row.get("path") for row in _reviewable_changes(facts)],
+            "focus": code_review_focus(record, facts),
+            "review_order": ["逐个变更文件追到调用方，写 consumer_check：输入、实际结果、基线差异",
+                             "逐条从题面真实入口追到最终写入、返回或导出，记录证据；按题面先写预期再和实际比较，区分正常拒绝、本次回归、应修未修与无关旧缺陷",
+                             "初看满分时再查高风险下游及真实边界；按最终影响评分。只修评价或补证，不改被测代码"],
+            "writing": "产物段一句概括完成情况，再写真实缺陷；过程段以模型开头，一句概括动作，有问题才补一句。",
+
+            "change_signals": {
+                "tests_deleted": changes.get("tests_deleted", []),
+                "tests_weakened": changes.get("tests_weakened", []),
+                "skips_added": changes.get("skips_added", [])[:10],
+                "placeholders": changes.get("placeholders", [])[:10],
+            },
+        },
         "tests": {
             "setup_cmd": tests.get("setup_cmd"),
             "test_cmd": tests.get("test_cmd"),
@@ -710,6 +898,7 @@ def build_capsule(record: dict, facts: dict, probes: list[dict]) -> dict:
             "diff": "review/diff.patch",
             "trace_pack": "trace/review-pack.json",
             "candidate_schema": "review/candidate-schema.json",
+            "code_review": "review/code-review.json（过闸后生成）",
             "recording": "record/recording.json",
             "pages": "record/pages/",
             "exact_trace": (
@@ -735,6 +924,11 @@ def render_capsule(capsule: dict) -> str:
         "",
         *[f"- {value}" for value in capsule.get("build_contract", [])],
         "",
+        "## 代码缺陷审查",
+        "",
+        "- 先审 review/diff.patch 和最终源码，再按需求检查入口接入、参数契约、数据落点、事务、并发、幂等、恢复和测试质量。",
+        "- 代码问题能确证时优先写 finding；不能只凭模型没有验收就判 verification_gap。",
+        "",
         "## 题面",
         "",
         capsule.get("prompt", ""),
@@ -749,6 +943,24 @@ def render_capsule(capsule: dict) -> str:
     if contract:
         out += ["", "## Review Contract", "", "```json",
                 json.dumps(contract, ensure_ascii=False, indent=2), "```"]
+    code_review = capsule.get("code_review") or {}
+    if code_review:
+        out += ["", "## 代码审查入口", ""]
+        for path in code_review.get("review_files", []):
+            out.append(f"- 必审文件：{path}")
+        for row in code_review.get("focus", []):
+            if row.get("file"):
+                out.append(f"- 先审改动：{row.get('file')}（{row.get('status')}）")
+            else:
+                out.append(f"- 必查代码点：{row.get('check')}")
+        signals = code_review.get("change_signals") or {}
+        for key, label in (("tests_deleted", "被删测试"), ("tests_weakened", "削弱测试"),
+                           ("skips_added", "新增跳过"), ("placeholders", "占位实现")):
+            values = signals.get(key) or []
+            if values:
+                if isinstance(values[0], dict):
+                    values = [f"{row.get('file')}：{row.get('line')}" for row in values]
+                out.append(f"- {label}：{'、'.join(map(str, values))}")
     tests = capsule.get("tests", {})
     before, after = tests.get("before", {}), tests.get("after", {})
     out += [

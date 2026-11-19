@@ -4,7 +4,7 @@ fbr_reviewer.py review 仅通过 reviewer.env 分析轨迹并返回 needs_task_a
 
 ## feedback.json 的内部字段
 
-现有 score、feedback、issues、process、note 保留；新增三项及 `process_audit` 仅供核对，不进入平台或结果表正文。
+现有 score、feedback、issues、process、note 保留；`feedback_policy_version: 2` 还会写入 `code_review`，该字段及 `process_audit` 仅供核对，不进入平台或结果表正文。
 
 默认作者格式是 `review/decision-input.json`：需求条目同时保留 `verdict/level/note/user_text/anchors`；`process[]` 可内嵌 `audit`；顶层 `claims[]` 按正文顺序保存逐句断言和原始来源；`quality_checks` 保存七项检查理由；`language_review` 保存最关键业务约束句、黑话改写和必要业务词。`fbr_reviewer.py build` 只做结构展开：从需求生成 audit/requirements_status，从 claims 生成 claim_reviews，从 process.audit 生成 process_audit，从检查理由生成 verification，并把 language_review 原样带入。脚本不生成或修改评分、需求结论、过程判断和正文。
 
@@ -23,7 +23,8 @@ fbr_reviewer.py review 仅通过 reviewer.env 分析轨迹并返回 needs_task_a
 
 - requirements_status：逐项 {requirement_id, status, user_text, anchors}。status 为 completed、partial、missing、unverified，必须与 audit 的“做到/有问题/看不出来”及问题级别一致，并覆盖全部需求点。user_text 写用户能看到的完成能力、部分能力或具体缺口；results 的 requirement_ids 合起来也必须覆盖全部需求。
 - results：至少一条 {sentence, requirement_ids, anchors}。sentence 是正文中说明最终行为的连续原文，requirement_ids 指向真实需求；anchors 至少含产物文件、缺失文件、运行日志、probe、演示或失败用例证据。不能只填需求编号或过程步骤。
-- score_basis：{category, delivered, remaining, why_this_score, lowest_supported_score, lower_score_rejected, anchors}。category 为 delivery_issue、verification_gap、process_issue 或 complete。`complete` 只对应 5 分；平台可交付的 4 分只用 `verification_gap` 或 `delivery_issue`。`process_issue` 只作内部诊断，不能作为平台 4 分，因为平台自动一致性复核会要求最终交付扣分点。4 分的 `remaining` 必须逐字复制正文中的同一最终缺口句，不能写“没有已证实功能缺口”或“过程有返工”。lowest_supported_score 必须等于 score；lower_score_rejected 至少 8 字，解释为什么不能更低（1 分说明已最低）；anchors 必须真实有效。确证前提下选择最低合理档位。
+- score_basis：{category, delivered, remaining, why_this_score, lowest_supported_score, lower_score_rejected, anchors}。旧记录兼容 `process_issue`，但 policy v2 只能使用 `delivery_issue`、`verification_gap` 或 `complete`。`complete` 只对应 5 分；平台可交付的 4 分只用 `verification_gap` 或 `delivery_issue`。`process_issue` 只作内部诊断，不能作为平台 4 分，因为平台自动一致性复核会要求最终交付扣分点。4 分的 `remaining` 必须逐字复制正文中的同一最终缺口句，不能写“没有已证实功能缺口”或“过程有返工”。lowest_supported_score 必须等于 score；lower_score_rejected 至少 8 字，解释为什么不能更低（1 分说明已最低）；anchors 必须真实有效。确证前提下选择最低合理档位。
+- code_review：policy v2 必填，按需求覆盖所有相关生产代码和测试改动文件；每条需求至少两个代码检查项。每个 finding 写 kind、evidence_level、trigger、expected、actual、impact 和 anchors，并关联 reviewed 文件；代码可达缺陷必须有真实文件与至少两个节点的调用链，复现缺陷必须绑定实跑或失败日志。已有 finding 时禁止使用 complete 或 verification_gap，必须进入 delivery_issue，并由 issue.finding_id 对应正文。
 - test_claims：正文有测试描述时逐处登记 {sentence, requirement_ids, behavior, source, output_excerpt, count, count_quote}，没有时为 []。sentence 要覆盖完整相关分句，不能只标出 make test 而漏掉后面的通过结论。behavior 说明检查的本题行为；output_excerpt 是该次执行真实输出中的连续摘录。
 - language_review：{reviewed, criterion_sentence, translated_terms, retained_terms, note}。criterion_sentence 必须逐字出现在正文并说明本轮最看重的业务约束；translated_terms 登记黑话到用户语言的改写；retained_terms 只登记确有必要保留的术语并逐项说明理由。
 
@@ -33,7 +34,7 @@ source 仅用以下一种：{"kind":"trace","step":6}、{"kind":"probe","id":"P1
 
 正文提到数量时 count 为整数，count_quote 是同一次输出的计数原行；不报数量时 count 为 null，count_quote 为空。脚本检查摘录存在和数字出处，独立复核再检查该数字的含义、执行是否成功、测试与题目的关系，不能把日志里任意相同数字当测试数。
 
-process 每项必须包含真实 steps 和至少一条 evidence。工具证据为 {kind:"tool", step, field:"tool|target|output|error", excerpt}，摘录必须落在该步骤对应字段；没有任何工具步骤的特殊会话才允许 {sentence, steps:[], source:"conversation", evidence:[{kind:"assistant", index, excerpt}]}。有步骤时不得使用对话例外。issues 只写真实功能/交付问题，不用未验证冒充缺陷。唯一限制是验证不足的 4 分可留空 issues，但须通过 verification_gap 条件及独立复核。
+process 每项必须包含真实 steps 和至少一条 evidence。工具证据为 {kind:"tool", step, field:"tool|target|output|error", excerpt}，摘录必须落在该步骤对应字段；没有任何工具步骤的特殊会话才允许 {sentence, steps:[], source:"conversation", evidence:[{kind:"assistant", index, excerpt}]}。有步骤时不得使用对话例外。issues 只写真实功能/交付问题，不用未验证冒充缺陷。policy v2 的 delivery_issue 问题句必须写 finding_id；唯一限制是验证不足的 4 分可留空 issues，但必须有已执行 probe、客观 blocked_reason 和完整 code_review。
 
 process_audit 必须与 process 等长、同序、同句，每项为 {sentence, subject:"model", verdict:"supported", checks:{full_trace:true, baseline:true, timeline:true, source_boundary:true, scope:true}, note}。五项分别核对完整会话、初始基线、后续时间线、模型轨迹与验收证据的边界，以及“只/仅/从未/没有”等范围表述。过程句出现 probe/验收侧、没有浏览器轨迹却写模型点击页面、或把基线已有行为归给模型时，闸门拒绝。每条 evidence 还必须由 claim_reviews 中同一原始轨迹摘录再次引用；布尔 check 不能替代原文。
 
@@ -43,15 +44,15 @@ process_audit 必须与 process 等长、同序、同句，每项为 {sentence, 
 
 | id | 核对内容 |
 | --- | --- |
-| result_and_process | 结果段先对照提示词说明哪些明示功能已完成、哪些未完成或仍有缺口；全部做到时直接陈述实际完成的能力，不写“未发现其他明确未完成功能”这类空泛完成度句。过程选择能说明结果或验证可信度，最多 3 句，只保留最有解释力的真实事件。存在首测失败、错误断言、并发校验写错、报错、返工或实现被推翻时，必须写清模型最初做了什么、问题为何出现、后来如何修正以及最终结果；只写未覆盖、未验证或末轮通过不算过程分析。全文“模型”最多出现一次，第一次点明主体后，后续动作改用“它”或直接省略主语。5 分正文不得出现上述真实过程问题；出现时最高 4 分。4 分还必须在最终交付上留下明确缺口，process_issue 不能替代这一句 |
+| result_and_process | 新稿按两个自然段写。第一段首句概括实际完成的功能，有已证实的瑕疵再写触发条件、实际结果和影响。第二段以“模型”开头，用一句话写主要操作，有真实过程问题再用一句说明波折及后续状态。核对主体、后续状态及证据。 |
 | task_specific_voice | 事实决定句序，读起来是具体判断，没有空泛赞美、装饰细节或机械褒贬配额；点明本轮最看重的业务约束，内部术语已翻成用户能理解的动作和结果 |
 | test_relevance | 每处测试描述对应本题行为，执行来源、成功状态、计数及结论范围一致 |
-| score_alignment | 分数、问题严重度、剩余工作一致，既拦无证据压分，也拦有证据却给高；纠正的过程失误不自动扣分；验证不足不伪装成缺陷 |
-| evidence_fidelity | 结果和过程原句均由相应证据支持，风险不升级成已发生事故，没有虚假实跑 |
+| score_alignment | 分数、问题严重度、剩余工作一致；先采用已证实的代码或功能缺陷，再考虑 verification_gap。既拦无证据压分，也拦有缺陷却只写未验证；纠正的过程失误不自动扣分 |
+| evidence_fidelity | 结果、代码审查和过程原句均由相应证据支持；代码可达问题有真实调用链和触发条件，复现问题有实跑输出；没有虚假实跑 |
 | scope_discipline | 只评价本轮约定和受影响兼容路径，不把可选增强、工程故障当缺项 |
 | non_template | 与其他反馈比较，未复用开头、转折、收尾或仅替换技术名词和数字的框架 |
 
-全部通过才写有效回执。结果段没有先交代功能完成度、过程超过 3 句，或全文重复使用“模型”的候选直接退回。5 分额外做一致性检查：正文已经写出真实错误验证、错判、实现返工或关键竞争未正确复核时，不允许保留 5 分；应重新核实并形成 verification_gap、delivery_issue 或更低分，不能用删掉过程问题的方式规避。4 分还必须通过平台交付扣分点检查：正文存在最终缺口且 `score_basis.remaining` 对应该句；纯 `process_issue` 直接阻断。质量文件绑定输入摘要、audit/feedback 摘要、生成规则摘要、当前任务 AI 来源及轨迹分析调用回执，随交付导出。旧结果缺少该回执或基于旧规则生成时，阻止再次交付并提示重新验收；不静默改动已有评价或平台记录。
+全部通过才写有效回执。新稿按两个自然段写。第一段首句概括实际完成的功能，有已证实的瑕疵再写触发条件、实际结果和影响。第二段以“模型”开头，用一句话写主要操作，有真实过程问题再用一句说明波折及后续状态。4 分还须检查交付扣分点。正文存在最终缺口且 `score_basis.remaining` 对应该句；纯 `process_issue` 或仅有模型“没验收/没核对”直接阻断。policy v2 的 verification_gap 还必须有完整 code_review、已执行 probe 和客观 blocked_reason。质量文件绑定输入摘要、audit/feedback 摘要、生成规则摘要、当前任务 AI 来源及轨迹分析调用回执，随交付导出。旧结果缺少该回执或基于旧规则生成时，阻止再次交付并提示重新验收；不静默改动已有评价或平台记录。
 
 正文不得直接写取证载体，也不能把模型过程写成无主语播报。`result_and_process` 复核时，要把“轨迹”“录屏”“录制”“素材卡”“事实卡”“原始会话”“工具返回”以及“证据显示/表明”视为来源口吻并要求改写；同时检查至少一句直接描述模型的行为链。只写“回归通过、构建完成”不够；只写“某边界没有覆盖”也不够。验收环境的浏览器、Chromium/系统库、`sudo`、`httpx2`、安装超时和本地端口问题不属于模型过程，必须删除，不能用来写“页面端到端未执行”或压低评分。原始过程里存在失败、误判、错误断言或验证器本身写错时，要优先写模型当时的做法、暴露出的问题、修正动作和最终影响，例如“模型先用并发 curl 校验重复提交，却把多段响应拼在一起解析，报出 JSONDecodeError；改成五个独立线程分别读取后，才确认五次提交共用同一批次”。没有真实失败或返工时，才允许写成具体实现、验证策略和最终边界，不能用“额外边界没有问题”代替分析。内部记录仍保留原始路径和连续摘录，不能为了改正文删掉证据。
 
@@ -68,3 +69,5 @@ sources 引用本题原始会话、工具返回、命令日志、probe、题面�
 重点复查：调用是否真正成功、后面有没有重试并修好、当前文件是否仍有缺陷、基线是否本来如此、失败是否来自验收环境，以及局部输入能否支持所写影响范围。声称“未实现”须核对实际入口和调用链；声称“从未/没有再验证”须查完整相关后续会话；业务影响与因果需有机制或复现支持。找不到证据时删除或缩小断言，需实跑则返回 probe，不以常识或模型推断补齐。
 
 逐句记录保存在 quality.json 和失败版本的 history 中，随正文、原始材料及规则摘要绑定。七项总体通过但逐句记录缺失、摘录伪造或仍有不确定断言，同样拒绝交付。该机制减少幻觉风险，不宣称脚本能自动证明任意语义结论。
+
+新稿每条 test_claims 填用途 use。delivery 填 public_behavior 并引用正文里对应的业务结果，核对同次运行的测试断言与输出。process 用于模型实际执行的操作，允许过程句写构建成功。若把成功状态当作修好业务的结论，须补该行为的验证或收窄表述。

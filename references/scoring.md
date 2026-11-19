@@ -12,7 +12,21 @@
 
 ### 5 分与过程观感
 
-5 分是“一次性完美跑通”，不是“最后都修好了”。同一份 Feedback 里如果已经写出模型验证器本身写错、核心断言错判、实现导出的构建失败、错误载荷验证后才返工，或关键竞争只做了顺序/单进程验证，读者会看到明确过程问题，此时最高 4 分。`process_issue` 只保留为内部诊断，不再是可以提交平台的 4 分依据。
+先沿本次改动追到真实调用方，再从每条需求的入口追到交付结果；初看完整时复查高风险边界。按实际影响定档，已修好的过程波折如实保留。交付完整且五分所需边界验证通过时可给五分。
+
+先独立写出该输入在题面下应该得到什么，再比较实际结果。比如撤销后的迟到请求按约定返回 409、越权登记按约定返回 403，均是正确行为。若拒绝后仍写入数据，定位这次额外写入及用户后果，作为单独缺陷。
+
+## 代码缺陷优先
+
+从 `feedback_policy_version: 2` 起，评分前必须先完成 `code_review`。代码审查针对最终产物，不是复述模型轨迹，也不是只看 diff 摘要：
+
+1. 审查所有与需求相关的生产代码和测试变更；每个文件写清 `reviewed` 或 `not_applicable` 的理由。
+2. 从入口沿调用链追到数据写入、返回、导出或下游消费位置。
+3. 把问题与初始提交对照，区分基线已有、本轮引入和题面要求修复。
+4. 检查参数契约、状态流转、事务边界、并发竞争、幂等、失败恢复、跨模块一致性和测试是否被削弱。
+5. 能由代码和运行证据确证的缺陷写成 `findings`，并优先落到 `delivery_issue`，不能改写成验证缺口。
+
+只有相关代码路径已经排除、关键 probe 已经尝试，仍然无法观察题面要求的用户结果时，才允许 `verification_gap`。`verification_gap` 必须列出已尝试的 probe 和客观阻塞原因；只写“模型没有验证”“模型没有核对”“模型没做验收”直接阻断。代码能确证的问题不重复跑服务；动不了代码但可由行为复现的问题才需要定向 probe。
 
 当前平台按交付完整性做自动一致性复核。纯 `process_issue` 4 分即使如实写了返工，只要最终交付
 没有留下缺口，也会被“4 分但 Feedback 未指出交付扣分点”打回。因此平台可用的 4 分必须是：
@@ -20,11 +34,11 @@
 - `verification_gap`：主要需求可用，但有一个题面相关的关键边界尚未实跑或无法确认；
 - `delivery_issue`：最终产物仍有已证实的轻微交付问题，正文写出触发条件、行为和用户影响。
 
-两类都必须让正文最后一个结果段明确出现“最终仍缺少”“当前仍无法确认”“导出入口仍返回 422”
+两类都必须让产物段明确出现“最终仍缺少”“当前仍无法确认”“导出入口仍返回 422”
 这类最终状态。只有过程返工、修正后通过、产物无问题，不能作为 4 分。若重新核实后所有重要边界
 都通过，应重新评估 5 分，不能为了压低比例保留过程型 4 分。
 
-因此不能一边在过程段写“模型先用错误方式验证，后来改对”，一边仍给 5 分。5 分的正文应当呈现具体但顺畅的验证路径，没有需要靠返工才成立的结论。保留真实过程并调整分数，比删掉过程问题保住 5 分更符合事实。
+先沿本次改动追到真实调用方，再从每条需求的入口追到交付结果；初看完整时复查高风险边界。按实际影响定档，已修好的过程波折如实保留。交付完整且五分所需边界验证通过时可给五分。
 
 ## 五档标准（任务文档原文）
 
@@ -56,7 +70,7 @@
 4. 看 `review/diff.patch`。留意改动清单里标出来的：被删的测试、删得比加得多的测试、新加的跳过标记、新增的 TODO 或占位实现。测试变绿如果是靠删用例或加跳过换来的，按没做到算。
 5. 看轨迹步骤索引：模型读了哪些文件才动手、有没有跑测试、最后一次改动之后有没有再验证、报错之后是修了还是绕开了。
 6. 看模型最后的回答，逐句对产物：它说做了的，产物里有没有；它说跑通的，轨迹里有没有那一步、那一步是不是真的通过。
-7. 光看代码定不了的，实跑。
+7. 先审查最终代码和调用链；代码能确证的问题直接形成 finding，只有代码和现有输出都不能定论时才实跑。
 
 ## 实跑（probe）
 
@@ -106,6 +120,74 @@ fbr_feedback.py probe --batch b1110-01 --task s11-000123 --cmd '<命令>'
 - `counterexamples`：实跑过的边界情况。`probe` 必须是 `probes.jsonl` 里存在的编号；
   `found_problem` 如实填；用于 5 分时必须写 `prompt_implied: false`。
 - `false_success`：无 / 轻微 / 较大 / 严重。不是「无」就必须写 `false_success_note`（模型说了什么、实际是什么）和 `false_success_anchors`。
+
+## code_review
+
+`review/decision-input.json` 与 `review/feedback.json` 从 policy v2 起必须包含：
+
+```json
+{
+  "feedback_policy_version": 2,
+  "code_review": {
+    "version": 1,
+    "baseline_compared": true,
+    "changed_files_reviewed": [
+      {
+        "path": "backend/app/services/example.py",
+        "requirement_ids": ["R1"],
+        "result": "reviewed",
+        "note": "核对入口、条件分支、写入点和错误路径",
+        "finding_ids": ["F1"]
+      }
+    ],
+    "requirement_checks": [
+      {
+        "requirement_id": "R1",
+        "status": "defect",
+        "call_chain": ["POST /api/example", "example.run", "repository.save"],
+        "checks": [
+          {
+            "id": "transaction_boundary",
+            "status": "violation",
+            "evidence": "状态记录先提交，业务结果随后写入，第二步失败会留下半个状态"
+          }
+        ],
+        "finding_ids": ["F1"]
+      }
+    ],
+    "findings": [
+      {
+        "id": "F1",
+        "requirement_ids": ["R1"],
+        "kind": "transaction",
+        "evidence_level": "code_reachable",
+        "trigger": "业务结果写入失败",
+        "expected": "状态和结果同时提交",
+        "actual": "状态已提交但结果缺失",
+        "impact": "用户看到已完成却无法读取结果",
+        "anchors": [{"type": "file", "path": "backend/app/services/example.py"}]
+      }
+    ],
+    "verification_gap": {
+      "unresolved_observable": "",
+      "attempted_probes": [],
+      "blocked_reason": ""
+    }
+  }
+}
+```
+
+每条需求至少登记两个代码检查项，且至少一项为 pass 或 violation。文件级锚点只能说明看过文件，
+不能单独证明缺陷。`code_reachable`
+必须同时有真实代码锚点和至少两个节点的调用链；`reproduced` 必须绑定 probe、失败测试、日志或
+演示。每个 finding 都要关联 reviewed 文件、在 audit 中形成“有问题”结论，并在 issues 正文中有
+对应原句。
+
+代码审查状态必须与 audit 对齐：`pass` 对应需求做到，`defect` 对应有问题并给出 finding，
+`blocked` 对应看不出来。不能 audit 写做到、代码审查却留 blocked，也不能 audit 已判问题而代码层
+没有任何 finding。
+
+验证缺口不能因为模型没跑测试而成立。必须已经执行至少一个相关 probe，`blocked_reason` 取 `nondeterministic_unobservable`、`required_external_service_unavailable`、`artifact_cannot_expose_result` 或 `execution_environment_unsupported`，并写明仍无法观察的用户结果。
 
 ## 虚假成功
 
@@ -184,7 +266,8 @@ fbr_feedback.py probe --batch b1110-01 --task s11-000123 --cmd '<命令>'
 看完实跑结果需要改结论，由当前任务 AI 重新检查、修改候选并逐句复核，再通过 `fbr_reviewer.py finalize` 校验绑定及门闸。不要为了过闸门把明显问题改叫细节。
 
 交付完整性衡量最终完成程度。已修复且最终无影响的夹具错误、命令失误或排错尝试可以写过程反馈，
-不能按发生次数扣分。只因验证材料不足以满足 5 分条件时，可给 4 分并说明证据边界，
-`score_basis.category` 为 `verification_gap`；这不代表发现了功能问题，`issues` 可以为空。
+不能按发生次数扣分。只有代码审查已覆盖相关改动、至少一个 probe 已执行且仍存在客观不可观察边界时，
+才可给 4 分并说明证据边界，`score_basis.category` 为 `verification_gap`；这不代表发现了功能问题，
+`issues` 可以为空，但 `code_review.verification_gap` 不得为空。
 `score_basis.remaining` 必须逐字复制正文中的同一最终缺口句，平台预检会核对两者是否一致。
 真实问题与验证缺口不可互换，语义复核会检查分数、本档理由和正文的一致性。

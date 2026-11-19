@@ -6,9 +6,10 @@
 才可能通过的失败，直接写 `review/platform-deprecated.json` 并在本地废弃，不继续处理。
 
 命中“自动一致性复核：交付完整性非满分（4 分），但 Feedback 未指出任何交付扣分点”时，不要
-直接改同义句。先重新核实最终产物和现有 probe：有真实轻微缺陷时用 `delivery_issue` 并写清
-用户影响；确认有一个题面相关的重要边界未实跑时用 `verification_gap` 并写最终缺口；所有重要
-边界都通过时重新评估 5 分。纯 `process_issue` 的 4 分会在 build、finalize 和平台预检被阻断。
+直接改同义句。先按 `review-capsule.json` 完成代码审查和最终产物核实：有真实代码或功能瑕疵时
+用 `delivery_issue` 并写清用户影响；相关代码已排除、已有 probe 执行但仍客观无法观察时，才用
+`verification_gap`；所有重要边界都通过时重新评估 5 分。纯 `process_issue` 或“模型没有验收”
+不能作为 4 分依据。
 
 ## 按失败来源继续处理
 
@@ -17,6 +18,9 @@
 - **录屏、setup 或测试材料缺失/失效**：区分环境问题与真实产物问题。恢复验收环境、按原命令重试准备或补录实际功能、补充最小定向 probe，保留失败记录，再更新 facts/card 和独立回执。原有有效材料能复用就复用；变更材料后重验受影响的下游绑定。
 - **轨迹或精确来源失效**：先运行 `fbr_evidence.py ingest --force` 重建 manifest、事件图、偏移和 trace-check，再重新生成 trace-analysis/card/brief 并核对 claim 来源。旧行号、旧 block、旧 hash 不得继续使用；不能用卡片摘要或 facts 摘要替代原始区间。
 - **评价、来源、格式、测试描述、评分依据或查重失败**：由当前任务 AI 根据具体错误及当前证据持续修复、逐句复核，再用 `fbr_reviewer.py finalize` 验证。生成回执有效但批次 gate 失败，也必须进入回修，不能反复沿用同一候选。只有轨迹分析读取 reviewer.env；其他修复由推进任务的当前 AI 完成。
+- **代码审查缺失或 finding 未映射**：先重新读取相关 diff hunk、最终代码和调用链，逐文件补齐
+  `code_review`，把缺陷写入 audit、finding 和正文 issues；不能通过删除 finding 或改叫
+  `verification_gap` 绕过闸门。验证缺口必须补已执行 probe 和客观 blocked_reason。
 - **已有平台单的题目级领域、难度、工作量或查重失败**：`DOMAIN_MISMATCH`、
   `trace_complexity_floor`、`trace_tool_call_floor`、`dedup`、`dedup_semantic` 都不属于
   Feedback 可修范围。保留失败检查和原题冻结字段，写 `review/platform-deprecated.json`

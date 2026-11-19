@@ -89,6 +89,14 @@ class Sandbox(unittest.TestCase):
             "git_user_name": "Self Test", "git_user_email": "selftest@example.com",
             "submitter": "测试员", "key_file": str(self.key_file), "concurrency": 2, "gateway": {"retry_base": 0}})
         (self.root / "batches" / BATCH).mkdir(parents=True)
+        # Existing trace fixtures finish at 18:00 Beijing time on November 10.
+        from unittest import mock
+        import fbr_quota as quota
+        for patcher in (mock.patch.object(quota, 'now', return_value=quota.datetime(2026, 11, 10, 19, tzinfo=quota.BJ)),
+                        mock.patch.object(quota, 'snapshot', return_value=(0, {}, 0)),
+                        mock.patch.dict(os.environ, {'SOLO11_QUOTA_DIR': str(self.tmp / 'runtime')})):
+            patcher.start()
+            self.addCleanup(patcher.stop)
         self.cfg = lib.settings(self.root)
 
     # ---------- 任务目录 ----------

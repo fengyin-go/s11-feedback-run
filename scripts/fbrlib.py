@@ -30,10 +30,6 @@ class FbrError(Exception):
     """可预期的失败：信息直接给人看。"""
 
 
-class KeyLeakError(FbrError):
-    """原始证据含网关 key，必须留存并停止，不能按普通运行异常重跑。"""
-
-
 TASK_ID_RE = re.compile(r"^(?:s11-(\d{6})|[A-Za-z0-9_.-]+-(?:0[1-9]|[1-9][0-9])-(?:development|bugfix|optimization|refactor|migration))$")
 BATCH_ID_RE = re.compile(r"^b(\d{4})-(\d{2})$")
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -96,6 +92,7 @@ DEFAULTS = {
         "min_counterexamples": 2,                 # 5 分至少要有这么多个实跑过的反例
     },
     "submit": {
+        "daily_limit": 70,
         "interval_seconds": 10,
         "rate_limit_retries": 3,
         "rate_limit_backoff_seconds": [15, 30, 45],
@@ -340,6 +337,9 @@ def handoff_payload(
         keys += ("producer", "execution_mode", "branch", "origin", "workspace")
         if "repro_evidence" in record:
             keys += ("repro_evidence",)
+        if record.get('contract_binding_version') == 1:
+            keys += ('contract_binding_version', 'sequence', 'topic_map_sha256', 'generation_sha256',
+                     'review_contract_sha256', 'feedback_policy_version')
         if include_domain_contract:
             keys += ("domain_contract", "domain_gate_version")
     return {"task": {key: record.get(key) for key in keys}, "recording": recording}
@@ -449,6 +449,14 @@ def validate_handoff(
     if len(matches) != 1 or len({item.get("task_id") for item in rows}) != len(rows):
         raise FbrError(f"{task_dir.name}：批次交接清单任务缺失或重复")
     row = matches[0]
+    if manifest.get('contract_binding_version') or record.get('contract_binding_version'):
+        if manifest.get('contract_binding_version') != 1 or record.get('contract_binding_version') != 1:
+            raise FbrError('交接规则版本不一致')
+        for filename, key in [('repo-topic-map.json', 'topic_map_sha256'),
+                              ('prompt-generation-manifest.json', 'generation_sha256')]:
+            source = task_dir.parent / filename
+            if source.is_symlink() or not source.is_file() or hashlib.sha256(source.read_bytes()).hexdigest() != record.get(key):
+                raise FbrError(f'{filename} 与冻结交接版本不一致')
     for key in ("repo_id", "initial_commit", "task_type", "difficulty", "baseline_id", "handoff_hash", "task_repo"):
         if row.get(key) != record.get(key):
             raise FbrError(f"{task_dir.name}：批次清单的 {key} 与任务不一致")
@@ -896,14 +904,6 @@ def redact(text: str, secrets: tuple[str, ...] | list[str] = ()) -> str:
             text = text.replace(base64.b64encode(f"x-access-token:{secret}".encode()).decode(), "***")
     text = re.sub(r"(?i)\b(apikey|ANTHROPIC_AUTH_TOKEN)=\S+", r"\1=***", text)
     return TOKEN_RE.sub("***", text)
-
-
-def key_occurrences(path: Path, secret: str) -> int:
-    """只读统计 key 原文，不改写原始输出或轨迹，也不返回 key 内容。"""
-    if not secret or not Path(path).is_file():
-        return 0
-    data = Path(path).read_bytes()
-    return data.count(secret.encode())
 
 
 # ---------- 文本 ----------

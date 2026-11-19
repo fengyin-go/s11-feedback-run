@@ -279,10 +279,13 @@ def render(plan, container, port, out_dir, rec):
                             continue
                         hold_page(observe_page())
                         expected_page = item.get('page')
+                        action, locator = item['action'], page.locator(item['selector'])
                         actual_page = observe_page()
+                        navigates_to_expected = bool(
+                            expected_page and actual_page != expected_page and action == 'click')
                         if actual_page:
                             visits[actual_page]['actions'] += 1
-                        if expected_page and actual_page != expected_page:
+                        if expected_page and actual_page != expected_page and action != 'click':
                             action_errors.append(
                                 f"第 {len(steps) + 1} 个页面动作期望 {expected_page}，实际为 {actual_page or '未知页面'}"
                             )
@@ -293,11 +296,13 @@ def render(plan, container, port, out_dir, rec):
                                 'tail': '页面目标不匹配，动作未执行',
                             })
                             continue
-                        action, locator = item['action'], page.locator(item['selector'])
                         wait = min(5000, int(remaining * 1000))
                         try:
                             if action == 'click':
                                 locator.click(timeout=wait)
+                                if navigates_to_expected:
+                                    target = next(item for item in pages if item['id'] == expected_page)
+                                    page.wait_for_url(f"**{target['path']}**", timeout=wait)
                             elif action == 'fill':
                                 locator.fill(str(item.get('value', '')), timeout=wait)
                             elif action == 'set_files':
@@ -317,6 +322,12 @@ def render(plan, container, port, out_dir, rec):
                             except Exception:
                                 observed = ''
                             current_id = observe_page()
+                            if navigates_to_expected and current_id != expected_page:
+                                target = next(item for item in pages if item['id'] == expected_page)
+                                raise RuntimeError(
+                                    f"动作后未进入页面 {expected_page}（{target['path']}），"
+                                    f"实际为 {current_id or '未知页面'}"
+                                )
                             capture_page(current_id)
                             steps.append({'cmd': action + ' ' + item['selector'],
                                           'page': expected_page, 'actual_page': current_id,

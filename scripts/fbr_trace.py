@@ -159,39 +159,15 @@ def interruption_note(ids: dict) -> str:
 API_KEY_NOTE = "模型运行时读取了 apikey"
 
 
-def run_note(ids: dict, *, api_key_read: bool = False) -> str:
+def run_note(ids: dict) -> str:
     """Only evidence-backed interruption and gateway-key facts may enter other_issues."""
     notes = []
     interruption = interruption_note(ids)
     if interruption:
         notes.append(interruption)
-    if api_key_read or ids.get("api_key_read") is True or ids.get("key_detected") is True:
+    if ids.get("api_key_read") is True or ids.get("key_detected") is True:
         notes.append(API_KEY_NOTE)
     return "；".join(notes)
-
-
-def api_key_evidence_paths(task_dir: Path) -> list[Path]:
-    """Current delivered run streams plus all exported main/sub-agent traces."""
-    task_dir = Path(task_dir)
-    paths = []
-    run_dir = task_dir / "run"
-    if run_dir.is_dir():
-        for path in run_dir.glob("*.jsonl"):
-            if path.is_file():
-                paths.append(path)
-        for path in run_dir.glob("*.stderr.log"):
-            if path.is_file():
-                paths.append(path)
-    projects = task_dir / "trace/projects"
-    if projects.is_dir():
-        paths.extend(path for path in projects.rglob("*.jsonl") if path.is_file())
-    return sorted(set(paths))
-
-
-def detect_api_key_read(task_dir: Path, cfg: dict) -> bool:
-    secret = lib.read_key(cfg)
-    return bool(secret and any(lib.key_occurrences(path, secret)
-                               for path in api_key_evidence_paths(task_dir)))
 
 
 def _target(tool: str, payload: dict) -> str:

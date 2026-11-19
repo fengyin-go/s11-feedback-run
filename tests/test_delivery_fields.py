@@ -39,7 +39,7 @@ class DeliveryFields(SheetCase):
              mock.patch.object(fbr_feedback,'gate_batch',side_effect=gate), \
              mock.patch.object(fbr_snapshot,'Hub'), \
              mock.patch.object(fbr_snapshot,'push_one',side_effect=publish), \
-             mock.patch.object(fbr_sheet,'write_sheet',side_effect=lambda *a: events.append('sheet')), \
+             mock.patch.object(fbr_sheet,'write_sheet',side_effect=lambda *a, **kw: events.append('sheet')), \
              mock.patch.object(fbr_sheet,'build_row',return_value=({'数据状态':'可提交'},'')), \
              mock.patch.object(fbr_sheet,'row_problems',return_value=[]), \
              mock.patch.object(fbr_attestation,'validate',
@@ -64,7 +64,8 @@ class DeliveryFields(SheetCase):
                  return_value={'state':'accepted'}) as materialize:
             result = fbr_flow.finish_review(task,self.root,self.cfg,options)
         self.assertEqual(result['state'],'ok')
-        materialize.assert_called_once()
+        materialize.assert_not_called()
+        self.assertEqual(lib.load_json(task / "review/delivery-repair.json")["state"], "local_accepted")
 
     def test_failed_acceptance_requests_repair_without_pushing(self):
         task=self.gated()

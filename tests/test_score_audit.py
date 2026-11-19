@@ -56,6 +56,19 @@ class DowngradeEvidence(FlowCase):
         row = audit.scan_task(task, self.cfg)
         self.assertIn("explicit_unverified", row["classes"])
 
+    def test_scan_prioritizes_verification_gap_without_code_review(self):
+        task = self.prepare_task()
+        doc = lib.load_json(task / "review/feedback.json")
+        doc["score_basis"]["category"] = "verification_gap"
+        doc["score_basis"]["remaining"] = "当前产物仍无法确认并发提交后的唯一结果"
+        doc["feedback"] += "当前产物仍无法确认并发提交后的唯一结果。"
+        doc["issues"] = []
+        doc.pop("code_review", None)
+        lib.save_json(task / "review/feedback.json", doc)
+        row = audit.scan_task(task, self.cfg)
+        self.assertIn("missing_code_review", row["classes"])
+        self.assertGreaterEqual(row["priority"], 30)
+
     def test_finalize_requires_current_downgrade_validation(self):
         task = self.probes(self.prepare_task())
         self.assertTrue(audit.validate_evidence(task, self.cfg)["eligible"])

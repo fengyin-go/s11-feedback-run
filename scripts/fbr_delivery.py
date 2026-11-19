@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -17,10 +18,6 @@ from pathlib import Path, PurePosixPath
 import fbrlib as lib
 import fbr_retention
 import fbr_reviewer as reviewer
-
-
-class DeliveryBlocked(lib.FbrError):
-    """起跑 key 无法验证时，整次交付刷新必须停止。"""
 
 
 SUMMARY_FIELDS = ("task_id", "batch", "repo_id", "prompt", "domain", "subdirection", "task_type", "difficulty",
@@ -127,6 +124,11 @@ def current_feedback(task_dir: Path) -> tuple[bool, str]:
     if info.get("state") != "ok":
         return False, "Feedback 还没过闸门"
     doc = lib.load_json(task_dir / "review/feedback.json", default={})
+    if doc.get("feedback_policy_version", 0) >= 2:
+        code_review = task_dir / "review/code-review.json"
+        if (code_review.is_symlink() or not code_review.is_file()
+                or lib.load_json(code_review, default={}) != doc.get("code_review")):
+            return False, "代码审查记录缺失或与当前 Feedback 不一致，需要重新验收"
     gate = lib.load_json(task_dir / "review/gate.json", default={})
     sha = hashlib.sha256(str(doc.get("feedback", "")).encode()).hexdigest()
     if sha != info.get("feedback_sha"):
@@ -162,6 +164,9 @@ def _session_file(task_dir: Path) -> str:
 
 def _source_files(task_dir: Path, feedback_sha: str) -> list[Path]:
     files = [task_dir / name for name in FILES if safe_file(task_dir, task_dir / name)]
+    code_review = task_dir / "review/code-review.json"
+    if code_review.is_file() and safe_file(task_dir, code_review):
+        files.append(code_review)
     style_report = task_dir / "review/style-report.json"
     if style_report.is_file() and safe_file(task_dir, style_report):
         files.append(style_report)
@@ -321,7 +326,7 @@ def _publish_staging(root: Path, staging: Path, target: Path, manifest: dict) ->
         shutil.rmtree(retired, ignore_errors=True)
 
 
-def export_batch(root: Path, batch_id: str, cfg: dict | None = None) -> dict:
+def export_batch(root: Path, batch_id: str, cfg: dict | None = None, *, task_id: str | None = None) -> dict:
     """Refresh the stable projection in place; archive only semantic delivery changes."""
     root = Path(root).resolve()
     target = delivery_dir(root, batch_id)
@@ -329,7 +334,7 @@ def export_batch(root: Path, batch_id: str, cfg: dict | None = None) -> dict:
     lock = root / "_verification" / "delivery-locks" / f"{batch_id}.lock"
     lock.parent.mkdir(parents=True, exist_ok=True)
     with lib.file_lock(lock):
-        manifest = _export_batch_locked(root, target, batch_id, cfg)
+        manifest = _export_batch_locked(root, target, batch_id, cfg, task_id=task_id)
         try:
             fbr_retention.trim_delivery_history(root, batch_id, cfg)
         except (lib.FbrError, OSError, ValueError) as exc:
@@ -340,7 +345,36 @@ def export_batch(root: Path, batch_id: str, cfg: dict | None = None) -> dict:
         return manifest
 
 
-def _export_batch_locked(root: Path, target: Path, batch_id: str, cfg: dict) -> dict:
+def _stat_tree(base: Path, names) -> str:
+    """Fingerprint names and metadata without reading media or following links."""
+    rows = []
+    def visit(path):
+        try:
+            st = path.lstat()
+        except FileNotFoundError:
+            return
+        rows.append((str(path.relative_to(base)), st.st_dev, st.st_ino, st.st_mode,
+                     st.st_size, st.st_mtime_ns, st.st_ctime_ns))
+        if stat.S_ISDIR(st.st_mode):
+            for child in sorted(path.iterdir()):
+                visit(child)
+    for name in sorted(set(names)):
+        visit(base / name)
+    return lib.content_hash(rows)
+
+
+def _input_stamp(task, settings_stamp):
+    names = [p.name for p in task.iterdir() if p.is_file() or p.is_symlink()]
+    names.extend(('trace', 'review', 'record', 'run', 'evidence'))
+    receipt = task / 'review/model-review.json'
+    if safe_file(task, receipt):
+        for name in lib.load_json(receipt).get('source_inputs', {}):
+            if safe_file(task, task / name) and name.split('/', 1)[0] not in names:
+                names.append(name)
+    return lib.content_hash([settings_stamp, _stat_tree(task, names)])
+
+
+def _export_batch_locked(root: Path, target: Path, batch_id: str, cfg: dict, *, task_id=None) -> dict:
     staging_root = root / "_verification" / "delivery-staging"
     staging_root.mkdir(parents=True, exist_ok=True)
     staging = Path(tempfile.mkdtemp(prefix=f"{batch_id}-", dir=staging_root))
@@ -349,6 +383,16 @@ def _export_batch_locked(root: Path, target: Path, batch_id: str, cfg: dict) -> 
         old_manifest = lib.load_json(target / "delivery-manifest.json", default={})
         old_entries = {row.get("task_id"): row for row in old_manifest.get("tasks", [])
                        if isinstance(row, dict) and row.get("task_id")}
+        cache_file = root / '_verification/delivery-cache' / (batch_id + '.json')
+        previous_cache = lib.load_json(cache_file, default={})
+        next_cache = {}
+        settings_stamp = lib.content_hash([
+            {k: v for k, v in cfg.items() if not k.startswith('_')},
+            _stat_tree(lib.batch_dir(root, batch_id), ('repo-topic-map.json',
+                'prompt-generation-manifest.json', 'batch-manifest.json')),
+            _stat_tree(Path(__file__).parent, [p.name for p in Path(__file__).parent.glob('*.py')])])
+        dirty = set()
+        partial = bool(task_id and old_manifest.get('batch_id') == batch_id)
         for source in lib.task_dirs(root, batch_id):
             try:
                 deprecated = lib.platform_deprecated(source)
@@ -360,6 +404,17 @@ def _export_batch_locked(root: Path, target: Path, batch_id: str, cfg: dict) -> 
                         ),
                     })
                     continue
+                stamp = _input_stamp(source, settings_stamp)
+                cached = previous_cache.get(source.name, {})
+                entry = old_entries.get(source.name)
+                if (partial and source.name != task_id and entry and cached.get('source') == stamp
+                        and cached.get('entry') == lib.content_hash(entry)
+                        and cached.get('output') == _stat_tree(target, [source.name])):
+                    tasks.append(entry)
+                    next_cache[source.name] = cached
+                    continue
+                dirty.add(source.name)
+                next_cache[source.name] = {'source': stamp}
                 if lib.load_json(source / "cleanup.json", default={}).get("state") == "cleaned":
                     entry = old_entries.get(source.name)
                     if not entry or not _task_entry_valid(root, target, entry):
@@ -389,30 +444,22 @@ def _export_batch_locked(root: Path, target: Path, batch_id: str, cfg: dict) -> 
                     raise lib.FbrError("交付任务编号格式不合法")
                 if not checked.get("ready") or checked.get("errors"):
                     raise lib.FbrError("当前证据已不能通过 Feedback 闸门：" + "；".join(checked.get("errors", [])[:5]))
-                import fbr_run
-                try:
-                    secret = fbr_run.bound_key(source, cfg)
-                except lib.FbrError as exc:
-                    raise DeliveryBlocked(f"{source.name}：无法用起跑 key 核验交付文件，停止整次导出；{exc}") from None
                 _session_file(source)
                 feedback_sha = lib.load_state(source)["stages"]["feedback"]["feedback_sha"]
                 dest = staging / source.name
                 dest.mkdir()
                 files = _source_files(source, feedback_sha)
                 inputs = {str(p.relative_to(source)): digest(p) for p in files}
-                gateway_key_files = []
                 for name in ("task.json", "review/snapshot.json", "run/attempts.json"):
                     path = source / name
                     if safe_file(source, path):
                         inputs[name] = digest(path)
                 entries = []
                 for path in files:
-                    if secret and lib.key_occurrences(path, secret):
-                        gateway_key_files.append(path.relative_to(source).as_posix())
                     relative = path.relative_to(source)
                     copied = dest / relative
                     copied.parent.mkdir(parents=True, exist_ok=True)
-                    pending_copies.append((path,copied))
+                    pending_copies.append((path, copied, inputs[str(relative)]))
                     entries.append({"path": (target / source.name / relative).relative_to(root).as_posix(),
                                     "bytes": path.stat().st_size, "sha256": inputs[str(relative)]})
                 summary = {k: record[k] for k in SUMMARY_FIELDS if k in record}
@@ -424,30 +471,46 @@ def _export_batch_locked(root: Path, target: Path, batch_id: str, cfg: dict) -> 
                                 "bytes": summary_path.stat().st_size, "sha256": digest(summary_path)})
                 tasks.append({"task_id": source.name, "feedback_sha": feedback_sha,
                               "source_digest": hashlib.sha256(json.dumps(inputs, sort_keys=True).encode()).hexdigest(),
-                              "api_key_files": gateway_key_files,
                               "files": entries})
             except (lib.FbrError, OSError) as exc:
-                if isinstance(exc, (lib.KeyLeakError, DeliveryBlocked)):
-                    raise
                 shutil.rmtree(staging / source.name, ignore_errors=True)
                 excluded.append({"task_id": source.name, "reason": str(exc)})
         manifest = {"schema_version": 2, "batch_id": batch_id, "tasks": tasks, "excluded": excluded}
         old = lib.load_json(target / "delivery-manifest.json", default={})
-        if _semantic_manifest(old) == _semantic_manifest(manifest) and _verify_files(root, target, old):
-            return old
-        for source,copied in pending_copies:
-            if not copied.parent.exists(): continue  # task was excluded after preparing entries
-            # APFS CoW retains independent files and history without re-reading unchanged videos.
-            old_file=target/copied.relative_to(staging)
-            original=old_file if old_file.is_file() and not old_file.is_symlink() and digest(old_file)==digest(source) else source
-            done=subprocess.run(['cp','-c',str(original),str(copied)],capture_output=True) if __import__('sys').platform=='darwin' else None
-            if done is None or done.returncode:shutil.copyfile(source,copied)
-            if digest(copied)!=digest(source):raise lib.FbrError('导出期间来源发生变化，拒绝发布混合版本')
+        unchanged = (_semantic_manifest(old) == _semantic_manifest(manifest)
+                     and old.get('excluded') == excluded)
+        def save_cache():
+            for entry in tasks:
+                name = entry['task_id']
+                if name in dirty:
+                    next_cache[name].update(entry=lib.content_hash(entry), output=_stat_tree(target, [name]))
+            lib.save_json(cache_file, next_cache)
+
+        if unchanged:
+            if partial:
+                verified = all(previous_cache.get(name, {}).get('output') == _stat_tree(target, [name])
+                               and _task_entry_valid(root, target, old_entries[name])
+                               for name in dirty if name in old_entries)
+            else:
+                verified = _verify_files(root, target, old)
+            if verified:
+                save_cache()
+                return old
+        for source, copied, expected_sha in pending_copies:
+            if not copied.parent.exists():  # A subsequent check excluded the task.
+                continue
+            clone = (subprocess.run(['cp', '-c', str(source), str(copied)], capture_output=True)
+                     if sys.platform == 'darwin' else None)
+            if clone is None or clone.returncode:
+                shutil.copyfile(source, copied)
+            if digest(copied) != expected_sha:
+                raise lib.FbrError('导出期间来源发生变化，拒绝发布混合版本')
         manifest["generated_at"] = lib.now_iso()
         lib.save_json(staging / "delivery-manifest.json", manifest)
         if target.exists() and old and _semantic_manifest(old) != _semantic_manifest(manifest):
             _archive_projection(root, batch_id, target)
         _publish_staging(root, staging, target, manifest)
+        save_cache()
         return manifest
     finally:
         if staging.exists():

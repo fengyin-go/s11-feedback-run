@@ -98,7 +98,7 @@ def next_task(root: Path, batch: str, *, wait: bool = False, timeout: int = 300,
             if more:
                 return {"state": "ok", "task": more[0], "backlog": len(more)}
             return {"state": "empty", "task": None, "backlog": 0,
-                    "flow": event["state"]}
+                    "flow": event["state"], "quota": event.get("quota", {})}
 
 
 def closeout(root: Path, batch: str, task_id: str) -> dict:
@@ -147,11 +147,11 @@ def wait_for_event(root: Path, batch: str, events: set[str], timeout: int = 300,
         if state and state in events:
             return {'state': state, 'batch': batch,
                     'results': stop.get('results', [])[:10],
-                    'platform': stop.get('platform', {})}
+                    'platform': stop.get('platform', {}), 'quota': stop.get('quota', {})}
         if state and state in ('completed', 'blocked', 'budget', 'paused'):
             return {'state': state, 'batch': batch,
                     'detail': '运行阶段已结束，不含请求的事件',
-                    'platform': stop.get('platform', {})}
+                    'platform': stop.get('platform', {}), 'quota': stop.get('quota', {})}
         if clock() >= deadline:
             return {'state': 'timeout', 'batch': batch,
                     'detail': f'{timeout} 秒内没有出现 {sorted(events)}'}

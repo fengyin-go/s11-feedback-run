@@ -246,6 +246,11 @@ def _accepted_state_current(task: Path, candidate: dict, *, publish: bool,
     gate = lib.load_json(task / "review/gate.json", default={})
     model_review = lib.load_json(task / "review/model-review.json", default={})
     quality_receipt = lib.load_json(task / "review/quality.json", default={})
+    code_review_path = task / "review/code-review.json"
+    if feedback.get("feedback_policy_version", 0) >= 2:
+        if (code_review_path.is_symlink() or not code_review_path.is_file()
+                or lib.load_json(code_review_path) != feedback.get("code_review")):
+            return False
     text_sha = hashlib.sha256(str(feedback.get("feedback", "")).encode("utf-8")).hexdigest()
     if (stage.get("state") != "ok" or stage.get("feedback_sha") != text_sha
             or gate.get("passed") is not True or gate.get("feedback_sha") != text_sha
@@ -256,6 +261,8 @@ def _accepted_state_current(task: Path, candidate: dict, *, publish: bool,
     if spot.get("state") == "退回" and spot.get("feedback_sha") == text_sha:
         return False
     delivery = lib.load_json(task / "review/delivery-repair.json", default={})
+    if not publish and delivery.get("state") == "local_accepted":
+        return not provenance_errors(task)
     if delivery.get("state") != "passed":
         return False
     if publish and not defer_delivery:
@@ -535,12 +542,24 @@ def repair_actions(errors: list[str]) -> list[dict]:
         elif "完整句段" in error or "正文原句" in error or "完整正文原句" in error:
             path = "results/process/issues[].sentence"
             fix = "引用一个完整句号或分号段；若只写局部短语，build 仅在唯一包含句时自动扩展"
+        elif "consumer_check" in error:
+            path = "code_review.changed_files_reviewed[].consumer_check"
+            fix = "沿本次改动追到消费者，写入实际输入、调用方和最终观察结果，再核对 finding"
+        elif any(key in error for key in ("按两段重写", "写入第一段", "落在第二段", "过程段先用一句")):
+            path = "feedback"
+            fix = "按产物和过程整理两段，先概括完成项和操作，再写有证据的问题；重绑原句"
+        elif "public_behavior" in error or "use=delivery" in error:
+            path = "test_claims"
+            fix = "检查该次断言；交付结论引用正文业务结果，纯模型操作绑定过程句，重跑 lint"
         elif "process_audit" in error or "过程句归因" in error:
             path = "process[].audit"
             fix = "补齐五项 checks 和 note；process_audit 由 build 从该对象生成"
         elif "requirements_status" in error or "需求状态" in error:
             path = "requirements[]"
             fix = "补齐需求 verdict、user_text 和 anchors；build 会生成 requirements_status"
+        elif "code_review" in error or "代码审查" in error or "finding" in error:
+            path = "code_review"
+            fix = "先审查最终 diff 和调用链，补齐文件覆盖、逐需求检查、finding 与 issues 的对应关系"
         elif "score_basis" in error or "分数" in error or "评分依据" in error:
             path = "score_basis"
             fix = "补齐 category、已交付、剩余、降档理由和 anchors；可省略项由 build 生成"
@@ -564,6 +583,8 @@ def validation_report(task: Path, stage: str, result: dict) -> Path:
             key = "trace_steps"
         elif any(word in error for word in ("requirements_status", "没有覆盖全部需求", "results 没有按需求")):
             key = "requirements_coverage"
+        elif any(word in error for word in ("code_review", "代码审查", "finding", "call_chain")):
+            key = "code_review"
         elif any(word in error for word in ("锚点", "anchors", "来源", "摘录不在")):
             key = "anchors_sources"
         elif any(word in error for word in ("测试描述", "通过数量", "count", "输出摘录")):
@@ -683,6 +704,7 @@ def prepare_task_agent(task: Path, *, allow_platform_repair: bool = False) -> di
                   },
                   'verification_contract': {'task_agent': 'current_task_agent', 'binding': binding,
                       'candidate_sha': 'lib.content_hash(candidate)', 'checks': list(quality.CHECKS),
+                      'code_review': 'policy v2 必须覆盖相关改动文件、全部需求调用链和代码检查；finding 优先进入 delivery_issue',
                       'language_review': '填写 criterion_sentence、translated_terms、retained_terms；criterion_sentence 必须逐字出现在正文',
                       'process_evidence': '每个 process 句绑定真实 steps 及 tool/assistant evidence；复核引用同一原始摘录',
                       'claim_reviews': '按 public_units 完整逐句回查；trace 来源必须带 start_line、end_line、block 和原文'},
@@ -803,7 +825,8 @@ def finalize(task: Path, candidate: dict, verification: dict, *, publish=True,
         raise lib.FbrError('复核期间证据或规则变化，拒绝采用过期评价')
     # Preserve an accepted version as one content-addressed object, not four copied files.
     previous = {}
-    for name in ('evidence/audit.json', 'review/feedback.json', 'review/model-review.json', 'review/quality.json'):
+    for name in ('evidence/audit.json', 'review/feedback.json', 'review/model-review.json',
+                 'review/quality.json', 'review/code-review.json'):
         path = task/name
         if path.is_file():
             previous[name] = lib.load_json(path)
@@ -849,6 +872,8 @@ def finalize(task: Path, candidate: dict, verification: dict, *, publish=True,
     rows, _ = fbr_feedback.gate_batch(root, task.parent.name, cfg, task.name)
     row = next(r for r in rows if r['task_id'] == task.name)
     if row['state'] == 'ok':
+        if isinstance(feedback.get('code_review'), dict):
+            lib.save_json(task/'review/code-review.json', feedback['code_review'])
         import fbr_work
         fbr_work.closeout(root, task.parent.name, task.name)
         if defer_delivery:
@@ -864,7 +889,7 @@ def finalize(task: Path, candidate: dict, verification: dict, *, publish=True,
                  'detail': '已复核并过闸门；交付表和导出延后统一生成'},
             )
         import fbr_sheet
-        fbr_sheet.write_sheet(root, task.parent.name, cfg)
+        fbr_sheet.write_sheet(root, task.parent.name, cfg, task_id=task.name)
         import argparse, threading, fbr_flow
         options = argparse.Namespace(batch=task.parent.name, publish=publish, auto_submit=False, delivery_lock=threading.Lock())
         result = fbr_flow.finish_review(task, root, cfg, options)

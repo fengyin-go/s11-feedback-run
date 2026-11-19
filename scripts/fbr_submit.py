@@ -18,6 +18,7 @@ from pathlib import Path
 from urllib.parse import urljoin, urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import fbr_quota as quota
 import fbrlib as lib
 import fbr_gate as gate
 import fbr_runtime
@@ -52,7 +53,7 @@ GENERIC_TEST_LAYER_RE = re.compile(
     re.I,
 )
 OPERATIONAL_METRIC_RE = re.compile(r"\d+(?:\.\d+)?\s*(?:小时|天|GB|MB|毫秒|ms|秒)", re.I)
-TOOL_OUTPUT_LITERAL_RE = re.compile(r"\bALL CHECKS PASSED\b|✓\s*built in", re.I)
+TOOL_OUTPUT_LITERAL_RE = re.compile(r"(?<![A-Za-z])ALL CHECKS PASSED(?![A-Za-z])|✓\s*built in", re.I)
 ABSTRACT_REPORT_RE = re.compile(r"复用已有版本锁定|没有依赖临时状态|抽象名词串")
 VAGUE_FAILURE_RE = re.compile(r"(?:验证中还出现过|在并发场景里|测试中|验证中)[^。；]{0,40}(?:问题|错误|失败|异常)")
 CONCRETE_FAILURE_RE = re.compile(r"(?:[A-Za-z_][\w./-]+\.[A-Za-z]{2,5}|第\s*\d+\s*步|\d+\s*步)")
@@ -97,6 +98,10 @@ def configure_account(root: Path) -> str:
     return ACCOUNT
 
 
+class SubmissionFieldsRejected(lib.FbrError):
+    """Platform rejected the new-submission fields before creation."""
+
+
 class SubmitRateLimited(lib.FbrError):
     """A 429 write remains pending after safe retries and session rechecks."""
 
@@ -136,7 +141,7 @@ def resolve_submit_interval(root: Path, value=None) -> float:
 def write_pacing_path() -> Path:
     identity = hashlib.sha256(json.dumps(
         [BASE_URL, ACCOUNT], ensure_ascii=False, separators=(",", ":")).encode()).hexdigest()[:24]
-    return fbr_runtime.runtime_home({}) / f"platform-write-pacing-{identity}.json"
+    return quota.directory() / f"platform-write-pacing-{identity}.json"
 
 
 def _load_write_pacing(path: Path) -> dict:
@@ -302,8 +307,7 @@ def plan_from_row(root: Path, task_dir: Path, row: dict, manifest: dict) -> dict
                                       ("session_id", "prompt_id", "user_turns", "continuations")):
             raise lib.FbrError("中断续写记录与原始轨迹不一致")
     cfg = lib.settings(root)
-    api_key_read = fbr_trace.detect_api_key_read(task_dir, cfg)
-    expected_note = fbr_trace.run_note(ids, api_key_read=api_key_read)
+    expected_note = fbr_trace.run_note(ids)
     data["other_issues"] = expected_note
     if str(row.get("备注") or "") != expected_note:
         raise lib.FbrError("备注与当前轨迹事实不一致，先重新生成结果表")
@@ -447,7 +451,7 @@ def preflight_one(root: Path, batch_id: str, task_id: str, *, client=None,
         valid, reason = delivery.current_feedback(task_dir)
         if not valid:
             result["errors"].append(reason)
-        record = lib.load_task(task_dir)
+        record = lib.load_task_readonly(task_dir)
         local_rules = fbr_platform_rules.evaluate(
             task_dir,
             strict=record.get("producer") == "s11-gsb-prompt-create",
@@ -485,7 +489,7 @@ def preflight_one(root: Path, batch_id: str, task_id: str, *, client=None,
         result["errors"].extend(gate.platform_consistency_errors(
             feedback_doc.get("score"),
             str(feedback_doc.get("feedback") or ""),
-            feedback_doc.get("score_basis") if isinstance(feedback_doc.get("score_basis"), dict) else None,
+            gate.public_score_basis(feedback_doc),
         ))
         records_by_task = {}
         for candidate in lib.task_dirs(root, batch_id):
@@ -545,14 +549,16 @@ def preflight_one(root: Path, batch_id: str, task_id: str, *, client=None,
                 result["errors"].append("回执中的附件清单格式无效，先核对再继续")
             elif receipt.get("submission_id") and set(uploads) != set(MEDIA_TYPES):
                 result["errors"].append("已有记录 ID 但附件回执不完整，停止自动提交")
-        if receipt.get("state") in ("creating", "verifying", "uncertain") and not valid_id(
+        recovered = (len(matches) == 1 and same_receipt
+                     and set(receipt.get('uploads') or {}) == set(MEDIA_TYPES))
+        if not recovered and receipt.get("state") in ("creating", "verifying", "uncertain") and not valid_id(
                 receipt.get("submission_id")):
             result["errors"].append("已有提交回执但平台结果待核对，禁止自动重复建单")
         if receipt.get("submission_id") and not same_receipt:
             result["errors"].append("已有平台单与当前交付摘要不一致，需先核对")
-        if matches and not (same_receipt and receipt.get("submission_id")):
+        if matches and not recovered and not (same_receipt and receipt.get("submission_id")):
             result["errors"].append(
-                f"SessionID 已存在于平台记录 {matches[0]['id']}，不能重复建单")
+                f"SessionID已存在于平台记录 {matches[0]['id']}，不能重复建单")
     except (lib.FbrError, OSError, ValueError) as exc:
         result["errors"].append(str(exc))
         if online_started:
@@ -806,7 +812,7 @@ def create_with_pacing(root: Path, client, data: dict, fingerprint: str, task_id
         except PlatformHTTPError as exc:
             mark_write_outcome(task_id, "create", "rate_limited" if exc.status == 429 else "http_error",
                                status=exc.status)
-            if exc.status != 429:
+            if exc.daily_limit or exc.status != 429:
                 raise
             delay = _retry_delay(root, retry_index, exc.retry_after_seconds, interval)
             if on_rate_limit:
@@ -931,13 +937,17 @@ def locked_domain(me: dict, records: list[dict]) -> str:
     return next(iter(values), "")
 
 
-def prepare(root: Path, batch_id: str, schema: dict, tasks: str | None = None, limit: int | None = None) -> list[dict]:
+def prepare(root: Path, batch_id: str, schema: dict, tasks: str | None = None, limit: int | None = None,
+            *, prioritize_deadlines: bool = False) -> list[dict]:
     import fbr_attestation
     import fbr_sheet
     schema_fields(schema)
     cfg = lib.settings(root)
     selected = [task for task in lib.task_dirs(root, batch_id, tasks)
-                if not lib.platform_deprecated(task)][:limit]
+                if not lib.platform_deprecated(task)]
+    if prioritize_deadlines:
+        selected = quota.priority_order(root, cfg, selected)
+    selected = selected[:limit]
     if not selected:
         raise lib.FbrError("没有可处理的待提交任务；本地废弃任务不参与提交或返修")
     manifest = delivery.export_batch(root, batch_id, cfg)
@@ -991,17 +1001,18 @@ def submit_lock(root: Path):
         except BlockingIOError:
             raise lib.FbrError("另一个平台提交进程正在运行，请等待它结束后再核对") from None
         import fbr_runtime
-        shared = fbr_runtime.runtime_home({}) / ('platform-' + lib.content_hash([BASE_URL, ACCOUNT])[:24] + '.lock')
+        shared = quota.directory() / ('platform-' + lib.content_hash([BASE_URL, ACCOUNT])[:24] + '.lock')
         with lib.file_lock(shared):
             yield
 
 
-def confirm_remote(client, plan: dict, receipt: dict, task_dir: Path, submission_id) -> dict:
+def confirm_remote(client, plan: dict, receipt: dict, task_dir: Path, submission_id, *, detail=None) -> dict:
     # Invalidate the prior confirmation before asking the server again. A failed
     # read or a changed remote record must not keep looking confirmed in Excel.
     receipt.update(state="verifying", submission_id=submission_id)
     lib.save_json(task_dir / "review/upload.json", receipt)
-    detail = client.detail(submission_id)
+    if detail is None:
+        detail = client.detail(submission_id)
     expected = payload_with_media(plan, receipt["uploads"])
     actual = remote_data(detail)
     remote_trace = None
@@ -1027,7 +1038,9 @@ def confirm_remote(client, plan: dict, receipt: dict, task_dir: Path, submission
     receipt.update(state="confirmed", submission_id=submission_id, remote_data={k: actual[k] for k in expected},
                    remote_status=remote_status, verified_at=lib.now_iso(), submitted_at=created_at)
     lib.save_json(task_dir / "review/upload.json", receipt)
-    return {"task_id": task_dir.name, "state": "confirmed", "submission_id": submission_id,
+    notice = quota.confirmed(task_dir, ACCOUNT, submission_id, created_at, plan['data']['session_id'],
+                             quota.limit(lib.settings(lib.containing_root(task_dir))))
+    return {"quota_notice": notice, "task_id": task_dir.name, "state": "confirmed", "submission_id": submission_id,
             "status": receipt["remote_status"], "url": f"{BASE_URL}/app/submissions/{submission_id}"}
 
 
@@ -1068,6 +1081,12 @@ def submit_one(root: Path, plan: dict, client, schema: dict, records: list[dict]
                 "fields": list(plan["data"]) + list(MEDIA_TYPES),
                 "files": {k: {"path": f["relative"], "bytes": f["bytes"], "sha256": f["sha256"]}
                           for k, f in plan["files"].items()}, "content_digest": plan["content_digest"]}
+    cfg = lib.settings(root)
+    trace = plan['files']['trace_file']
+    info = quota.trace_info(Path(trace['path']), plan['data']['session_id'])
+    if info['trace_sha256'] != trace['sha256']:
+        raise lib.FbrError('时效核对的轨迹摘要与提交附件不一致')
+    quota.check_create(root, task_dir, cfg, client, info)
     recheck_binding(root, plan, task_dir)
     if not same:
         if receipt:
@@ -1104,6 +1123,7 @@ def submit_one(root: Path, plan: dict, client, schema: dict, records: list[dict]
     receipt.update(state="creating", requested_at=lib.now_iso(), schema_fingerprint=schema["fingerprint"],
                    pacing=pacing)
     lib.save_json(path, receipt)
+    quota_attempt = {}
     try:
         def persist_rate_limit(delay: float) -> None:
             receipt.update(state="uploaded", pacing=pacing, last_rate_limit_at=lib.now_iso(),
@@ -1111,6 +1131,12 @@ def submit_one(root: Path, plan: dict, client, schema: dict, records: list[dict]
             lib.save_json(path, receipt)
 
         def persist_attempt() -> None:
+            try:
+                quota_attempt.update(quota.check_create(root, task_dir, cfg, client, info, before_post=True))
+            except lib.FbrError as exc:
+                if isinstance(exc, quota.Wait):
+                    raise
+                raise quota.Wait(f'写入前额度待核对：{exc}') from exc
             receipt.update(state="creating", pacing=pacing, requested_at=lib.now_iso())
             lib.save_json(path, receipt)
 
@@ -1124,13 +1150,35 @@ def submit_one(root: Path, plan: dict, client, schema: dict, records: list[dict]
         lib.save_json(path, receipt)
         result = confirm_remote(client, plan, receipt, task_dir, created["id"])
         result["pacing"] = pacing
+        if quota_attempt.get('probe'):
+            try:
+                with quota.book(ACCOUNT) as ledger:
+                    quota.refresh(ledger, ACCOUNT, client, force=True)
+            except lib.FbrError as exc:
+                result['quota_recheck'] = str(exc)
         return result
     except (lib.FbrError, OSError) as exc:
-        from fbr_platform import RequestNotSent
+        from fbr_platform import RequestNotSent, PlatformHTTPError
+        daily_full = isinstance(exc, PlatformHTTPError) and exc.daily_limit
+        if (isinstance(exc, PlatformHTTPError) and exc.status == 422 and not daily_full
+                and not valid_id(receipt.get('submission_id'))):
+            receipt.update(state='uploaded', pacing=pacing)
+            lib.save_json(path, receipt)
+            quota.clear_attempt(ACCOUNT, task_dir)
+            raise SubmissionFieldsRejected('平台拒绝建单字段（HTTP 422），需核对本题数据') from None
+        if daily_full or isinstance(exc, quota.Wait):
+            receipt.update(state='uploaded', pacing=pacing)
+            lib.save_json(path, receipt)
+            quota.clear_attempt(ACCOUNT, task_dir)
+            if daily_full:
+                detail = quota.full(ACCOUNT, quota_attempt['day'], client=client, capacity=quota.limit(cfg))
+                raise quota.Wait(detail, tomorrow=True) from None
+            raise
         rate_limited = isinstance(exc, SubmitRateLimited)
         not_sent = isinstance(exc, RequestNotSent) and not valid_id(receipt.get("submission_id"))
         receipt["state"] = "uploaded" if not_sent else "uncertain"
         if not_sent or rate_limited:
+            quota.clear_attempt(ACCOUNT, task_dir)
             receipt["last_create_not_sent"] = lib.now_iso()
         if rate_limited:
             receipt.update(state="uploaded", last_rate_limit_at=lib.now_iso(),
@@ -1362,7 +1410,7 @@ def repair_one(root: Path, plan: dict, client, schema: dict, *, execute: bool, c
     style_errors.extend(gate.platform_consistency_errors(
         local_feedback.get("score"),
         str(local_feedback.get("feedback") or ""),
-        local_feedback.get("score_basis") if isinstance(local_feedback.get("score_basis"), dict) else None,
+        gate.public_score_basis(local_feedback),
     ))
     if style_errors:
         raise lib.FbrError("；".join(style_errors))
@@ -1584,17 +1632,36 @@ def run_batch(root: Path, batch_id: str, *, tasks: str | None = None, limit: int
         if user.get("username") != ACCOUNT or user.get("must_change_password"):
             raise lib.FbrError("登录账号不符或需要人工修改初始密码")
         schema, records = client.schema(), own_records(client)
-        plans = prepare(root, batch_id, schema, tasks, limit)
+        plans = prepare(root, batch_id, schema, tasks, limit, prioritize_deadlines=execute)
         domain = locked_domain(user, records)
         if domain and any(p["data"]["domain"] != domain for p in plans):
             raise lib.FbrError(f"账号已锁定领域 {domain}，本批领域不符，不上传")
+        preflight_errors = []
+        for plan in plans:
+            preflight = preflight_one(root, batch_id, plan['task_id'], client=client,
+                                      schema=schema, records=records, authenticated=True)
+            if not preflight['ready']:
+                preflight_errors.append(plan['task_id'] + '：' + '；'.join(preflight['errors']))
+            elif preflight['content_digest'] != plan['content_digest']:
+                preflight_errors.append(plan['task_id'] + '：预检期间交付内容变化')
+        if preflight_errors:
+            raise lib.FbrError('批量提交预检未通过：' + '；'.join(preflight_errors))
         # Run the *same* receipt/duplicate/readback checks for every task before
         # the first mutation. A weaker separate precheck can miss later errors.
         previews = [submit_one(root, plan, client, schema, records, execute=False,
                                interval=interval) for plan in plans]
-        rows = previews if not execute else [preview if preview["state"] == "confirmed" else
-            submit_one(root, plan, client, schema, records, execute=True, interval=interval)
-            for plan, preview in zip(plans, previews)]
+        rows = []
+        for plan, preview in zip(plans, previews):
+            if not execute or preview['state'] == 'confirmed':
+                rows.append(preview)
+                continue
+            try:
+                rows.append(submit_one(root, plan, client, schema, records, execute=True, interval=interval))
+            except SubmissionFieldsRejected as exc:
+                rows.append({'task_id': plan['task_id'], 'state': 'submit_blocked', 'detail': str(exc)})
+            except quota.Wait as exc:
+                rows.append({'task_id': plan['task_id'], 'state': exc.state,
+                             'detail': str(exc)})
         return {"platform": BASE_URL, "account": ACCOUNT, "execute": execute,
                 "locked_domain": domain or "尚未锁定；首次提交后锁定", "tasks": rows}
 
@@ -1746,6 +1813,8 @@ def main() -> int:
                        f"type={result.get('field_type')} required={result.get('is_required')}")
         else:
             print(compact_result(result, full=args.json))
+        if args.command == "submit" and args.execute and any(row["state"] != "confirmed" for row in result.get("tasks", [])):
+            return 1
         return 0
     except lib.FbrError as exc:
         print(f"错误：{exc}", file=sys.stderr)

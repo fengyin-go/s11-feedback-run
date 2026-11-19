@@ -274,12 +274,12 @@ class Collect(DockerCase):
                 self.assertIn("s11-000001", self.docker.containers)
                 self.assertFalse((task_dir / "trace" / "ids.json").exists())
 
-    def test_key_in_trace_marks_api_key_read_and_allows_delivery(self):
+    def test_key_in_trace_is_preserved_without_annotation(self):
         task_dir = self.ran(answer=f"完成了，顺便打印了环境变量 {KEY}")
         self.assertEqual(fbr_run.collect_one(task_dir, self.cfg)["state"], "ok")
         ids = lib.load_json(task_dir / "trace" / "ids.json")
-        self.assertTrue(ids["api_key_read"])
-        self.assertEqual(fbr_trace.run_note(ids), fbr_trace.API_KEY_NOTE)
+        self.assertNotIn("api_key_read", ids)
+        self.assertEqual(fbr_trace.run_note(ids), "")
         self.assertIn(KEY, next((task_dir / "trace/projects").rglob("*.jsonl")).read_text())
         self.assertNotIn("s11-000001", self.docker.containers)
 

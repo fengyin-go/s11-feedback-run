@@ -14,6 +14,7 @@ import time
 import fbrlib as lib
 import fbr_runtime as runtime
 import fbr_run
+import fbr_quota as quota
 
 
 def home(root, batch):
@@ -201,6 +202,11 @@ def submit_task(task, root, cfg, options):
             context=getattr(options, 'submit_context', None))
     except (lib.FbrError, OSError, ValueError) as exc:
         context = getattr(options, 'submit_context', None)
+        if isinstance(exc, fbr_submit.SubmissionFieldsRejected):
+            return {'task_id': task.name, 'state': 'submit_blocked', 'detail': str(exc)}
+        if isinstance(exc, quota.Wait):
+            return {'task_id': task.name, 'state': exc.state,
+                    'detail': str(exc), 'retry_after': exc.retry_at}
         if context is not None:
             context.reset_reads()
         receipt = lib.load_json(task / 'review/upload.json', default={})
@@ -212,7 +218,7 @@ def submit_task(task, root, cfg, options):
                 'detail': f'平台提交暂时失败：{exc}',
                 'retry_after': time.time() + max(float(retry_after), 1.0)}
     with options.delivery_lock:
-        fbr_sheet.write_sheet(root, options.batch, cfg)
+        fbr_sheet.write_sheet(root, options.batch, cfg, task_id=task.name)
     if result.get('state') == 'confirmed':
         task_result = result.get('task_result') or {}
         pacing_detail = ''
@@ -223,7 +229,7 @@ def submit_task(task, root, cfg, options):
             pacing_detail = f"；写入等待 {waited:.1f} 秒"
         return {'task_id': task.name, 'state': 'ok',
                 'detail': f"已提交 #{task_result.get('submission_id', '')} / "
-                          f"{task_result.get('status', '待质检')}{pacing_detail}"}
+                          f"{task_result.get('status', '待质检')}{pacing_detail} {task_result.get('quota_notice', '')}".rstrip()}
     errors = result.get('errors') or ['提交预检未通过']
     return {'task_id': task.name, 'state': 'submit_blocked',
             'detail': '提交预检未通过：' + '；'.join(str(item) for item in errors)}
@@ -268,7 +274,7 @@ def finish_review(task, root, cfg, options):
     import fbr_common
     # Finish acceptance first, then proactively publish and re-read the snapshot before field audit.
     with options.delivery_lock:
-        fbr_sheet.write_sheet(root,options.batch,cfg)
+        fbr_sheet.write_sheet(root,options.batch,cfg,task_id=task.name)
     history={'attempts':[]}
     target=task/'review/delivery-repair.json'
     publishing=getattr(options,'publish',None)
@@ -284,16 +290,19 @@ def finish_review(task, root, cfg, options):
                 lib.save_json(target,history)
                 # Retry transport/temporary failures only; never force-push a divergent main.
                 if attempt==3 or not any(w in str(exc).lower() for w in ('timeout','timed out','connection','502','503','504','推送失败','回读远端')):
-                    with options.delivery_lock:fbr_sheet.write_sheet(root,options.batch,cfg)
+                    with options.delivery_lock:fbr_sheet.write_sheet(root,options.batch,cfg,task_id=task.name)
                     raise
                 if time.time()+attempt*2>=cfg.get('_deadline',float('inf')):raise
                 time.sleep(attempt*2)
     for attempt in range(2):
         with options.delivery_lock:
-            fbr_sheet.write_sheet(root,options.batch,cfg)
+            fbr_sheet.write_sheet(root,options.batch,cfg,task_id=task.name)
             row,reason=fbr_sheet.build_row(root,task,cfg)
         problems = fbr_sheet.row_problems(row, lib.load_json(task/'trace/ids.json'), lib.load_json(task/'review/snapshot.json')) if row else [reason]
         if not publishing:
+            snapshot = lib.load_json(task/'review/snapshot.json', default={})
+            if not lib.SHA_RE.fullmatch(str(snapshot.get('commit') or '')):
+                raise lib.FbrError('本地验收缺少产物提交')
             problems = [p for p in problems if p not in ('缺产物快照', '产物快照还没推送')]
         if row is not None and not problems:break
         repaired=fbr_common.repair_from_peer(task,root) if attempt==0 else False
@@ -301,7 +310,10 @@ def finish_review(task, root, cfg, options):
         lib.save_json(target,history)
         if not repaired:
             raise lib.FbrError('交付核查仍有缺失，来源不足不能猜值：'+(reason or (row or {}).get('数据状态','缺少有效本地行')))
-    history['state']='passed';lib.save_json(target,history)
+    if not publishing:
+        history['state'] = 'local_accepted'
+        lib.save_json(target, history)
+        return {'task_id': task.name, 'state': 'ok', 'detail': '本地验收完成，等待发布'}
     state = fbr_attestation.validate(task, root, cfg)
     if state['valid']:
         attestation = state['attestation']
@@ -310,6 +322,8 @@ def finish_review(task, root, cfg, options):
             task, root, cfg, force=state['state'] == 'delivery_changed')
     else:
         raise lib.FbrError(state['reason'])
+    history['state'] = 'passed'
+    lib.save_json(target, history)
     detail = '验收、快照推送及本地字段核查完成' if publishing else '本地验收完成（显式不发布）'
     return {'task_id':task.name,'state':'ok','detail':detail}
 
@@ -354,6 +368,10 @@ def run_flow(root, args):
             import fbr_sheet
             fbr_sheet.start_watch(root, args.batch, cfg)
         tasks = lib.task_dirs(root, args.batch, args.tasks)
+        quota_status = quota.live_status(root)
+        print(quota.status_text(quota_status), flush=True)
+        next_quota_sync = time.monotonic() + 600
+        quota_day = quota.now().date()
         import fbr_dependencies
         prewarm = fbr_dependencies.prewarm_batch(root, args.batch, cfg, tasks)
         print(f"依赖预热：{prewarm['prepared']} 已准备，{prewarm['fallback']} 回退原 setup，"
@@ -404,6 +422,11 @@ def run_flow(root, args):
         try:
             while pending or retry_queue or submit_retry_queue or cleanup_retry_queue or author_waiting:
                 runtime.write_tail_policy(root, args.batch, tasks, cfg, 'flow')
+                if time.monotonic() >= next_quota_sync or quota_day != quota.now().date():
+                    quota_status = quota.live_status(root)
+                    print(quota.status_text(quota_status), flush=True)
+                    next_quota_sync = time.monotonic() + 600
+                    quota_day = quota.now().date()
                 for name, task in list(author_waiting.items()):
                     if lib.stage_ok(task, 'feedback'):
                         pending[enqueue(3,task)] = (3,task)
@@ -464,7 +487,9 @@ def run_flow(root, args):
                 for future in completed:
                     step, task = pending.pop(future)
                     result = future.result()
-                    if isinstance(result,dict) and result.get('state') == 'retry':
+                    if step == 5 and result.get('state') == 'quota_wait':
+                        submit_retry_queue.append((result['retry_after'], task))
+                    elif isinstance(result,dict) and result.get('state') == 'retry':
                         if step == 5:
                             count = submit_retries.get(task.name, 0) + 1
                             submit_retries[task.name] = count
@@ -512,7 +537,7 @@ def run_flow(root, args):
                 report = {'at': lib.now_iso(), 'active': [{'task_id': t.name, 'stage': s} for s, t in pending.values()],
                           'results': rows, 'deadline': deadline, 'waiting_for_task_ai': list(author_waiting),
                           'phases': {t.name: phase(t) for t in tasks},
-                          'platform': platform_summary(tasks)}
+                          'platform': platform_summary(tasks), 'quota': quota_status}
                 lib.save_json(directory / 'state.json', report)
         finally:
             for pool in pools:
@@ -529,10 +554,12 @@ def run_flow(root, args):
         except (lib.FbrError, OSError, ValueError) as exc:
             maintenance = {"state": "blocked", "reason": str(exc)}
             lib.save_json(directory / 'retention-warning.json', maintenance)
+        quota_status = quota.summary(root, rescan=True)
+        print(quota.status_text(quota_status), flush=True)
         lib.save_json(directory / 'stop.json', {
-            'reason': reason, 'at': lib.now_iso(), 'results': rows,
+            'quota': quota_status, 'reason': reason, 'at': lib.now_iso(), 'results': rows,
             'platform': platform_summary(tasks), 'maintenance': maintenance})
-        return {'state': reason, 'results': rows, 'maintenance': maintenance}
+        return {'state': reason, 'results': rows, 'maintenance': maintenance, 'quota': quota_status}
 
 
 def spawn(root, args, watchdog=False):
@@ -643,6 +670,8 @@ def main():
             result = {'state': 'dry' if args.command != 'status' else 'status',
                       'tasks': {t.name: phase(t) for t in tasks},
                       'platform': platform_summary(tasks)}
+            if args.command == 'status':
+                result['quota'] = quota.summary(root, rescan=True)
         elif args.command in ('pause', 'drain'):
             directory.mkdir(parents=True, exist_ok=True)
             (directory / args.command).touch()
@@ -672,6 +701,8 @@ def main():
                 counts[value] = counts.get(value, 0)+1
             print(f"{args.batch}：{len(result['tasks'])} 题，状态 " +
                   " / ".join(f"{key} {value}" for key, value in sorted(counts.items())))
+            if result.get('quota'):
+                print(quota.status_text(result['quota']))
         elif isinstance(result, dict) and isinstance(result.get('results'), list):
             counts = {}
             for row in result['results']:

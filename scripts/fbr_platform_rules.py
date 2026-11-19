@@ -81,8 +81,11 @@ def prompt_contract_problems(
                 owner="s11-gsb-prompt-create",
                 action="rebuild_prompt_with_h3_v3",
             ))
+        record = lib.load_json(task_dir / "task.json", default={})
+        seed = lib.load_json(task_dir / "task-seed.json", default={})
         try:
-            sequence = int(task_dir.name.split("-")[1])
+            parts = task_dir.name.rsplit("-", 2)
+            sequence = int(record.get("sequence") or seed.get("sequence") or (parts[-1] if len(parts) == 2 else parts[-2]))
         except (IndexError, ValueError):
             sequence = -1
         plan = next(
@@ -134,23 +137,36 @@ def prompt_contract_problems(
                     if isinstance(workload, dict)
                     else None
                 )
+                modules = {item["module"].strip() for item in (slices if isinstance(slices, list) else [])
+                           if isinstance(item, dict) and isinstance(item.get("module"), str) and item["module"].strip()}
+                distinct_paths = {path.strip() for path in (paths if isinstance(paths, list) else []) if isinstance(path, str) and path.strip()}
                 if (
                     not isinstance(slices, list)
                     or len(slices) < 4
                     or not isinstance(paths, list)
-                    or len(set(paths)) < 2
+                    or len(distinct_paths) < 2 or len(modules) < 2
                 ):
                     errors.append(_problem(
                         "p6_workload_design_weak",
-                        "workload_design 未达到 4 个工作切片和 2 条验证路径；工具调用次数不作为要求",
+                        "workload_design 未达到 4 个工作切片、2 个模块和 2 条验证路径；工具调用次数不作为要求",
                         owner="s11-gsb-prompt-create",
                         action="expand_workload_before_run",
                         evidence={
                             "work_slices": len(slices) if isinstance(slices, list) else 0,
-                            "verification_paths": len(set(paths)) if isinstance(paths, list) else 0,
+                            "verification_paths": len(distinct_paths),
+                            "modules": len(modules),
                         },
                     ))
 
+    if generation.get("receipt_version") == 2 or lib.load_json(task_dir / "task.json", default={}).get("contract_binding_version") == 1:
+        cross = generation.get("cross_project")
+        cross = cross if isinstance(cross, dict) else {}
+        checks = (generation.get("gate_ok"), generation.get("raw_a5_ok"),
+                  cross.get("ok"), cross.get("platform_dedup_ok"),
+                  cross.get("platform_corpus_used"))
+        if any(flag is not True for flag in checks):
+            errors.append(_problem("generation_receipt_incomplete", "新批次缺少通过的查重及语料覆盖回执",
+                                   owner="s11-gsb-prompt-create", action="refresh_generation_manifest"))
     if not generation:
         item = _problem(
             "prompt_generation_manifest_missing",

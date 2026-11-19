@@ -136,7 +136,7 @@ def build_row(root: Path, task_dir: Path, cfg: dict, *, delivery_manifest: dict 
         "产物快照": snapshot.get("artifact_snapshot", "") if snapshot.get("pushed") else "",
         "运行录屏": str(video) if (root / video).is_file() else "",
         "交付完整性": doc.get("score"), "Feedback": text,
-        "备注": fbr_trace.run_note(ids, api_key_read=fbr_trace.detect_api_key_read(task_dir, cfg)),
+        "备注": fbr_trace.run_note(ids),
         "提交人": "", "提交时间": "",
         "任务编号": record["task_id"], "批次": record.get("batch") or task_dir.parent.name,
         "底座仓库": record.get("repo_id", ""), "任务仓库": record.get("task_repo_full") or record.get("task_repo", ""),
@@ -192,7 +192,7 @@ def prepared_fields(root: Path, task_dir: Path, cfg: dict) -> dict:
             "轨迹文件": str(session.relative_to(root)) if trace_ok else "",
             "产物快照": snapshot.get("artifact_snapshot", "") if snapshot.get("pushed") else "",
             "运行录屏": str(video.relative_to(root)) if lib.stage_ok(task_dir, "record") and video.is_file() else "",
-            "备注": fbr_trace.run_note(ids, api_key_read=fbr_trace.detect_api_key_read(task_dir, cfg))}
+            "备注": fbr_trace.run_note(ids)}
 
 
 def field_state(field: str, value, task_dir: Path, *, current_row: bool) -> str:
@@ -447,7 +447,7 @@ def _write_json_if_changed(path: Path, data: dict) -> bool:
 
 
 def _write_sheet_unlocked(root: Path, batch_id: str, cfg: dict, *, force: bool = True,
-                          refresh_delivery: bool = True) -> dict:
+                          refresh_delivery: bool = True, task_id: str | None = None) -> dict:
     from openpyxl import Workbook
     from openpyxl.styles import Alignment, Font, PatternFill
     from openpyxl.utils import get_column_letter
@@ -462,16 +462,31 @@ def _write_sheet_unlocked(root: Path, batch_id: str, cfg: dict, *, force: bool =
         return previous.get("last_result", {"path": target, "tasks": 0, "rows": 0, "ready": 0, "pending": []})
 
     if refresh_delivery:
-        manifest = delivery.export_batch(root, batch_id, cfg)
+        manifest = delivery.export_batch(root, batch_id, cfg, task_id=task_id) if task_id else delivery.export_batch(root, batch_id, cfg)
     else:
         manifest = lib.load_json(delivery.delivery_dir(root, batch_id) / "delivery-manifest.json",
                                  default={"tasks": [], "excluded": []})
     rows, progress = [], []
+    cache_path = _sheet_home(root, batch_id) / 'row-cache.json'
+    old_cache = lib.load_json(cache_path, default={}) if task_id else {}
+    next_cache = {}
+    manifest_rows = {entry['task_id']: entry['source_digest'] for entry in manifest.get('tasks', [])}
+    sheet_config = lib.content_hash({k: v for k, v in cfg.items() if not k.startswith("_")})
     for task_dir in lib.task_dirs(root, batch_id):
-        try:
-            row, reason = build_row(root, task_dir, cfg, delivery_manifest=manifest)
-        except lib.FbrError as exc:
-            row, reason = None, str(exc)
+        stamp = lib.content_hash([sheet_config, manifest_rows.get(task_dir.name),
+            *[_source_values(task_dir / name) for name in ('state.json', 'task.json', 'review/snapshot.json',
+                'review/feedback.json', 'review/gate.json', 'review/quality.json', 'review/field-revisions.json',
+                'review/upload.json', 'review/submit-preflight.json', 'trace/ids.json', 'run/attempts.json', 'review/spotcheck.json', 'review/platform-deprecated.json', 'cleanup.json')]])
+        cached = old_cache.get(task_dir.name, {})
+        if (task_id and task_dir.name in manifest_rows and task_dir.name != task_id
+                and cached.get('stamp') == stamp and cached.get('row')):
+            row, reason = cached['row'], ''
+        else:
+            try:
+                row, reason = build_row(root, task_dir, cfg, delivery_manifest=manifest)
+            except lib.FbrError as exc:
+                row, reason = None, str(exc)
+        next_cache[task_dir.name] = {'stamp': stamp, 'row': row}
         if row:
             rows.append(row)
         progress.append(progress_row(task_dir,
@@ -578,7 +593,7 @@ def _write_sheet_unlocked(root: Path, batch_id: str, cfg: dict, *, force: bool =
             task.get("repro_level", ""),
             snapshot.get("artifact_snapshot", "") if snapshot.get("pushed") else "",
             str(video.relative_to(root)) if meta and video.is_file() else "",
-            fbr_trace.run_note(ids, api_key_read=fbr_trace.detect_api_key_read(task_dir, cfg)), status,
+            fbr_trace.run_note(ids), status,
             "冻结 task.json；存在时核验 field-revisions.json 绑定的实时 schema 和实际环境证据；snapshot.json 推送回读；record/recording.json；trace/ids.json。"])
     corrections.freeze_panes = "B2"
     for index, column in enumerate(correction_columns, 1):
@@ -595,6 +610,7 @@ def _write_sheet_unlocked(root: Path, batch_id: str, cfg: dict, *, force: bool =
     stored_result = {**result, "path": str(target)}
     book.active = book.sheetnames.index("进度")
     _atomic_workbook(root, batch_id, book, target)
+    lib.save_json(cache_path, next_cache)
     fingerprint = progress_fingerprint(root, batch_id, cfg)
     _save_sheet_state(root, batch_id, last_fingerprint=fingerprint,
                       last_write_epoch=time.time(), last_result=stored_result)
@@ -602,13 +618,13 @@ def _write_sheet_unlocked(root: Path, batch_id: str, cfg: dict, *, force: bool =
 
 
 def write_sheet(root: Path, batch_id: str, cfg: dict, *, force: bool = True,
-                refresh_delivery: bool = True) -> dict:
+                refresh_delivery: bool = True, task_id: str | None = None) -> dict:
     root = Path(root).resolve()
     lock = root / "_verification" / "sheet-locks" / f"{batch_id}.lock"
     lock.parent.mkdir(parents=True, exist_ok=True)
     with lib.file_lock(lock):
         return _write_sheet_unlocked(root, batch_id, cfg, force=force,
-                                     refresh_delivery=refresh_delivery)
+                                     refresh_delivery=refresh_delivery, task_id=task_id)
 
 
 def refresh_if_changed(root: Path, batch_id: str, cfg: dict) -> dict:

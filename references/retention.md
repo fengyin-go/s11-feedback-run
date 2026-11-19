@@ -81,4 +81,4 @@ fbr_cleanup.py verify --batch b1113-01
 `--execute`，未达到平台 `QC_PASSED` 的任务也不会删除代码现场。`prune` 仍只负责
 平台 `QC_PASSED` 的最终单题清理，需要 `--execute --confirm CLEANUP`。
 
-清理失败不会阻断已经通过的交付；具体错误写入 `review/retention-warning.json` 或 `_verification/retention/`，已移动但未完成记账的目录保留在 `_verification/cleanup-trash/`。
+清理失败不会阻断已经通过的交付；具体错误写入 `review/retention-warning.json` 或 `_verification/retention/`，清理操作先写 `cleanup-pending.json` 再移动文件。中断后再次执行清理时，已写入本题 `cleanup.json` 的事务补齐结果包和批次账本，其余事务将暂存文件移回原路径。

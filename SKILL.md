@@ -56,6 +56,10 @@ fbr_flow.py run --batch b1110-01 \
   --submit-interval 10 --execute --confirm FLOW --detach
 ```
 
+新增额度按 SOLO2 账号和北京时间跨项目共用，生产基准 `submit.daily_limit` 默认 70。R1 启动前原子预留，最终废弃释放；R2 按实际上传的主会话最后有效运行时间确定最迟提交日。20:00:00 及之前的轨迹当天到期，严格晚于 20:00:00 的轨迹可以次日提交。返修复用原单。账号概览和首次建单明细的核对方式、存量导入和多机共用配置见 [每日新增额度](references/daily-quota.md)。
+
+只有已获平台提交授权的任务才可在晚间试投。出现额度变化通知时，当前 AI 应在用户可见的进度或最终回复中报告账号、日期、实际新增数及当前基准。`pre-submit` 完成时向用户报告今晚到期和已就绪待授权的数量。用 `fbr_quota.py --root <root> --sync` 获取实时值。
+
 平台提交由独立单线程队列串行消费，不占用运行、录屏、取证和评价并发。所有建单和返修写请求共用账号级最小间隔，默认 10 秒；间隔卡在 `POST /submissions` 或 `PUT /submissions/{id}` 之前，附件上传、预检和回读不计入。每条本地验收完成后立即生成 `review/attestation.json`。提交期不再重跑需求评审，只执行确定性的单题与批检：
 
 - 校验评审凭证绑定的题面、轨迹、事实、Feedback、质量回执、抽检、快照和媒体摘要；
@@ -170,7 +174,7 @@ fbr_cleanup.py prune --batch b1113-01 --execute --confirm CLEANUP
 - 模型只挂载从冻结初始提交生成的 `run-tree/`；该目录不含 `.git`、远端、引用、对象和历史，依赖缓存可以单独复制进去。
 - 运行结束后由宿主机把 `run-tree/` 的新增、修改和删除同步回 `workspace/`，再生成 Git 快照。模型运行树里的 `.git` 或 Git 配置不进入交付。
 - 首轮启动前清空容器内预置的跨会话 `projects`、`todos` 和 `history.jsonl`，只允许当前工作区、当前题面与本轮 session；续写只恢复本题同一 SessionID。
-- key 只通过 `--env-file` 进容器；轨迹出现 key 时保留原始证据并自动记录备注，不改写原始轨迹。
+- 运行凭据通过 `--env-file` 传入容器。原始轨迹按原样收集、导出和上传，包括含网关 key 的轨迹。交付不扫描网关 key，也不要求取得当时的 key。
 - 授权、停止、恢复、尝试上限和容器清理细节全部以 `run-rules.md`/`runtime-flow.md` 为准。
 
 ```bash
@@ -179,6 +183,8 @@ fbr_run.py run --batch b1110-01                      # 演练：列出哪些题�
 fbr_run.py run --batch b1110-01 --execute            # 真跑，并发按 settings 里的 concurrency
 fbr_run.py collect --batch b1110-01
 ```
+
+显式使用 `--no-publish` 时，字段和验收证据合格即可记为本地验收完成。手工批交和滚动提交都要逐题通过同一份提交预检。单题验收刷新对应结果，整批收口重新核对全部交付文件。清理现场前重新回读平台质检状态及提交内容。清理中断后，下一次清理会恢复原文件或补齐已完成的清理回执。
 
 ## 2. 产物快照
 
@@ -222,9 +228,11 @@ fbr_record.py --batch b1110-01                       # --redo 重录
 
 提交或平台返修前还要通过 [references/feedback-platform-style.md](references/feedback-platform-style.md) 的本地风格检查。4 分必须在最终交付上明确写出一个尚未闭合的缺口、验证边界或用户可见残留后果，并留下至少一个真实文件、命令、对象或返回值。过程返工只能解释缺口来源，不能单独充当平台交付扣分点。`score_basis.category=process_issue` 不能通过平台预检；只能改用有真实正文缺口的 `verification_gap` 或 `delivery_issue`，或在确认最终交付完整后重新评审为 5 分。
 
+policy v2 的候选还必须先完成 `code_review`。审查对象是最终产物和相关 diff，不是模型轨迹：逐文件覆盖生产代码与测试改动，逐需求沿入口追到数据写入、返回或导出位置，每条需求至少登记两个代码检查项，覆盖参数契约、状态流转、事务、并发、幂等、恢复、跨模块一致性和测试是否被削弱。可确证的代码或功能问题写成 `findings`，优先进入 `delivery_issue`；相关代码已排除、至少一个 probe 已执行后仍有客观不可观察边界，才允许 `verification_gap`。只写模型没有验证、没有核对或没有做验收会直接阻断。
+
 1. `fbr_feedback.py card` 汇集题面、需求点、测试对比、演示结果、改动与轨迹索引。
 2. `fbr_reviewer.py review` 自动先对全部主/子轨迹及获准续写做一次全量摄取，建立事件图和精确偏移；reviewer 只读经过裁剪的编辑、测试/构建、错误和修正事件，不统计或补算工具调用次数，并按行号/block 回查候选原文，保存带精确出处、完整后续状态和调用回执的 `review/trace-analysis.json`，随后返回 `needs_task_agent` 检查点。轨迹配置未填写 `model` / `reasoning_effort` 时沿用 `gpt-6.2-sol` / `high`；不可用时只暂停这一阶段，不伪造分析。
-3. 当前任务 AI 默认通过 `fbr_work.py next --inline` 读取 `review/review-capsule.json`，再按需查询相关代码 hunk 和真实实跑材料，判需求完成情况与评分。Capsule 已去重包含题面、需求、review contract、测试、改动、演示、probe、过程错误、最终回答和查询入口；不再重复读取 `task-agent-brief.md` 和 `review-contract.json`。先写 `review/decision-input.json`，同时填写 `language_review`：最关键业务约束原句、黑话改写和必要业务词；再运行 `fbr_reviewer.py build` 展开并 lint。只有排错或迁移时才手写完整 candidate。代码已能确证的问题不重复跑服务；缺证据则用既有 probe 补齐后刷新 card 和检查点。5 分仍须至少两个不同的、题面未明说的有效边界 probe，每条反例登记 `prompt_implied: false`。
+3. 当前任务 AI 默认通过 `fbr_work.py next --inline` 读取 `review/review-capsule.json`，再按需查询相关代码 hunk 和真实实跑材料，先完成 `code_review`，再判需求完成情况与评分。Capsule 已去重包含题面、需求、review contract、代码审查重点、测试、改动、演示、probe、过程错误、最终回答和查询入口；不再重复读取 `task-agent-brief.md` 和 `review-contract.json`。先写 `review/decision-input.json`，同时填写 `code_review` 和 `language_review`：最关键业务约束原句、黑话改写和必要业务词；再运行 `fbr_reviewer.py build` 展开并 lint。只有排错或迁移时才手写完整 candidate。代码已能确证的问题不重复跑服务；缺证据则用既有 probe 补齐后刷新 card 和检查点。5 分仍须至少两个不同的、题面未明说的有效边界 probe，每条反例登记 `prompt_implied: false`。
 4. 当前任务 AI 另做产物与文字复核轮，按 `public_units` 逐句拆出断言，核对原始连续摘录、后续修正、最终影响，以及七项语义要求，保存绑定候选和检查点的 verification。每个 `process` 句除真实 `steps` 外还必须写 `evidence`，逐条指定 `kind=tool`、step、`target/output/error/tool` 字段和原始连续摘录；没有工具步骤时用 `kind=assistant` 绑定真实助手文本。`claim_reviews.sources` 中凡是 `trace/projects/*.jsonl`，必须同时写 `start_line`、`end_line`、`block` 和 `excerpt`。独立复核轮必须引用同一摘录，并通过 `fbr_evidence.py fetch/verify` 回查精确原始区间，不能复读整份原始轨迹。过程句还必须按 [模型过程归因审计](references/process-attribution-audit.md) 完成 `process_audit`：逐句确认主体是模型、基线行为没有被误归给模型、时间线覆盖后续修改、验收 probe/录屏没有混入模型动作，并对“只、仅、从未、收尾”等范围或时序表述扫描完整轨迹。不得将自报“通过”代替逐句证据，不得冒称另一个模型或独立审核人完成。细节见 [reviewer.md](references/reviewer.md) 和 [feedback-quality.md](references/feedback-quality.md)。
 5. `fbr_reviewer.py finalize` 只做确定性校验，不读取 `reviewer.env` 或调用外部模型；通过后保存 `audit.json`、`feedback.json`、`model-review.json` 与 `quality.json`，执行门闸、刷新本地表并主动推送快照，再核查交付字段；明确本地模式时使用 `--no-publish`。finalize 使用不含时间的稳定语义键：完全相同的失败再次提交时只返回已记录错误，不追加历史；已完整交付的同一 candidate/verification 再次提交时直接复用回执，不重复过闸、落表或发布。题面材料、评审 binding、质量/语言规则、批内查重上下文或抽检状态变化都会生成新键。失败返回具体错误，由当前任务 AI 继续修复、补证和复验；材料、规则或正文变化须重新核实，不给旧记录补盖新回执。
 
@@ -263,14 +271,14 @@ fbr_feedback.py gate  --batch b1110-01
 Feedback 的硬底线：
 
 - “模型”只在第一次明确主体时出现一次，后续用“它”承接或省略主语。正文不写“轨迹显示”“录屏中”“证据表明”等取证口吻。
-- 结果先按需求说明用户可观察的完成、部分完成、缺失和问题；过程最多 3 句，只保留最有解释力的真实失败、修正和最终影响。已修正的小问题不自动扣分，验证不足不等于功能失败。
+新稿按两个自然段写。第一段首句概括实际完成的功能，有已证实的瑕疵再写触发条件、实际结果和影响。第二段以“模型”开头，用一句话写主要操作，有真实过程问题再用一句说明波折及后续状态。
+- policy v2 必须先完成代码审查。已有代码或功能缺陷优先写 `delivery_issue`；不能把可复现缺陷改写成“未验证”，也不能把模型没有自测直接写成验证缺口。
 - 每个问题句和过程句必须有真实锚点。过程 evidence 必须落在指定步骤的真实输入/输出；逐句复核必须回到同一原始区间并检查完整后续和最终状态。
 - 过程段只能写被测模型在完成题面时的实现、判断、验证和返工。验收侧的 probe、录屏、
   Chromium/系统库、sudo、httpx2、浏览器安装或本地页面测试问题不得写成模型行为，
   也不得据此扣分或写明“未执行”。
-- 5 分必须与正文呈现一致；正文若写出首测失败、错误断言、核心返工或关键竞争未验证，最高 4 分。
-- 4 分正文必须在最后一个结果段明确留下最终缺口。若正文最后仍是“修正后通过、产物无问题、
-  交付行为符合预期”，则不能提交 4 分；必须重新核实最终交付并补真实缺口，或改为 5 分。
+先沿本次改动追到真实调用方，再从每条需求的入口追到交付结果；初看完整时复查高风险边界。按实际影响定档，已修好的过程波折如实保留。交付完整且五分所需边界验证通过时可给五分。
+- 4 分在产物段写明题面相关的残余缺口，将该句绑定到 finding 或已执行的验证。
 - `score_basis.remaining` 必须逐字写入正文中的同一最终缺口句。`process_issue` 只保留作内部诊断，
   不能作为平台 4 分依据；平台可用的 4 分类别只有 `verification_gap` 和 `delivery_issue`。
 - 正文自然、具体，不写公司黑话、抽象名词清单、空泛完成度和机器报告字段；统一规则见 `feedback-language-policy.md` 和 `feedback-style-lexicon.json`。测试数量必须绑定同次输出，不能拿全仓总数代替本题行为。
@@ -327,10 +335,10 @@ fbr_sheet.py --batch b1110-01                       # 确认回执后回填媒�
 - 抽检由真人执行；`spotcheck` 只登记结论，agent 不能自批通过。退回后改正文并重新过闸。
 - `results/<批次>/` 是固定交付投影，只含当前有效且已过闸门的白名单证据；代码和 workspace 不外移。直接改副本无效，列定义见 `sheet-columns.md`。
 - 平台 19 个启用输入字段中，18 个必填字段必须逐题核查；只有 `other_issues` 可空，提交人/时间由平台生成。缺值或未验收就阻止，不猜、不占位。
-- `other_issues` 只允许中断续写和“模型运行时读取了 apikey”两类轨迹事实，其余为空。
+- 新任务的备注只记录有证据的中断续写。历史 `trace/ids.json` 已记录 `api_key_read` 或 `key_detected` 为真时沿用原备注，其余情况留空。
 - 操作系统使用实时枚举 `MacOS/Linux`；未知枚举或 schema 变化停止并重新核实。
 
-本地“备注”和平台“其他问题”（`other_issues`）只允许两类由原始轨迹自动生成的事实：中断续写说明，以及 `模型运行时读取了 apikey`。两类同时存在时用中文分号连接；其余时候一律提交空字符串 `""`，返修也相同。备注不从 `feedback.note`、重跑、历史改写、录屏或验收说明复制；当前脚本不自动返修，另行获准返修时也必须遵守此字段规则。
+本地“备注”和平台“其他问题”使用同一份冻结的会话标识。新任务的备注只记录有证据的中断续写。历史 `trace/ids.json` 已记录 `api_key_read` 或 `key_detected` 为真时沿用原备注，其余情况留空。
 
 提交前只读 `references/stage-briefs/submit.md`，需要细节时再读 [references/platform-api.md](references/platform-api.md)。平台固定为 `https://solo2.jzxhnh.com`，账号从 `_config/settings.json` 的 `platform.account` 读取，当前默认 `zouyonghong`；`SOLO11_PLATFORM_ACCOUNT` 只作显式临时覆盖。每次登录、读取实时 schema/fingerprint、账号领域和历史 SessionID，遇到新增字段或类型变化就停止。账号以首次提交锁定领域，同账号不能跨领域提交。
 
@@ -354,7 +362,7 @@ fbr_sheet.py --batch b1110-01                       # 确认回执后回填媒�
               manifest.json events.jsonl trace-check.json review-pack.json offsets/
     record/   recording.mp4 recording.json terminal.raw.log pages/<页面ID>.png
     evidence/ facts.json audit.json probes.jsonl
-    review/   snapshot.json diff.patch card.md review-capsule.json task-agent-brief.md candidate-schema.json feedback.json
+    review/   snapshot.json diff.patch card.md review-capsule.json task-agent-brief.md candidate-schema.json feedback.json code-review.json
               model-review.json quality.json metrics.json task-agent-work.json task-closeout.json
               attestation.json（当前有效评审凭证）
               decision-input.json candidate.json verification.json build-report.json
@@ -375,7 +383,7 @@ fbr_sheet.py --batch b1110-01                       # 确认回执后回填媒�
     trace/    ids.json projects/...        原样复制主会话与子会话 JSONL
     record/   recording.mp4 recording.json pages/<页面ID>.png
     evidence/ facts.json audit.json probes.jsonl
-    review/   feedback.json model-review.json quality.json style-report.json gate.json spotcheck.json（仅当前正文版本）
+    review/   feedback.json code-review.json model-review.json quality.json style-report.json gate.json spotcheck.json（仅当前正文版本）
 <root>/_registry/baseline-tests/<完整身份摘要>.json  基线、镜像、命令、架构与脚本版本绑定的缓存
 <root>/_registry/platform-schema/<fingerprint>.json  实时 schema 完整快照
 <root>/_registry/delivered-feedback.jsonl           已交付的 Feedback（查重用，每行 {task_id, feedback}）

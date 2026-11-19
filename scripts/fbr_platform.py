@@ -41,10 +41,31 @@ class RequestNotSent(PlatformError):
     """TLS negotiation failed before HTTP bytes could be sent."""
 
 
+def daily_limit_error(raw: bytes) -> bool:
+    """Only recognize a positive daily new-submission limit, never log server text."""
+    try:
+        error = jsonlib.loads(raw)
+    except (ValueError, UnicodeError):
+        return False
+    if not isinstance(error, dict):
+        return False
+    detail = error.get('detail', error)
+    parts = [detail] if isinstance(detail, str) else []
+    for obj in (error, detail):
+        if isinstance(obj, dict):
+            parts.extend(str(obj.get(k, '')) for k in ('code', 'message', 'msg', 'error'))
+    return any(re.search(r'(?:daily_submission_(?:limit|quota)_(?:exceeded|reached)|'
+                         r'(?:今日|今天|当天|每日|每天|单日).{0,24}(?:新增|提交|建单).{0,18}(?:上限|已满|用尽|最多|已达限额|超过限制|超出限制)|'
+                         r'(?:今日|今天|当天|每日|每天|单日).{0,15}(?:最多|上限).{0,12}(?:新增|提交)|'
+                         r'daily (?:new )?submission (?:limit|quota).{0,20}(?:reached|exceeded))', text, re.I)
+               for text in parts)
+
+
 class PlatformHTTPError(PlatformError):
     """Sanitized HTTP status with an optional Retry-After hint."""
 
-    def __init__(self, status: int, retry_after: str | None = None):
+    def __init__(self, status: int, retry_after: str | None = None, *, daily_limit=False):
+        self.daily_limit = daily_limit
         self.status = int(status)
         self.retry_after_seconds = parse_retry_after(retry_after)
         super().__init__(f"平台 HTTP {self.status}；未自动重试，写请求结果需核查")
@@ -265,8 +286,13 @@ class Client:
         except urllib.error.HTTPError as exc:
             code = exc.code
             retry_after = exc.headers.get("Retry-After") if exc.headers else None
-            exc.close()
-            raise PlatformHTTPError(code, retry_after) from None
+            daily_limit = False
+            try:
+                if method == 'POST' and path == '/submissions' and code in (400, 403, 409, 422, 429):
+                    daily_limit = daily_limit_error(exc.read(8192))
+            finally:
+                exc.close()
+            raise PlatformHTTPError(code, retry_after, daily_limit=daily_limit) from None
         except (urllib.error.URLError, OSError, TimeoutError, http.client.HTTPException, ValueError) as exc:
             if tls_before_http(exc):
                 raise RequestNotSent("平台TLS握手失败，HTTP请求尚未发送；未自动重试") from None

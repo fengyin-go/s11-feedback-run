@@ -332,6 +332,8 @@ def main() -> int:
                 except (lib.FbrError, OSError, ValueError):
                     pass
             print(fbr_submit.compact_result(result, full=args.json))
+            if args.execute and any(row["state"] != "confirmed" for row in result.get("tasks", [])):
+                return 1
         return 0
     except lib.FbrError as exc:
         print(f"错误：{exc}", file=sys.stderr)

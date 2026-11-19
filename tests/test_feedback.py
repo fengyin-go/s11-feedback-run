@@ -31,7 +31,7 @@ class Card(FlowCase):
         self.assertLess(len(brief.encode("utf-8")), len(text.encode("utf-8")))
         self.assertLess(len(brief.encode("utf-8")), 6000)
         self.assertLess(len(json.dumps(capsule, ensure_ascii=False).encode("utf-8")), 7000)
-        self.assertEqual(capsule["version"], 2)
+        self.assertEqual(capsule["version"], 3)
         self.assertEqual(capsule["task_id"], task_dir.name)
         self.assertEqual(capsule["tests"]["after"]["test_rc"], 0)
         self.assertEqual(brief.count("- probe P1："), 1 if capsule["probes"] else 0)
@@ -56,6 +56,8 @@ class Card(FlowCase):
             "  - A src/clipcut/segment.py (+2 / -0)\n",
             "- 新增的 TODO 或占位：src/clipcut/packer.py：# TODO: 一小时以上的输入",
             "- 完整 diff 在 review/diff.patch",
+            "## 代码缺陷审查（评分前必须完成）",
+            "必查代码点：entrypoint_wiring",
             "- 模型自己跑过测试：是；最后一次改动在第 4 步，之后没有再验证；最后一次检查通过",
             "  - 第 3 步 test：`make test` → 通过",
             "    3 Bash   make test",
@@ -440,6 +442,13 @@ class Main(FlowCase):
         self.assertEqual(out.strip(), str(target))
         doc = lib.load_json(target)
         self.assertEqual([row["id"] for row in doc["requirements"]], ["R1", "R2", "R3"])
+        self.assertEqual(doc["feedback_policy_version"], 3)
+        self.assertTrue(doc["code_review"]["changed_files_reviewed"])
+        self.assertEqual(len(doc["code_review"]["requirement_checks"]), 3)
+        self.assertFalse(doc["code_review"]["baseline_compared"])
+        focus = {row["check"] for row in doc["code_review_focus"] if "check" in row}
+        self.assertIn("entrypoint_wiring", focus)
+        self.assertIn("cross_module_consistency", focus)
         self.assertIn("claims", doc)
         self.assertIn("quality_checks", doc)
         self.assertTrue(all(item["passed"] is False for item in doc["quality_checks"].values()))

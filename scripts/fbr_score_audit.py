@@ -60,6 +60,12 @@ def scan_task(task: Path, cfg: dict) -> dict | None:
         classes.append("counterexample_problem")
     if len(valid_probes) < int(cfg["feedback_gate"]["min_counterexamples"]):
         classes.append("verification_gap")
+    if (doc.get("score_basis") or {}).get("category") == "verification_gap":
+        if not doc.get("code_review"):
+            classes.append("missing_code_review")
+        elif doc.get("feedback_policy_version", 0) >= gate.CODE_REVIEW_POLICY_VERSION \
+                and gate.code_review_errors(doc, record, audit, ev):
+            classes.append("incomplete_code_review")
     if cap == 5 and (doc.get("score_basis") or {}).get("category") == "process_issue":
         classes.append("process_only")
     if any(word in process_text + text for word in ("没有真正", "未实测", "仍未成立", "没有实际",
@@ -76,7 +82,9 @@ def scan_task(task: Path, cfg: dict) -> dict | None:
                                 "check": requirement.get("check", "")})
     priority = 0
     for name, weight in (("counterexample_problem", 50), ("detail_severity_review", 40),
-                         ("explicit_unverified", 35), ("verification_gap", 20),
+                         ("explicit_unverified", 35), ("incomplete_code_review", 32),
+                         ("missing_code_review", 30),
+                         ("verification_gap", 20),
                          ("process_only", 10)):
         if name in classes:
             priority += weight

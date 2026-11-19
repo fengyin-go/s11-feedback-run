@@ -225,15 +225,6 @@ class Secrets(Sandbox):
         packed = base64.b64encode(f"x-access-token:{KEY}".encode()).decode()
         self.assertNotIn(packed, lib.redact(f"Authorization: Basic {packed}", [KEY]))
 
-    def test_key_check_preserves_file(self):
-        path = write(self.tmp / "stream.jsonl", f'{{"a": "{KEY}"}}\n{{"b": "{KEY}"}}\nclean\n')
-        original = path.read_bytes()
-        self.assertEqual(lib.key_occurrences(path, KEY), 2)
-        self.assertEqual(path.read_bytes(), original)
-        self.assertEqual(lib.key_occurrences(path, KEY), 2)
-        self.assertEqual(lib.key_occurrences(self.tmp / "missing.log", KEY), 0)
-
-
 class Steps(unittest.TestCase):
     STEPS = [{"name": "setup", "cmd": "make setup", "timeout": 10}, {"name": "test", "cmd": "make test", "timeout": 10},
              {"name": "probe", "cmd": "true", "timeout": 10}]

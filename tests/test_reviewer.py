@@ -202,6 +202,73 @@ class Review(FlowCase):
         self.assertEqual(receipt['reasoning_effort'], 'session')
         self.assertNotIn('trace-claims_sha', receipt)
 
+    def test_v2_code_review_is_frozen_with_accepted_feedback(self):
+        task = self.agent_prepared()
+        candidate = json.loads(self.candidate()[0])
+        feedback_doc = candidate["feedback"]
+        feedback_doc["feedback_policy_version"] = 2
+        feedback_doc["issues"][0]["finding_id"] = "F1"
+        feedback_doc["code_review"] = {
+            "version": 1,
+            "baseline_compared": True,
+            "changed_files_reviewed": [
+                {
+                    "path": path,
+                    "requirement_ids": ["R1", "R2", "R3"],
+                    "result": "reviewed",
+                    "note": "核对最终代码、数据流和缺失的长输入分支",
+                    "finding_ids": ["F1"] if path.endswith("packer.py") else [],
+                }
+                for path in ("src/clipcut/packer.py", "src/clipcut/segment.py")
+            ],
+            "requirement_checks": [
+                {
+                    "requirement_id": requirement_id,
+                    "status": "defect" if requirement_id == "R2" else "pass",
+                    "call_chain": ["cli.pack", "packer.pack", "segment.write_manifest"],
+                    "checks": [{
+                        "id": "input_contract" if requirement_id == "R2" else "data_flow",
+                        "status": "violation" if requirement_id == "R2" else "pass",
+                        "evidence": "超过一小时的输入进入 TODO 后抛出 RuntimeError"
+                        if requirement_id == "R2" else "分片写入和清单返回使用同一路径与版本",
+                    }, {
+                        "id": "test_quality",
+                        "status": "violation" if requirement_id == "R2" else "pass",
+                        "evidence": "现有测试没有覆盖一小时以上输入的长时长分支"
+                        if requirement_id == "R2" else "现有用例断言了分片数量、清单和非法参数结果",
+                    }],
+                    "finding_ids": ["F1"] if requirement_id == "R2" else [],
+                }
+                for requirement_id in ("R1", "R2", "R3")
+            ],
+            "findings": [{
+                "id": "F1",
+                "requirement_ids": ["R2"],
+                "kind": "logic_error",
+                "evidence_level": "reproduced",
+                "trigger": "输入时长超过一小时",
+                "expected": "长输入也能生成完整分片",
+                "actual": "进入 TODO 后抛出 RuntimeError",
+                "impact": "长素材完全无法打包",
+                "anchors": [
+                    {"type": "probe", "id": "P2"},
+                    {"type": "file", "path": "src/clipcut/packer.py"},
+                    {"type": "log", "text": "input longer than 3600s is not supported"},
+                ],
+            }],
+            "verification_gap": {
+                "unresolved_observable": "",
+                "attempted_probes": [],
+                "blocked_reason": "",
+            },
+        }
+        result = reviewer.finalize(task, candidate, self.verification(task, candidate))
+        self.assertEqual(result["state"], "ok")
+        self.assertEqual(
+            lib.load_json(task / "review/code-review.json"),
+            feedback_doc["code_review"],
+        )
+
     def test_lint_catches_requirement_gaps_and_platform_style_before_finalize(self):
         task = self.agent_prepared()
         candidate = json.loads(self.candidate()[0])
@@ -518,9 +585,11 @@ class Review(FlowCase):
         actions = reviewer.repair_actions([
             "第 1 句复查没有逐条引用过程句 evidence 对应的原始轨迹摘录",
             "第 2 句复查摘录不在原始文件中",
+            "code_review 未覆盖相关改动文件：src/clipcut/segment.py",
         ])
         self.assertEqual(actions[0]["path"], "process[].evidence")
         self.assertEqual(actions[1]["path"], "claims[].sources")
+        self.assertEqual(actions[2]["path"], "code_review")
 
     def test_compact_build_derives_internal_status_and_score_fields(self):
         task = self.agent_prepared()
@@ -576,6 +645,21 @@ class Review(FlowCase):
         self.assertNotEqual(
             candidate["feedback"]["score_basis"]["category"], "process_issue",
             "自动展开不能把纯 process_issue 选成可提交平台的 4 分",
+        )
+
+    def test_compact_build_carries_code_review_without_deriving_its_verdict(self):
+        task = self.agent_prepared()
+        decision = fbr_feedback.decision_template(task)
+        decision["score"] = 4
+        decision["feedback"] = "正文"
+        decision["code_review"]["baseline_compared"] = True
+        decision["code_review"]["requirement_checks"][0]["status"] = "pass"
+        candidate, _ = fbr_feedback.expand_decision(task, decision)
+        self.assertEqual(candidate["feedback"]["feedback_policy_version"], 3)
+        self.assertTrue(candidate["feedback"]["code_review"]["baseline_compared"])
+        self.assertEqual(
+            candidate["feedback"]["code_review"]["requirement_checks"][0]["status"],
+            "pass",
         )
 
     def test_work_wait_and_closeout_use_files_not_conversation_history(self):

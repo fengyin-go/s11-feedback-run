@@ -18,7 +18,7 @@ class PlatformRulesTest(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory(prefix="platform-rules-")
         self.addCleanup(self.temp.cleanup)
         self.batch = Path(self.temp.name) / "batch"
-        self.task = self.batch / "repo-05-bugfix"
+        self.task = self.batch / "sales-data-05-bugfix"
         (self.task / "trace").mkdir(parents=True)
         (self.task / "review").mkdir()
 
@@ -31,7 +31,7 @@ class PlatformRulesTest(unittest.TestCase):
 
     def write_contract(self, *, expected_calls: int | None = None) -> None:
         workload = {
-            "work_slices": [{}, {}, {}, {}],
+            "work_slices": [{"module": name} for name in ("入口", "存储", "入口", "存储")],
             "verification_paths": ["path-a", "path-b"],
         }
         if expected_calls is not None:

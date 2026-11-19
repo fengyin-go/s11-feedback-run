@@ -74,13 +74,13 @@ fbr_sheet.py --root "<root>" --batch b1110-01
 | screencast | 上传视频得到的 URL 字符串 |
 | score_delivery | 交付完整性，整数 1–5 |
 | feedback | Feedback 原文 |
-| other_issues | 平台“其他问题”，唯一非必填字段；只允许有证据的中断续写说明和“模型运行时读取了 apikey”，两者可同时存在，其他情况一律为空字符串，返修也相同 |
+| other_issues | 新任务的备注只记录有证据的中断续写。历史 `trace/ids.json` 已记录 `api_key_read` 或 `key_detected` 为真时沿用原备注，其余情况留空。 |
 
 本地保留 21 列兼容表，不从表格反向读数据提交。`提交人` 和 `提交时间` 不在 API data 中：平台据登录账号和服务端时间生成。未提交时两项保持空白，不用本地身份或评价时间代替，也不阻塞输入字段检查。来源必须是当前仍通过 Feedback 闸门的原始记录和白名单投影；人工抽检退回的当前正文禁止提交，agent 不代登记人工抽检通过。
 
 ## 附件、建单和回读
 
-1. 刷新 `results/<批次>/delivery-manifest.json`。正文、分数、证据、会话轮数和快照不合格时，上传前停止。用起跑 key 扫描交付源文件；缺 key 不能确认备注事实，停止导出。轨迹或证据命中起跑 key 时可交付，但备注必须自动包含“模型运行时读取了 apikey”，命中文件记入交付清单供核查。
+1. 刷新 `results/<批次>/delivery-manifest.json`，核实正文、分数、证据、会话轮数和快照。原始轨迹按原样收集、导出和上传，包括含网关 key 的轨迹。交付不扫描网关 key，也不要求取得当时的 key。
 2. 仅取本题清单内的主会话 `.jsonl` 和 `record/recording.mp4`，拒绝符号链接、跨题文件、空文件和摘要漂移。平台仅接受一个 JSONL，不能打包 ZIP 或把子会话当第二附件；子会话原样保留本地。
 3. `POST /submissions/upload` 使用 multipart。轨迹只含 `file`；视频含 `file` 和 `kind=video`。轨迹响应须有 `name,path,size`，视频响应须有 `name,url`。同一打开文件先核对大小/SHA256，流式发送时再次核对 SHA256。2026-11-11 schema 的附件上限为 27 MB；schema 未给视频上限时采用当日页面组件的 500 MB，服务端可进一步拒绝。录屏时长/编码/分辨率仍遵守原运行规则。
 4. `POST /submissions`，请求为 `{"data": {...19字段...}, "schema_fingerprint": "实时指纹"}`。上传后指纹变化则停止建单，保留已上传附件供重新演练后复用。
@@ -123,7 +123,7 @@ fbr_batch.py repair --batch b1110-01 --tasks s11-000123 \
 重投。返修完成后轮询详情，只有 `QC_PASSED` 才算通过；新的 `PENDING_FIX` 仍按原字段返修
 硬规则处理。
 
-平台 `other_issues` 不从本地 `feedback.note` 复制，只根据原始轨迹自动生成两类事实：模型自行中断后已输入“继续”的次数及首轮标识说明；当前轨迹或运行输出确实出现起跑 key 时写固定短句“模型运行时读取了 apikey”。两类都存在时用中文分号连接。两项都没有时显式发送 `""`；重跑、Git 历史、录屏问题、修复说明等仍保留在本地证据中。
+新任务的备注只记录有证据的中断续写。历史 `trace/ids.json` 已记录 `api_key_read` 或 `key_detected` 为真时沿用原备注，其余情况留空。
 
 `PENDING_FIX` 仍要区分可编辑字段失败和题目级失败。
 `qc_checks[].evidence.problem_type=DOMAIN_MISMATCH` 表示题面主体与所属领域不符；P3/P4/P5

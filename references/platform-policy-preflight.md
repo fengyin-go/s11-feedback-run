@@ -7,13 +7,13 @@
 - 2 条 `DISCARDED` 是 A-5 公共长片段查重。
 
 因此运行侧在附件上传和建单前必须执行本地平台规则预检。结果写入
-`review/platform-rules.json`，失败只阻断当前题。
+`review/platform-rules.json`，滚动提交按题阻断。手工批交先预检本次选择的所有题，全部通过才开始上传。
 
 ## 检查顺序
 
 1. 读取批次 `repo-topic-map.json`。新 S11 批次缺失文件即阻断；旧批次完全缺失时进入 legacy
    兼容模式并记录 warning。文件存在但没有 H3 v3 契约、缺少八项假 H3 守卫或缺少
-   `workload_design` 时阻断。工作切片少于 4、验证路径少于 2 时阻断；不读取、不校验
+   `workload_design` 时阻断。工作切片少于 4、覆盖模块少于 2 或验证路径少于 2 时阻断；不读取、不校验
    `expected_effective_tool_calls`，也不设 50/55 次工具调用门槛。
 2. 独立读取 `prompt-generation-manifest.json`，不能因上一步缺文件而跳过。新 S11 批次缺失
    文件即阻断；旧批次完全缺失时记录 warning。文件存在且 `gate_ok`、`raw_a5_ok` 或

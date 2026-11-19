@@ -10,8 +10,8 @@ import fbr_evidence
 import fbr_gate as gate
 import fbrlib as lib
 
-VERSION = 14
-SUPPORTED_CERTIFICATE_VERSIONS = {12, 13, 14}
+VERSION = 15
+SUPPORTED_CERTIFICATE_VERSIONS = {12, 13, 14, 15}
 CHECKS = ("result_and_process", "task_specific_voice", "test_relevance", "score_alignment",
           "evidence_fidelity", "scope_discipline", "non_template")
 RULE_FILES = ("references/scoring.md", "references/feedback-writing.md", "references/feedback-calibration.md",
@@ -27,6 +27,9 @@ LEGACY_TRACE_POLICIES = {
     "41e8cc299da551d1c8f22773ec0b0307262ddd13f5eb41cb2903b3bcc68d1e72",
 }
 LEGACY_FEEDBACK_POLICIES = {
+    "2c7fb22e5b498516f11b9cdb130536924a459fd8912e2393454553a6510a128a",  # archived rule files from 94bc83b3
+    "ead4a7665ff3d354c19e63a33e2397108cd243303034d9ab4665f4d06051c6ca",  # archived rule files from d4cee250
+    "e8a8f045e877f6b755bf55fee0dfe518b01dc278f94bbe1b4248edac2a428218",
     "a1e0ca307e61222cd2ba24ab1c382f6bcf18c2bbeed1eb469d6369dbf60f2e9a",
     "4f8b031762278016d5e63cb784fd04bc2b2f921b33b9a7dda52082fb1427f95e",
     "6a50956ab20e9c7567e9397be7e7be8d3183d84981786b9899809a6c016111d4",
@@ -258,6 +261,10 @@ def check_contract(doc: dict, task: dict, facts: dict, audit: dict, probes: list
     if not isinstance(basis, dict) or any(not isinstance(basis.get(k), str) or len(basis[k].strip()) < 6
             for k in ("delivered", "remaining", "why_this_score")):
         errors.append("score_basis 必须说明已交付、剩余缺口及本档理由；不进入正文")
+    if (isinstance(doc.get("feedback_policy_version"), int)
+            and doc.get("feedback_policy_version", 0) >= gate.CODE_REVIEW_POLICY_VERSION
+            and isinstance(basis, dict) and basis.get("category") == "process_issue"):
+        errors.append("policy v2 不允许把 process_issue 作为评分类别；先完成代码审查并选择 complete、verification_gap 或 delivery_issue")
     if not isinstance(basis, dict) or basis.get("category") not in ("delivery_issue", "verification_gap", "process_issue", "complete"):
         errors.append("score_basis.category 必须是 delivery_issue、verification_gap、process_issue 或 complete")
     elif (doc.get("score") == 5) != (basis["category"] == "complete"):
@@ -275,7 +282,7 @@ def check_contract(doc: dict, task: dict, facts: dict, audit: dict, probes: list
         else:
             errors += gate._anchor_problems(anchors, ev, '评分依据')
         errors += gate.platform_consistency_errors(
-            doc.get("score"), str(doc.get("feedback") or ""), basis,
+            doc.get("score"), str(doc.get("feedback") or ""), gate.public_score_basis(doc),
         )
 
     errors += process_audit_errors(doc, facts)
@@ -300,6 +307,20 @@ def check_contract(doc: dict, task: dict, facts: dict, audit: dict, probes: list
             errors.append(label + "没有关联本题真实需求点")
         if len(str(item.get("behavior", "")).strip()) < 6:
             errors.append(label + "须说明测试验证的具体行为，不能只报总数或通过状态")
+        if doc.get('feedback_policy_version') == gate.CURRENT_FEEDBACK_POLICY:
+            use = item.get('use')
+            public = str(item.get('public_behavior') or '').strip()
+            if use not in ('delivery', 'process'):
+                errors.append(label + '须标明 use=delivery（交付结论）或 process（模型操作）')
+            elif use == 'delivery' and (len(public) < 6 or gate.squash(public) not in text
+                    or re.fullmatch(r'(?:完整|全部|所有|后端|前端|服务|单元|边界|主|回归|生产|测试|套件|用例|构建|检查|校验|和|与|都|均|已|成功|通过|了|的|\s)+', public)):
+                errors.append(label + '须从正文 public_behavior 引用实际验证的业务结果；只有套件成功就收窄结论或补定向证据')
+            elif use == 'process' and not any(sentence in gate.squash(str(row.get('sentence') or ''))
+                                              for row in doc.get('process') or [] if isinstance(row, dict)):
+                errors.append(label + '作为操作事实须绑定同一过程句；若用来证明交付，请填写业务结果')
+            if use == 'process' and re.search(r'(?:修正|修复|改完|改好).{0,35}(?:套件|服务测试|后端校验).{0,15}通过', sentence):
+                if not public or gate.squash(public) not in text or gate.squash(public) == gate.squash(sentence):
+                    errors.append(label + '用修正后套件通过说明修复结果，须在 public_behavior 绑定正文和同次测试所验的业务行为，或只陈述实际操作')
         output = source_text(item, facts, probes)
         source = item.get("source")
         if isinstance(source, dict) and source.get("kind") == "verification" and (
@@ -316,7 +337,9 @@ def check_contract(doc: dict, task: dict, facts: dict, audit: dict, probes: list
                 errors.append(label + "提到通过数量，必须给出同一日志中的 count 与 count_quote；不能推算或挪用全仓总数")
     # 覆盖整段相关分句，防止只登记“make test”几个字符却遗漏后面的夸大结论。
     for raw in re.split(r"[。；！？\n]", str(doc.get("feedback", ""))):
-        if not TEST_CLAUSE.search(raw) and not COUNT_CLAIM.search(raw):
+        suite_claim = (doc.get('feedback_policy_version') == gate.CURRENT_FEEDBACK_POLICY
+                       and re.search(r'(?:套件|构建|回归|校验脚本|检查脚本|unittest).{0,20}(?:通过|成功|passed)', raw, re.I))
+        if not TEST_CLAUSE.search(raw) and not COUNT_CLAIM.search(raw) and not suite_claim:
             continue
         clause = gate.squash(raw)
         if not any(clause in s for s in valid_sentences):

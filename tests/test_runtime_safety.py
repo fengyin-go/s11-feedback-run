@@ -53,7 +53,7 @@ class EvidenceSafety(DockerCase):
         self.assertIn(KEY, exported[0].read_text())
         self.assertEqual(len(self.docker.docker_calls("exec")), 2)
 
-    def test_collect_key_preserves_original_and_records_platform_note(self):
+    def test_collect_key_preserves_original_without_new_note(self):
         task_dir = self.make_task()
         fbr_run.bound_key(task_dir, self.cfg, start=True)
         lib.set_stage(task_dir, "run", "ok", attempts=1, session_id=SID)
@@ -66,8 +66,8 @@ class EvidenceSafety(DockerCase):
         target = next((task_dir / "trace/projects").rglob("*.jsonl"))
         self.assertEqual(target.read_bytes(), original)
         ids = lib.load_json(task_dir / "trace/ids.json")
-        self.assertTrue(ids["api_key_read"])
-        self.assertEqual(fbr_trace.run_note(ids), fbr_trace.API_KEY_NOTE)
+        self.assertNotIn("api_key_read", ids)
+        self.assertEqual(fbr_trace.run_note(ids), "")
         self.assertNotIn("s11-000001", self.docker.containers)
         self.assertNotIn(KEY, str(row))
         self.assertEqual(fbr_run.collect_one(task_dir, self.cfg)["state"], "skip")

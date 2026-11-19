@@ -75,7 +75,7 @@ class ProgressContinuation(unittest.TestCase):
     Path(stdout_path).write_text('',encoding='utf-8')
     Path(stderr_path).write_text('',encoding='utf-8')
     return 124,True
-   with patch.object(lib,'load_task',return_value=record),patch.object(fbr_run,'bound_key',return_value='fake'),patch.object(fbr_run,'recover_one',return_value={'state':'prepared','detail':'same container'}),patch.object(fbr_run,'ready_problems',return_value=[]),patch.object(fbr_run,'use_legacy_progress_recovery',return_value=True),patch.object(fbr_run,'run_command') as create:
+   with patch.object(fbr_run.quota,'reserve',return_value=None),patch.object(lib,'load_task',return_value=record),patch.object(fbr_run,'bound_key',return_value='fake'),patch.object(fbr_run,'recover_one',return_value={'state':'prepared','detail':'same container'}),patch.object(fbr_run,'ready_problems',return_value=[]),patch.object(fbr_run,'use_legacy_progress_recovery',return_value=True),patch.object(fbr_run,'run_command') as create:
     create.return_value=Mock(returncode=0,stdout='cid')
     with patch.object(lib,'save_git_config'),patch.object(lib,'open_permissions'),patch.object(lib,'run_stream',side_effect=timed_stream),patch.object(fbr_run,'code_changes',return_value=[]),patch.object(fbr_run,'archive_attempt'):
      row=fbr_run.run_one(task,cfg)

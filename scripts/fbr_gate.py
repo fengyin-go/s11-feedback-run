@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import re
 from difflib import SequenceMatcher
+from pathlib import Path
 
 import fbrlib as lib
 import fbr_style
@@ -22,6 +23,28 @@ VERDICTS = ("做到", "有问题", "看不出来")
 LEVELS = ("未实现", "明显", "细节")
 FALSE_SUCCESS = {"无": 5, "轻微": 3, "较大": 2, "严重": 1}
 ANCHOR_TYPES = ("file", "tree", "missing", "step", "log", "value", "req", "test", "probe", "demo")
+CODE_REVIEW_POLICY_VERSION = 2
+CURRENT_FEEDBACK_POLICY = 3
+CODE_REVIEW_STATUSES = {"pass", "defect", "blocked"}
+CODE_REVIEW_FILE_RESULTS = {"reviewed", "not_applicable"}
+CODE_REVIEW_CHECK_STATUSES = {"pass", "violation", "not_applicable"}
+CODE_REVIEW_EVIDENCE_LEVELS = {"reproduced", "code_reachable"}
+CODE_REVIEW_KINDS = {
+    "logic_error", "integration_gap", "contract_mismatch", "data_integrity",
+    "transaction", "concurrency_race", "idempotency", "recovery",
+    "compatibility_regression", "validation_gap", "false_success", "minor_format",
+}
+CODE_REVIEW_BLOCKED_REASONS = {
+    "nondeterministic_unobservable",
+    "required_external_service_unavailable",
+    "artifact_cannot_expose_result",
+    "execution_environment_unsupported",
+}
+CODE_REVIEW_SOURCE_SUFFIXES = {
+    ".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".java", ".c", ".cc",
+    ".cpp", ".h", ".hpp", ".go", ".rs", ".rb", ".php", ".vue", ".svelte", ".sql",
+    ".json", ".yml", ".yaml", ".toml", ".xml", ".sh", ".html", ".css",
+}
 
 RUBRIC = [
     "一次性完美跑通。不仅实现了所有明示需求，还主动补全了隐性需求（如边界处理），零虚假成功",
@@ -54,6 +77,10 @@ MODEL_PROCESS_RE = re.compile(
     r"(?:先|最初|随后|最后|尝试|实现|修改|重写|验证|修正|重跑|完成|遗漏|没有|未|误判|判断)"
 )
 PROCESS_GAP_ONLY_RE = re.compile(r"未覆盖|没覆盖|没有覆盖|仍未验证|还没有验证|没有验证|未验证")
+PROCESS_ONLY_FINAL_GAP_RE = re.compile(
+    r"(?:模型|它).{0,30}(?:没有|未|没).{0,20}(?:验证|核对|验收|检查|测试)"
+    r"|(?:没有|未|没)(?:有)?(?:做|进行|完成|执行)?(?:验证|核对|验收|检查|测试)"
+)
 PROCESS_PROBLEM_RE = re.compile(
     r"失败|报错|误判|错判|判断错|错误|异常|中断|不通过|没过|冲突|超时|无法|返工|JSONDecodeError|Error|Traceback|TS\d+",
     re.I,
@@ -95,19 +122,53 @@ def remaining_gap_sentences(text: str) -> list[str]:
     return [unit for unit in sentences(text) if PLATFORM_REMAINING_GAP_RE.search(unit)]
 
 
+def public_score_basis(doc: dict) -> dict | None:
+    """Resolve an archived paraphrase to its evidenced public sentence without changing the stored review."""
+    basis = doc.get('score_basis')
+    if not isinstance(basis, dict):
+        return None
+    if doc.get('feedback_policy_version') or doc.get('score') != 4 or not basis.get('anchors'):
+        return basis
+    remaining = squash(str(basis.get('remaining') or '')).rstrip('。')
+    text = str(doc.get('feedback') or '')
+    if not remaining or remaining in squash(text):
+        return basis
+    if basis.get('category') == 'delivery_issue':
+        candidates = [str(issue.get('sentence') or '').strip().rstrip('。')
+                      for issue in doc.get('issues') or [] if isinstance(issue, dict)
+                      and issue.get('anchors') and issue.get('trigger') and issue.get('impact')]
+    elif basis.get('category') == 'verification_gap':
+        candidates = [unit for unit in sentences(text) if '无法确认' in unit or '尚未验证' in unit]
+    else:
+        return basis
+    matches = set()
+    for unit in candidates:
+        if not unit or unit not in text:
+            continue
+        matcher = SequenceMatcher(None, remaining, unit, autojunk=False)
+        shared = [block.size for block in matcher.get_matching_blocks() if block.size >= 3]
+        if max(shared, default=0) >= 7 or (len(shared) >= 2 and sum(shared) >= 8):
+            matches.add(unit)
+    if len(matches) == 1:
+        return {**basis, 'remaining': matches.pop()}
+    return basis
+
+
 def platform_consistency_errors(score, text: str, basis: dict | None = None) -> list[str]:
     """Reject process-only 4-point feedback before platform consistency review."""
     if score != 4:
         return []
     errors = []
     gaps = remaining_gap_sentences(str(text or ""))
-    if not gaps:
-        errors.append(
-            "4 分必须写出最终交付扣分点：没有最终缺口、验证边界或用户可见残留后果时，"
-            "不能只写过程返工；请重新核实交付并考虑 5 分或补出真实 verification_gap/delivery_issue"
-        )
+    # A platform payload contains no findings. Missing a regex match is weak evidence;
+    # an explicit process-only or fully-complete conclusion is a real contradiction.
+    process_only = (str(text).strip().startswith('模型') and len(sentences(text)) == 1
+                    and bool(PROCESS_REPAIR_RE.search(text)))
+    explicit_complete = bool(re.search(r'最终(?:产物|交付)(?:无问题|没有问题|全部完成|没有缺口)', text))
     if not isinstance(basis, dict):
-        return errors
+        if not gaps and (process_only or explicit_complete):
+            return ["4 分必须写出最终交付扣分点，已修正的过程返工没有说明残余影响"]
+        return []
     category = str(basis.get("category") or "")
     if category == "process_issue":
         errors.append(
@@ -117,13 +178,25 @@ def platform_consistency_errors(score, text: str, basis: dict | None = None) -> 
     elif category and category not in ("verification_gap", "delivery_issue"):
         errors.append("4 分的 score_basis.category 必须是 verification_gap 或 delivery_issue")
     remaining = squash(str(basis.get("remaining") or ""))
-    if not remaining_gap_sentences(remaining):
+    stated_delivery = (category in ('delivery_issue', 'verification_gap') and bool(remaining)
+                       and remaining in squash(text) and len(remaining) >= 6)
+    if not gaps and not stated_delivery:
+        errors.append(
+            "4 分必须写出最终交付扣分点：没有最终缺口、验证边界或用户可见残留后果时，"
+            "不能只写过程返工；请重新核实交付并考虑 5 分或补出真实 verification_gap/delivery_issue"
+        )
+    if not remaining_gap_sentences(remaining) and not stated_delivery:
         errors.append(
             "score_basis.remaining 必须写明同一最终交付缺口，不能只写过程失败、"
             "没有已证实功能缺口或全部通过"
         )
-    elif gaps and not any(squash(gap) in remaining or remaining in squash(gap) for gap in gaps):
+    elif not stated_delivery and gaps and not any(squash(gap) in remaining or remaining in squash(gap) for gap in gaps):
         errors.append("score_basis.remaining 必须对应正文中的同一最终缺口句")
+    if category == "verification_gap" and PROCESS_ONLY_FINAL_GAP_RE.search(remaining):
+        errors.append(
+            "verification_gap 不能只写模型没有验证或没有核对；"
+            "必须写最终产物中仍无法观察的用户结果，并绑定已执行 probe"
+        )
     return list(dict.fromkeys(errors))
 
 
@@ -159,10 +232,15 @@ def build_evidence(task: dict, facts: dict, audit: dict | None, probes: list[dic
                       ensure_ascii=False)
     return {
         "diff_files": {f["path"] for f in facts["changes"]["files"]},
+        "review_files": sorted(
+            f["path"] for f in facts["changes"]["files"]
+            if Path(str(f.get("path") or "")).suffix.lower() in CODE_REVIEW_SOURCE_SUFFIXES
+        ),
         "tree": set(facts.get("tree_files", [])),
         "steps": {s["step"] for s in facts["trace"]["steps"]},
         "req_ids": {str(r["id"]) for r in task["requirements"]},
         "failed_tests": set(tests["after"].get("failed_names", [])) | set(tests.get("new_failures", [])),
+        "tests_regression": bool(tests.get("regression")),
         "probes": {row.get("id"): row for row in probes},
         "demo_steps": len(facts["demo"]["steps"]),
         "logs": squash("\n".join(logs)),
@@ -178,7 +256,7 @@ def verify_anchor(anchor, ev: dict) -> str | None:
         return f"锚点格式不对：{json.dumps(anchor, ensure_ascii=False)[:80]}"
     kind = anchor["type"]
     if kind in ("file", "tree", "missing"):
-        path = str(anchor.get("path", "")).lstrip("./")
+        path = str(anchor.get("path", "")).removeprefix("./")
         if not path:
             return "文件锚点没写 path"
         if kind == "file" and path not in ev["diff_files"]:
@@ -220,6 +298,287 @@ def _anchor_problems(anchors, ev: dict, where: str) -> list[str]:
     if not isinstance(anchors, list):
         return [f"{where}：anchors 要是列表"]
     return [f"{where}：{p}" for p in (verify_anchor(a, ev) for a in anchors) if p]
+
+
+def _text_list(value) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(item).strip() for item in value if str(item or "").strip()]
+
+
+def code_review_errors(doc: dict, task: dict, audit: dict, ev: dict) -> list[str]:
+    """Require a completed implementation review before a v2 score is accepted.
+
+    Legacy feedback without ``feedback_policy_version`` remains readable. New
+    candidates carry version 2 and must prove that relevant changed code was
+    reviewed, every requirement has a code-level conclusion, and any claimed
+    verification gap followed an actual probe attempt.
+    """
+    try:
+        policy_version = int(doc.get("feedback_policy_version") or 0)
+    except (TypeError, ValueError):
+        policy_version = 0
+    if policy_version < CODE_REVIEW_POLICY_VERSION:
+        return []
+    review = doc.get("code_review")
+    if not isinstance(review, dict):
+        return ["新 Feedback 必须填写 code_review，先完成代码审查再评分"]
+
+    errors: list[str] = []
+    if review.get("version") != 1:
+        errors.append("code_review.version 必须是 1")
+    if review.get("baseline_compared") is not True:
+        errors.append("code_review.baseline_compared 必须为 true，先区分基线已有与本次引入的问题")
+
+    files = review.get("changed_files_reviewed")
+    if not isinstance(files, list):
+        errors.append("code_review.changed_files_reviewed 必须是列表")
+        files = []
+    reviewed: dict[str, dict] = {}
+    reviewed_finding_ids: set[str] = set()
+    for index, row in enumerate(files, 1):
+        label = f"code_review.changed_files_reviewed[{index}]"
+        if not isinstance(row, dict):
+            errors.append(label + " 必须是对象")
+            continue
+        path = str(row.get("path") or "").removeprefix("./")
+        if not path:
+            errors.append(label + ".path 缺失")
+            continue
+        if path not in ev["diff_files"]:
+            errors.append(f"{label}.path 不在本次改动中：{path}")
+            continue
+        if path in reviewed:
+            errors.append(f"{label}.path 重复：{path}")
+        reviewed[path] = row
+        if row.get("result") not in CODE_REVIEW_FILE_RESULTS:
+            errors.append(f"{label}.result 必须是 reviewed 或 not_applicable")
+        ids = _text_list(row.get("requirement_ids"))
+        if not ids or any(req not in ev["req_ids"] for req in ids):
+            errors.append(f"{label}.requirement_ids 必须引用真实需求")
+        if len(str(row.get("note") or "").strip()) < 12:
+            errors.append(f"{label}.note 至少 12 字，说明实际看了哪些入口、分支、数据落点和测试")
+        if (policy_version >= CURRENT_FEEDBACK_POLICY and row.get('result') == 'reviewed'
+                and not str(row.get('consumer_check') or '').strip()):
+            errors.append(f'{label}.consumer_check 缺失：沿改动追到真实调用方或最终输出，说明触发输入和核对结果')
+        finding_ids = _text_list(row.get("finding_ids"))
+        reviewed_finding_ids.update(finding_ids)
+        if row.get("result") == "not_applicable" and finding_ids:
+            errors.append(f"{label} 标为 not_applicable 时不能关联缺陷")
+    missing_files = sorted(set(ev["review_files"]) - set(reviewed))
+    if missing_files:
+        errors.append("code_review 未覆盖相关改动文件：" + "、".join(missing_files))
+
+    checks = review.get("requirement_checks")
+    if not isinstance(checks, list):
+        errors.append("code_review.requirement_checks 必须是列表")
+        checks = []
+    by_requirement: dict[str, dict] = {}
+    for index, row in enumerate(checks, 1):
+        label = f"code_review.requirement_checks[{index}]"
+        if not isinstance(row, dict):
+            errors.append(label + " 必须是对象")
+            continue
+        requirement_id = str(row.get("requirement_id") or "")
+        if requirement_id not in ev["req_ids"]:
+            errors.append(f"{label}.requirement_id 不是真实需求：{requirement_id or '空'}")
+            continue
+        if requirement_id in by_requirement:
+            errors.append(f"{label}.requirement_id 重复：{requirement_id}")
+        by_requirement[requirement_id] = row
+        if row.get("status") not in CODE_REVIEW_STATUSES:
+            errors.append(f"{label}.status 必须是 pass、defect 或 blocked")
+        chain = _text_list(row.get("call_chain"))
+        if len(chain) < 2 or any(len(item) < 3 for item in chain):
+            errors.append(f"{label}.call_chain 至少写入口和处理/数据落点两个真实节点")
+        code_checks = row.get("checks")
+        if not isinstance(code_checks, list) or len(code_checks) < 2:
+            errors.append(f"{label}.checks 至少登记两个代码检查项")
+            code_checks = []
+        for check_index, item in enumerate(code_checks, 1):
+            check_label = f"{label}.checks[{check_index}]"
+            if not isinstance(item, dict):
+                errors.append(check_label + " 必须是对象")
+                continue
+            if len(str(item.get("id") or "").strip()) < 3:
+                errors.append(check_label + ".id 缺失")
+            if item.get("status") not in CODE_REVIEW_CHECK_STATUSES:
+                errors.append(check_label + ".status 必须是 pass、violation 或 not_applicable")
+            if len(str(item.get("evidence") or "").strip()) < 12:
+                errors.append(check_label + ".evidence 至少 12 字，写清代码事实和结果")
+        check_statuses = {
+            item.get("status") for item in code_checks if isinstance(item, dict)
+        }
+        if check_statuses and not check_statuses & {"pass", "violation"}:
+            errors.append(f"{label}.checks 不能全部标为 not_applicable")
+        if row.get("status") != "defect" and "violation" in check_statuses:
+            errors.append(f"{label} 有 violation，但需求状态没有标为 defect")
+        finding_ids = _text_list(row.get("finding_ids"))
+        if row.get("status") == "defect" and not finding_ids:
+            errors.append(f"{label} 判了 defect，但 finding_ids 为空")
+        if row.get("status") in ("pass", "blocked") and finding_ids:
+            errors.append(f"{label} 不是 defect，不能关联 finding_ids")
+    missing_requirements = sorted(ev["req_ids"] - set(by_requirement))
+    if missing_requirements:
+        errors.append("code_review 未覆盖需求：" + "、".join(missing_requirements))
+
+    findings = review.get("findings")
+    if not isinstance(findings, list):
+        errors.append("code_review.findings 必须是列表")
+        findings = []
+    by_finding: dict[str, dict] = {}
+    for index, row in enumerate(findings, 1):
+        label = f"code_review.findings[{index}]"
+        if not isinstance(row, dict):
+            errors.append(label + " 必须是对象")
+            continue
+        finding_id = str(row.get("id") or "")
+        if not finding_id:
+            errors.append(label + ".id 缺失")
+            continue
+        if finding_id in by_finding:
+            errors.append(f"{label}.id 重复：{finding_id}")
+        by_finding[finding_id] = row
+        ids = _text_list(row.get("requirement_ids"))
+        if not ids or any(req not in ev["req_ids"] for req in ids):
+            errors.append(f"{label}.requirement_ids 必须引用真实需求")
+        if row.get("kind") not in CODE_REVIEW_KINDS:
+            errors.append(f"{label}.kind 不在允许的代码缺陷类型中")
+        if row.get("evidence_level") not in CODE_REVIEW_EVIDENCE_LEVELS:
+            errors.append(f"{label}.evidence_level 必须是 reproduced 或 code_reachable")
+        if policy_version >= CURRENT_FEEDBACK_POLICY and squash(str(row.get('expected') or '')) == squash(str(row.get('actual') or '')):
+            errors.append(f'{label} 的实际行为和预期一致，请撤回疑点或补上不同的实际结果')
+        for key, minimum in (("trigger", 8), ("expected", 8), ("actual", 8), ("impact", 8)):
+            if len(str(row.get(key) or "").strip()) < minimum:
+                errors.append(f"{label}.{key} 必须写清楚")
+        anchors = row.get("anchors")
+        if not isinstance(anchors, list) or not anchors:
+            errors.append(f"{label} 缺少证据 anchors")
+            anchors = []
+        else:
+            errors += _anchor_problems(anchors, ev, label)
+        kinds = {item.get("type") for item in anchors if isinstance(item, dict)}
+        level = row.get("evidence_level")
+        if level == "reproduced" and not kinds & {"probe", "test", "log", "demo"}:
+            errors.append(f"{label} 的 reproduced 缺陷必须绑定 probe、失败测试、日志或演示")
+        if level == "code_reachable" and "file" not in kinds:
+            errors.append(f"{label} 的 code_reachable 缺陷必须绑定真实代码文件")
+        if level == "code_reachable":
+            for requirement_id in ids:
+                requirement_check = by_requirement.get(requirement_id) or {}
+                if len(_text_list(requirement_check.get("call_chain"))) < 2:
+                    errors.append(
+                        f"{label} 声称代码可达，但 {requirement_id} 的 call_chain 少于两个节点"
+                    )
+        for requirement_id in ids:
+            requirement_check = by_requirement.get(requirement_id) or {}
+            if finding_id not in _text_list(requirement_check.get("finding_ids")):
+                errors.append(f"{label} 未被 {requirement_id} 的 requirement_check 引用")
+        audit_requirements = {
+            str(item.get("id")): item for item in audit.get("requirements", [])
+            if isinstance(item, dict)
+        }
+        for requirement_id in ids:
+            audit_row = audit_requirements.get(requirement_id) or {}
+            reflected = audit_row.get("verdict") == "有问题"
+            if row.get("kind") == "false_success" and audit.get("false_success") != "无":
+                reflected = True
+            if not reflected:
+                errors.append(f"{label} 所属需求 {requirement_id} 未在 audit 中判为有问题")
+    for requirement_id, row in by_requirement.items():
+        for finding_id in _text_list(row.get("finding_ids")):
+            if finding_id not in by_finding:
+                errors.append(f"{requirement_id} 引用了不存在的 finding：{finding_id}")
+    unknown_file_findings = reviewed_finding_ids - set(by_finding)
+    if unknown_file_findings:
+        errors.append("changed_files_reviewed 引用了不存在的 finding：" + "、".join(sorted(unknown_file_findings)))
+    detached_findings = set(by_finding) - reviewed_finding_ids
+    if detached_findings:
+        errors.append("finding 必须关联至少一个 reviewed 改动文件：" + "、".join(sorted(detached_findings)))
+    audit_requirements = {
+        str(item.get("id")): item for item in audit.get("requirements", [])
+        if isinstance(item, dict)
+    }
+    for requirement_id, audit_row in audit_requirements.items():
+        if audit_row.get("verdict") == "有问题":
+            review_row = by_requirement.get(requirement_id) or {}
+            if review_row.get("status") != "defect" or not _text_list(review_row.get("finding_ids")):
+                errors.append(f"audit 中 {requirement_id} 已判有问题，code_review 必须对应 defect finding")
+        elif audit_row.get("verdict") == "看不出来":
+            review_row = by_requirement.get(requirement_id) or {}
+            if review_row.get("status") != "blocked":
+                errors.append(f"audit 中 {requirement_id} 判了看不出来，code_review.status 必须为 blocked")
+    for requirement_id, review_row in by_requirement.items():
+        if review_row.get("status") == "blocked":
+            audit_row = audit_requirements.get(requirement_id) or {}
+            if audit_row.get("verdict") != "看不出来":
+                errors.append(f"code_review 中 {requirement_id} 标为 blocked，audit 必须判为看不出来")
+    if ev.get("tests_regression") and not findings:
+        errors.append("产物测试出现本次回归，code_review 必须给出对应代码缺陷或说明具体 finding")
+
+    basis = doc.get("score_basis") if isinstance(doc.get("score_basis"), dict) else {}
+    category = str(basis.get("category") or "")
+    if category in ("complete", "verification_gap") and findings:
+        errors.append(f"{category} 不能带有 code_review.findings；已发现缺陷必须按 delivery_issue 处理")
+    if category == "delivery_issue" and not findings:
+        errors.append("delivery_issue 必须给出至少一个 code_review.findings 缺陷")
+    if category == "complete":
+        blocked = [rid for rid, row in by_requirement.items() if row.get("status") == "blocked"]
+        if blocked:
+            errors.append("complete 不能保留 blocked 的代码审查结论：" + "、".join(sorted(blocked)))
+
+    issues = doc.get("issues") if isinstance(doc.get("issues"), list) else []
+    issue_findings = {
+        str(item.get("finding_id")) for item in issues
+        if isinstance(item, dict) and item.get("finding_id")
+    }
+    unknown_issue_findings = issue_findings - set(by_finding)
+    if unknown_issue_findings:
+        errors.append("issues 引用了不存在的 finding：" + "、".join(sorted(unknown_issue_findings)))
+    if category == "delivery_issue":
+        unmapped = set(by_finding) - issue_findings
+        if unmapped:
+            errors.append("delivery_issue 的 finding 必须对应的 issues 问题句：" + "、".join(sorted(unmapped)))
+
+    if policy_version >= CURRENT_FEEDBACK_POLICY and doc.get('score') == 4:
+        remaining = squash(str(basis.get('remaining') or ''))
+        if category == 'delivery_issue':
+            supported = [squash(str(item.get('sentence') or '')) for item in issues
+                         if isinstance(item, dict) and item.get('finding_id') in by_finding]
+        else:
+            gap = review.get('verification_gap')
+            supported = [squash(str(gap.get('unresolved_observable') or ''))] if isinstance(gap, dict) else []
+        if not any(sentence and remaining and (sentence in remaining or remaining in sentence) for sentence in supported):
+            errors.append('score_basis.remaining 须引用有 finding 的产物问题句或经 probe 核实的验证边界')
+    if category == "verification_gap":
+        defects = [rid for rid, row in by_requirement.items() if row.get("status") == "defect"]
+        if defects:
+            errors.append("已有代码缺陷时不能用 verification_gap：" + "、".join(sorted(defects)))
+        gap = review.get("verification_gap")
+        if not isinstance(gap, dict):
+            errors.append("verification_gap 必须提供 code_review.verification_gap 证据")
+        else:
+            unresolved = str(gap.get("unresolved_observable") or "").strip()
+            if len(unresolved) < 6:
+                errors.append("code_review.verification_gap.unresolved_observable 必须写出未观察到的用户结果")
+            elif squash(unresolved) not in squash(str(doc.get("feedback") or "")):
+                errors.append("code_review.verification_gap.unresolved_observable 必须逐字出现在正文")
+            attempted = _text_list(gap.get("attempted_probes"))
+            if not attempted:
+                errors.append("verification_gap 必须列出已尝试的 probe，不能只因模型没有验证就判 4 分")
+            for probe_id in attempted:
+                probe = ev["probes"].get(probe_id)
+                if not probe:
+                    errors.append(f"verification_gap 引用了不存在的 probe：{probe_id}")
+                elif probe.get("setup_rc") != 0 or not isinstance(probe.get("rc"), int) \
+                        or isinstance(probe.get("rc"), bool) or probe["rc"] in (124, 126, 127, 137):
+                    errors.append(f"probe {probe_id} 未有效执行，不能证明验证缺口")
+            if gap.get("blocked_reason") not in CODE_REVIEW_BLOCKED_REASONS:
+                errors.append(
+                    "code_review.verification_gap.blocked_reason 必须是客观阻塞原因，"
+                    "不能用模型未测试或未核对"
+                )
+    return list(dict.fromkeys(errors))
 
 
 # ---------- audit.json ----------
@@ -441,6 +800,31 @@ def check_feedback(doc: dict, task: dict, facts: dict, audit: dict, ev: dict, ga
     flat = squash(text)
     issues = doc.get("issues") if isinstance(doc.get("issues"), list) else []
     process = doc.get("process") if isinstance(doc.get("process"), list) else []
+    if task.get("feedback_policy_version") == CURRENT_FEEDBACK_POLICY and doc.get("feedback_policy_version") != CURRENT_FEEDBACK_POLICY:
+        errors.append("新交接题需按当前版本重建 Feedback 和代码审查材料")
+    errors += code_review_errors(doc, task, audit, ev)
+    if doc.get('feedback_policy_version') == CURRENT_FEEDBACK_POLICY:
+        paragraphs = [part.strip() for part in re.split(r'\n[ \t]*\n', text.strip().replace('\r\n', '\n')) if part.strip()]
+        if len(paragraphs) != 2 or not paragraphs[1].startswith('模型'):
+            errors.append('按两段重写：第一段先说实际交付，再说已证实的问题；第二段以模型开头，先说操作，有过程问题再说明。')
+        else:
+            product_sentences = [unit for unit in re.split(r'[。！？]+', paragraphs[0]) if unit.strip()]
+            basis = doc.get('score_basis') or {}
+            if not issues and isinstance(basis, dict) and basis.get('category') == 'complete' and len(product_sentences) > 1:
+                errors.append('产物段用一句概括已完成的功能；各项详细验证保存在内部结果映射')
+            if issues and product_sentences and all(
+                isinstance(item, dict) and squash(str(item.get('sentence') or '')).rstrip('。') in squash(product_sentences[0])
+                for item in issues
+            ) and len(product_sentences) > 1:
+                errors.append('产物段首句先概括实际交付，再说明已证实的瑕疵')
+            for item in issues:
+                if isinstance(item, dict) and squash(str(item.get('sentence') or '')) not in squash(paragraphs[0]):
+                    errors.append('将最终产物问题写入第一段并重新绑定 issues')
+            for item in process:
+                if isinstance(item, dict) and squash(str(item.get('sentence') or '')) not in squash(paragraphs[1]):
+                    errors.append('模型实际动作及其后续状态必须落在第二段')
+            if len(re.findall(r'[。！？]+', paragraphs[1].rstrip('。！？'))) > 1:
+                errors.append('过程段先用一句说明模型操作，确有问题再补一句说明后果')
 
     for index, item in enumerate(issues, 1):
         where = f"第 {index} 个问题句"
@@ -450,7 +834,7 @@ def check_feedback(doc: dict, task: dict, facts: dict, audit: dict, ev: dict, ga
         sentence = squash(str(item.get("sentence") or ""))
         if len(sentence) < 6 or sentence not in flat:
             errors.append(f"{where}：sentence 要是正文里的原句")
-        for key, label in (("trigger", "触发节点"), ("behavior", "模型实际行为"), ("impact", "业务影响")):
+        for key, label in (("trigger", "触发条件"), ("behavior", "最终实现行为"), ("impact", "业务影响")):
             if len(str(item.get(key) or "").strip()) < 4:
                 errors.append(f"{where}：缺{label}（{key}）")
         anchors = item.get("anchors") or []
@@ -489,7 +873,7 @@ def check_feedback(doc: dict, task: dict, facts: dict, audit: dict, ev: dict, ga
         if score < 5 and not issues and not process_or_verification_gap:
             errors.append(f"{score} 分至少要有一处问题句")
         errors += platform_consistency_errors(
-            score, text, doc.get("score_basis") if isinstance(doc.get("score_basis"), dict) else None,
+            score, text, public_score_basis(doc),
         )
         if score >= 4 and len(re.findall(r"[A-Za-z_][\w./-]{2,}|\d+", text, flags=re.A)) < 2:
             errors.append("4 到 5 分也要写出核对过的要求和实际验证结果，正文里看不到具体的命令、文件或数值")
@@ -499,7 +883,7 @@ def check_feedback(doc: dict, task: dict, facts: dict, audit: dict, ev: dict, ga
     process_problem = any(PROCESS_PROBLEM_RE.search(sentence) or PROCESS_GAP_ONLY_RE.search(sentence)
                           for sentence in process_sentences)
     process_repair = any(PROCESS_REPAIR_RE.search(sentence) for sentence in process_sentences)
-    if score == 5 and process_problem and process_repair:
+    if score == 5 and process_problem and process_repair and doc.get('feedback_policy_version') != CURRENT_FEEDBACK_POLICY:
         errors.append("5 分要求过程接近一次性完美跑通；正文已写真实错误验证、返工或关键缺口，应降到 4 分并说明过程问题")
     covered = {str(a.get("id")) for item in issues if isinstance(item, dict)
                for a in (item.get("anchors") or []) if isinstance(a, dict) and a.get("type") == "req"}
@@ -509,7 +893,7 @@ def check_feedback(doc: dict, task: dict, facts: dict, audit: dict, ev: dict, ga
             errors.append(f"需求点 {req.get('id')} 判了{req.get('level')}，正文里要有对应的问题句（anchors 里带 req）")
 
     for found in PATH_RE.finditer(text):
-        token = found.group(1).lstrip("./")
+        token = found.group(1).removeprefix("./")
         if found.group(2).lower() not in PATH_EXT or not re.search(r"[A-Za-z]", token.rsplit(".", 1)[0]):
             continue
         # 运行时才生成的文件（任务原文点了名的输出、日志里打出来的路径）也算有出处

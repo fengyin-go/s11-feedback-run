@@ -151,6 +151,86 @@ def feedback(score: int = 4) -> dict:
     return doc
 
 
+def code_review(score: int = 4) -> dict:
+    files = ["src/clipcut/packer.py", "src/clipcut/segment.py", "tests/test_segment.py"]
+    finding = score < 5
+    checks = []
+    for requirement_id in ("R1", "R2", "R3"):
+        checks.append({
+            "requirement_id": requirement_id,
+            "status": "defect" if finding and requirement_id == "R3" else "pass",
+            "call_chain": ["CLI pack", "packer.pack", "segment.write_manifest"],
+            "checks": [{
+                "id": "data_flow" if requirement_id != "R3" else "input_contract",
+                "status": "violation" if finding and requirement_id == "R3" else "pass",
+                "evidence": (
+                    "非数字参数进入 int() 后直接抛异常"
+                    if finding and requirement_id == "R3"
+                    else "参数、分片写入和清单返回路径一致"
+                ),
+            }, {
+                "id": "test_quality",
+                "status": "violation" if finding and requirement_id == "R3" else "pass",
+                "evidence": (
+                    "现有用例只覆盖整数参数，没有验证非数字输入的错误提示"
+                    if finding and requirement_id == "R3"
+                    else "相关用例断言了分片输出和清单内容"
+                ),
+            }],
+            "finding_ids": ["F1"] if finding and requirement_id == "R3" else [],
+        })
+    return {
+        "version": 1,
+        "baseline_compared": True,
+        "changed_files_reviewed": [{
+            "path": path,
+            "requirement_ids": ["R1", "R2", "R3"],
+            "result": "reviewed",
+            "note": "沿 CLI、packer 和清单写入路径核对了最终代码",
+            "finding_ids": ["F1"] if finding and path.endswith("packer.py") else [],
+        } for path in files],
+        "requirement_checks": checks,
+        "findings": [{
+            "id": "F1",
+            "requirement_ids": ["R3"],
+            "kind": "validation_gap",
+            "evidence_level": "reproduced",
+            "trigger": "传入非数字的 --segment 参数",
+            "expected": "拒绝参数并输出可读错误",
+            "actual": "直接抛出 ValueError 调用栈",
+            "impact": "使用的人看不到可读的参数说明",
+            "anchors": [
+                {"type": "probe", "id": "P3"},
+                {"type": "file", "path": "src/clipcut/packer.py"},
+                {"type": "log", "text": "ValueError: invalid literal"},
+            ],
+        }] if finding else [],
+        "verification_gap": {
+            "unresolved_observable": "",
+            "attempted_probes": [],
+            "blocked_reason": "",
+        },
+    }
+
+
+def v2_feedback(score: int = 4) -> dict:
+    doc = feedback(score)
+    doc["feedback_policy_version"] = 2
+    doc["code_review"] = code_review(score)
+    if score < 5:
+        doc["issues"][0]["finding_id"] = "F1"
+        doc["score_basis"] = {
+            "category": "delivery_issue",
+            "remaining": S4,
+        }
+    else:
+        doc["score_basis"] = {
+            "category": "complete",
+            "remaining": "当前实跑范围内未发现交付缺口",
+        }
+    return doc
+
+
 def evidence(f=None, a=None, p=None, t=None) -> dict:
     return gate.build_evidence(t or task(), f or facts(), a if a is not None else audit(), probes() if p is None else p)
 
@@ -568,7 +648,7 @@ class Feedback(Case):
         doc = feedback(4)
         doc["issues"][0].update(trigger="", behavior="抛栈", impact=None)
         errors = self.check(doc)[0]
-        for fragment in ("缺触发节点（trigger）", "缺模型实际行为（behavior）", "缺业务影响（impact）"):
+        for fragment in ("缺触发条件（trigger）", "缺最终实现行为（behavior）", "缺业务影响（impact）"):
             self.has(errors, "第 1 个问题句：" + fragment)
         doc = feedback(4)
         doc["issues"][0]["anchors"] = [{"type": "req", "id": "R3"}, {"type": "value", "text": "370"}]
@@ -690,6 +770,94 @@ class Feedback(Case):
         errors = self.check({"score": 4, "feedback": TEXT4})[0]
         self.has(errors, "过程和产物都要写")
         self.has(errors, "4 分至少要有一处问题句")
+
+
+class CodeReview(Case):
+    def check(self, doc, a=None, f=None, p=None):
+        f, a = f or facts(), a or audit(doc["score"])
+        return gate.check_feedback(doc, task(), f, a, evidence(f, a, p), GATE)
+
+    def test_v2_delivery_issue_with_code_review_passes(self):
+        self.assertEqual(self.check(v2_feedback(4)), ([], []))
+
+    def test_v2_requires_code_review_and_requirement_coverage(self):
+        doc = v2_feedback(4)
+        doc.pop("code_review")
+        self.has(self.check(doc)[0], "必须填写 code_review")
+        doc = v2_feedback(4)
+        doc["code_review"]["changed_files_reviewed"] = [
+            row for row in doc["code_review"]["changed_files_reviewed"]
+            if row["path"] != "src/clipcut/segment.py"
+        ]
+        self.has(self.check(doc)[0], "未覆盖相关改动文件：src/clipcut/segment.py")
+        doc = v2_feedback(4)
+        doc["code_review"]["requirement_checks"].pop()
+        self.has(self.check(doc)[0], "未覆盖需求：R3")
+        doc = v2_feedback(4)
+        for item in doc["code_review"]["requirement_checks"][0]["checks"]:
+            item["status"] = "not_applicable"
+        self.has(self.check(doc)[0], "不能全部标为 not_applicable")
+
+    def test_v2_defect_requires_call_chain_and_issue_link(self):
+        doc = v2_feedback(4)
+        doc["code_review"]["requirement_checks"][2]["call_chain"] = ["pack"]
+        doc["code_review"]["findings"][0]["evidence_level"] = "code_reachable"
+        errors = self.check(doc)[0]
+        self.has(errors, "call_chain 少于两个节点")
+        doc = v2_feedback(4)
+        doc["issues"][0].pop("finding_id")
+        self.has(self.check(doc)[0], "finding 必须对应的 issues 问题句：F1")
+
+    def test_v2_finding_must_be_reflected_in_audit(self):
+        doc = v2_feedback(4)
+        self.has(self.check(doc, a=audit(5))[0], "未在 audit 中判为有问题")
+        doc = v2_feedback(5)
+        self.has(self.check(doc, a=audit(4))[0], "audit 中 R3 已判有问题，code_review 必须对应 defect finding")
+
+    def test_v2_verification_gap_requires_attempted_probe_and_code_coverage(self):
+        doc = v2_feedback(5)
+        gap = "最终仍无法观察并发提交后的唯一确认版本"
+        doc.update(score=4)
+        doc["feedback"] = TEXT5 + gap + "。"
+        doc["score_basis"] = {
+            "category": "verification_gap",
+            "remaining": gap,
+        }
+        doc["code_review"]["verification_gap"] = {
+            "unresolved_observable": gap,
+            "attempted_probes": [],
+            "blocked_reason": "nondeterministic_unobservable",
+        }
+        self.has(self.check(doc, a=audit(5), p=probes(2))[0], "必须列出已尝试的 probe")
+        doc["code_review"]["verification_gap"]["attempted_probes"] = ["P1"]
+        self.assertEqual(self.check(doc, a=audit(5), p=probes(2)), ([], []))
+
+    def test_v2_existing_defect_cannot_be_written_as_verification_gap(self):
+        doc = v2_feedback(4)
+        doc["score_basis"] = {
+            "category": "verification_gap",
+            "remaining": "最终仍缺少非数字参数的可见错误提示",
+        }
+        doc["issues"] = []
+        doc["code_review"]["verification_gap"] = {
+            "unresolved_observable": "最终仍缺少非数字参数的可见错误提示",
+            "attempted_probes": ["P3"],
+            "blocked_reason": "artifact_cannot_expose_result",
+        }
+        errors = self.check(doc)[0]
+        self.has(errors, "不能带有 code_review.findings")
+        self.has(errors, "已有代码缺陷时不能用 verification_gap：R3")
+
+    def test_model_not_verifying_is_not_a_verification_gap_reason(self):
+        errors = gate.platform_consistency_errors(
+            4,
+            "最终仍没有核对并发后的唯一确认版本。",
+            {
+                "category": "verification_gap",
+                "remaining": "最终仍没有核对并发后的唯一确认版本",
+            },
+        )
+        self.has(errors, "不能只写模型没有验证或没有核对")
 
 
 class Duplicates(Case):

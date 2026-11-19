@@ -258,20 +258,18 @@ def _refresh_remote(client, root: Path, task_dir: Path, manifest: dict) -> tuple
         raise lib.FbrError("没有有效平台提交回执")
     submission_id = receipt["submission_id"]
     detail = client.detail(submission_id)
-    source_data = receipt.get("remote_data")
-    if not isinstance(source_data, dict):
-        source_data = fbr_submit.remote_data(detail)
-    row = {label: source_data.get(key, "") for key, label in fbr_submit.FIELD_MAP.items()}
-    row["备注"] = source_data.get("other_issues", "")
+    import fbr_sheet
+    row, reason = fbr_sheet.build_row(root, task_dir, lib.settings(root), delivery_manifest=manifest)
+    if not row:
+        raise lib.FbrError(reason or '无法核对当前交付字段')
     plan = fbr_submit.plan_from_row(root, task_dir, row, manifest)
-    if receipt.get("content_digest") != plan["content_digest"]:
-        raise lib.FbrError("平台回执与当前交付摘要不一致")
-    if receipt.get("state") != "confirmed":
-        if set(receipt.get("uploads") or {}) != set(fbr_submit.MEDIA_TYPES):
-            raise lib.FbrError("本地回执尚未确认且附件记录不完整")
-        fbr_submit.confirm_remote(client, plan, receipt, task_dir, submission_id)
-        receipt = lib.load_json(task_dir / "review/upload.json", default={})
-        detail = client.detail(submission_id)
+    if receipt.get('content_digest') != plan['content_digest']:
+        raise lib.FbrError('平台回执与当前交付摘要不一致')
+    if set(receipt.get('uploads') or {}) != set(fbr_submit.MEDIA_TYPES):
+        raise lib.FbrError('平台附件回执不完整')
+    fbr_submit.confirm_remote(client, plan, receipt, task_dir, submission_id, detail=detail)
+    receipt = lib.load_json(task_dir / 'review/upload.json')
+    detail = {**detail, 'status': receipt['remote_status']}
     status = detail.get("status")
     receipt.update({
         "remote_status": status,
@@ -294,13 +292,12 @@ def _task_active(task_dir: Path) -> str:
     return ""
 
 
-def _code_cleanup_blocker(task_dir: Path) -> str:
+def _code_cleanup_blocker(task_dir: Path, *, cached_status=True) -> str:
     """Code checkouts may disappear only after the platform has accepted delivery."""
     receipt = lib.load_json(task_dir / "review/upload.json", default={})
-    if receipt.get("state") != "confirmed" or not fbr_submit.valid_id(
-            receipt.get("submission_id")):
+    if (cached_status and receipt.get("state") != "confirmed") or not fbr_submit.valid_id(receipt.get("submission_id")):
         return "尚未完成平台提交，代码现场仍需保留给批检、预检和等待提交阶段"
-    if receipt.get("remote_status") != "QC_PASSED":
+    if cached_status and receipt.get("remote_status") != "QC_PASSED":
         return f"平台状态不是 QC_PASSED：{receipt.get('remote_status') or '未回读'}"
     return ""
 
@@ -322,50 +319,88 @@ def _cleanup_candidates(root: Path, task_dir: Path) -> list[Path]:
     return [path for path in candidates if path.exists() or path.is_symlink()]
 
 
-def _safe_remove(root: Path, task_dir: Path, candidates: list[Path], receipt: dict,
-                 *, state: str = "cleaned", reason: str = "") -> list[dict]:
-    task_dir = task_dir.resolve()
-    scratch_root = (root.resolve() / "_verification/runtime-scratch").resolve()
-    trash = (root.resolve() / "_verification/cleanup-trash" / task_dir.parent.name
-             / f"{task_dir.name}-{uuid.uuid4().hex[:8]}")
-    trash.mkdir(parents=True, exist_ok=True)
+def _recover_cleanup(root, task_dir):
+    journal = task_dir / 'cleanup-pending.json'
+    if journal.is_symlink():
+        raise lib.FbrError('清理事务记录不能是符号链接')
+    if not journal.is_file():
+        return
+    plan = lib.load_json(journal)
+    token = str(plan['transaction'])
+    if len(token) != 32 or any(c not in '0123456789abcdef' for c in token):
+        raise lib.FbrError('清理事务编号无效')
+    trash = root / '_verification/cleanup-trash' / task_dir.parent.name / (task_dir.name + '-' + token)
+    if trash.resolve() != trash:
+        raise lib.FbrError('清理事务暂存目录越界')
+    cleanup = lib.load_json(task_dir / 'cleanup.json', default={})
+    if cleanup.get('transaction') == token:
+        target = delivery.delivery_dir(root, task_dir.parent.name)
+        delivery.atomic_save_json(target / task_dir.name / 'cleanup.json', cleanup)
+        with lib.file_lock(root / '_verification' / 'cleanup-locks' / (task_dir.parent.name + '.lock')):
+            ledger = target / 'cleanup-manifest.json'
+            summary = lib.load_json(ledger, default={})
+            rows = {row['task_id']: row for row in summary.get('cleaned', [])}
+            rows[task_dir.name] = {'task_id': task_dir.name, 'removed': cleanup['removed'],
+                                   'bytes_removed': cleanup['bytes_removed']}
+            delivery.atomic_save_json(ledger, {'batch': task_dir.parent.name, 'at': lib.now_iso(),
+                'cleaned': list(rows.values()), 'bytes_removed': sum(r['bytes_removed'] for r in rows.values())})
+    else:
+        for item in reversed(plan['removed']):
+            relative = Path(item['path'])
+            if relative.is_absolute() or '..' in relative.parts or not relative.parts:
+                raise lib.FbrError('清理恢复路径无效')
+            moved = trash / relative
+            if not moved.parent.resolve().is_relative_to(trash):
+                raise lib.FbrError('清理恢复来源越界')
+            if not os.path.lexists(moved):
+                continue
+            if relative.parts[0] == 'external-scratch':
+                if len(relative.parts) != 2 or task_dir.name not in relative.name:
+                    raise lib.FbrError('暂存恢复路径无效')
+                original = root / '_verification/runtime-scratch' / relative.name
+            else:
+                original = task_dir / relative
+                if not original.parent.resolve().is_relative_to(task_dir):
+                    raise lib.FbrError('清理恢复目标离开当前任务')
+            if os.path.lexists(original):
+                raise lib.FbrError(f'清理恢复位置已被占用：{relative}')
+            original.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(moved, original)
+    if trash.exists():
+        shutil.rmtree(trash)
+    journal.unlink()
+
+
+def _safe_remove(root: Path, task_dir: Path, candidates: list[Path], receipt: dict) -> list[dict]:
+    root, task_dir = root.resolve(), task_dir.resolve()
+    scratch = root / '_verification/runtime-scratch'
+    token = uuid.uuid4().hex
+    trash = root / '_verification/cleanup-trash' / task_dir.parent.name / (task_dir.name + '-' + token)
     removed = []
+    paths = []
     for path in candidates:
-        path = Path(path)
-        if path.is_symlink():
-            path.unlink()
-            removed.append({"path": str(path.relative_to(task_dir)), "bytes": 0})
-            continue
-        resolved = path.resolve()
-        if resolved.is_relative_to(task_dir):
+        if path.parent.resolve().is_relative_to(task_dir):
             relative = path.relative_to(task_dir)
-        elif resolved.is_relative_to(scratch_root):
-            relative = Path("external-scratch") / resolved.relative_to(scratch_root)
+        elif path.parent.resolve() == scratch and task_dir.name in path.name:
+            relative = Path('external-scratch') / path.name
         else:
-            raise lib.FbrError(f"清理目标越出白名单目录：{path}")
-        size = _path_size(path)
-        destination = trash / relative
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        os.replace(path, destination)
-        removed.append({"path": relative.as_posix(), "bytes": size,
-                        "trashed_at": lib.now_iso()})
-    cleanup = {
-        "state": state,
-        "at": lib.now_iso(),
-        "submission_id": receipt.get("submission_id"),
-        "remote_status": receipt.get("remote_status") or "local_sealed",
-        "reason": reason,
-        "removed": removed,
-        "bytes_removed": sum(item["bytes"] for item in removed),
-        "retained": ["task.json", "task-seed.json", "state.json", "recording-plan.json",
-                     "run/attempts.json", "run/key-identity.json", "trace/", "record/recording.mp4",
-                     "record/recording.json", "evidence/", "review/"],
-    }
-    lib.save_json(task_dir / "cleanup.json", cleanup)
-    delivery.atomic_save_json(
-        delivery.delivery_dir(root, task_dir.parent.name) / task_dir.name / "cleanup.json",
-        cleanup)
-    shutil.rmtree(trash, ignore_errors=True)
+            raise lib.FbrError('清理目标越出白名单目录')
+        paths.append((path, trash / relative))
+        removed.append({'path': relative.as_posix(), 'bytes': _path_size(path)})
+    cleanup = {'transaction': token, 'state': 'cleaned', 'at': lib.now_iso(), 'removed': removed,
+               'remote_status': receipt['remote_status'], 'submission_id': receipt['submission_id'],
+               'bytes_removed': sum(row['bytes'] for row in removed),
+               'retained': ['task.json', 'task-seed.json', 'state.json', 'recording-plan.json',
+                            'run/attempts.json', 'run/key-identity.json', 'trace/', 'record/recording.mp4',
+                            'record/recording.json', 'evidence/', 'review/']}
+    lib.save_json(task_dir / 'cleanup-pending.json', cleanup)
+    try:
+        for original, moved in paths:
+            moved.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(original, moved)
+        lib.save_json(task_dir / 'cleanup.json', cleanup)
+    finally:
+        _recover_cleanup(root, task_dir)
     return removed
 
 
@@ -391,71 +426,23 @@ def _local_seal_problems(root: Path, batch_id: str, task_dir: Path,
     return problems
 
 
-@lib.task_locked
 def compact_local_task(root: Path, batch_id: str, task_dir: Path, cfg: dict,
-                       *, force: bool = False) -> dict:
-    """Compact rebuildable task data only after platform QC has passed."""
-    root = Path(root).resolve()
-    task_dir = Path(task_dir).resolve()
-    if not retention.enabled(cfg, "local", force=force):
-        return {"task_id": task_dir.name, "state": "disabled", "bytes_removed": 0}
-    cleanup = lib.load_json(task_dir / "cleanup.json", default={})
-    if cleanup.get("state") == "cleaned":
-        return {"task_id": task_dir.name, "state": "skip", "bytes_removed": 0, "reason": "已经清理"}
-    platform_blocker = _code_cleanup_blocker(task_dir)
-    if platform_blocker:
-        return {
-            "task_id": task_dir.name,
-            "state": "blocked",
-            "bytes_removed": 0,
-            "reason": platform_blocker,
-        }
-    manifest = lib.load_json(
-        delivery.delivery_dir(root, batch_id) / "delivery-manifest.json", default={})
-    if not manifest.get("batch_id"):
-        return {
-            "task_id": task_dir.name,
-            "state": "blocked",
-            "bytes_removed": 0,
-            "reason": "缺少交付清单，拒绝为清理重新导出",
-        }
-    try:
-        _task_entry(manifest, task_dir.name)
-    except lib.FbrError as exc:
-        return {
-            "task_id": task_dir.name,
-            "state": "blocked",
-            "bytes_removed": 0,
-            "reason": f"{exc}，拒绝为清理重新导出",
-        }
-    problems = _local_seal_problems(root, batch_id, task_dir, manifest, cfg)
-    if problems:
-        return {
-            "task_id": task_dir.name,
-            "state": "blocked",
-            "bytes_removed": 0,
-            "reason": "；".join(dict.fromkeys(problems)),
-        }
-    candidates = _cleanup_candidates(root, task_dir)
-    if not candidates:
-        return {"task_id": task_dir.name, "state": "skip", "bytes_removed": 0, "reason": "没有可回收现场"}
-    record = lib.load_task_readonly(task_dir)
-    snapshot = lib.load_json(task_dir / "review/snapshot.json", default={})
-    receipt = lib.load_json(task_dir / "review/upload.json", default={})
-    _write_retention(root, task_dir, manifest, record, receipt, state="qc_cleaned")
-    _verify_retention(root, task_dir.name, batch_id)
-    removed = _safe_remove(
-        root, task_dir, candidates,
-        receipt,
-        state="cleaned",
-        reason="平台 QC_PASSED 且产物快照已推送",
-    )
-    return {
-        "task_id": task_dir.name,
-        "state": "ok",
-        "bytes_removed": sum(item["bytes"] for item in removed),
-        "removed": removed,
-    }
+                       *, force: bool = False, client=None) -> dict:
+    """Maintenance and explicit pruning share one live verification and deletion path."""
+    row = {'task_id': task_dir.name, 'bytes_removed': 0}
+    if not retention.enabled(cfg, 'local', force=force):
+        return {**row, 'state': 'disabled'}
+    if not (task_dir / 'cleanup-pending.json').exists():
+        if lib.load_json(task_dir / 'cleanup.json', default={}).get('state') == 'cleaned':
+            return {**row, 'state': 'skip', 'reason': '已经清理'}
+        blocker = _code_cleanup_blocker(task_dir, cached_status=False)
+        if blocker:
+            return {**row, 'state': 'blocked', 'reason': blocker}
+    result = prune_batch(root, batch_id, task_dir.name, execute=True, confirm='CLEANUP', client=client)
+    if result['cleaned']:
+        return {**result['cleaned'][0], 'state': 'ok'}
+    reason = next((r['reason'] for r in result['skipped']), '清理前复检未通过')
+    return {**row, 'state': 'blocked', 'reason': reason}
 
 
 def _task_terminal(task_dir: Path) -> tuple[bool, str]:
@@ -633,6 +620,10 @@ def prune_batch(root: Path, batch_id: str, tasks: str | None = None, *, execute:
     if execute and client is None:
         from fbr_platform import Client
         client = Client(account=fbr_submit.ACCOUNT)
+    if execute:
+        for task in lib.task_dirs(root, batch_id, tasks):
+            with lib.file_lock(task / '.operation.lock'):
+                _recover_cleanup(root.resolve(), task.resolve())
     audit = audit_batch(root, batch_id, tasks, client=client)
     if not execute:
         return audit
@@ -646,9 +637,19 @@ def prune_batch(root: Path, batch_id: str, tasks: str | None = None, *, execute:
             continue
         task_dir = lib.batch_dir(root, batch_id) / item["task_id"]
         with lib.file_lock(task_dir / ".operation.lock"):
-            receipt = lib.load_json(task_dir / "review/upload.json")
-            detail = client.detail(receipt["submission_id"])
+            manifest = lib.load_json(delivery.delivery_dir(root, batch_id) / 'delivery-manifest.json')
+            problems = _local_seal_problems(root, batch_id, task_dir, manifest, lib.settings(root))
+            if problems:
+                item.update(eligible=False, reason='；'.join(problems))
+                continue
+            try:
+                _, _, detail = _refresh_remote(client, root, task_dir, manifest)
+            except (lib.FbrError, OSError, ValueError) as exc:
+                item.update(eligible=False, reason=str(exc))
+                continue
+            receipt = lib.load_json(task_dir / 'review/upload.json')
             if detail.get("status") != "QC_PASSED":
+                item.update(eligible=False, reason=f"清理前平台状态为 {detail.get('status')}")
                 continue
             task = lib.load_task_readonly(task_dir)
             _write_retention(root, task_dir, manifest, task, receipt, detail)
@@ -664,8 +665,6 @@ def prune_batch(root: Path, batch_id: str, tasks: str | None = None, *, execute:
         "bytes_removed": sum(row["bytes_removed"] for row in cleaned),
         "skipped": [row for row in audit["tasks"] if not row.get("eligible")],
     }
-    delivery.atomic_save_json(
-        delivery.delivery_dir(root, batch_id) / "cleanup-manifest.json", summary)
     return summary
 
 
@@ -686,6 +685,9 @@ def verify_batch(root: Path, batch_id: str, tasks: str | None = None) -> dict:
                 task_dir / "review/feedback.json", task_dir / "review/gate.json",
                 task_dir / "review/snapshot.json",
             )
+            feedback = lib.load_json(task_dir / "review/feedback.json", default={})
+            if feedback.get("feedback_policy_version", 0) >= 2:
+                required += (task_dir / "review/code-review.json",)
             if cleanup.get("state") == "cleaned":
                 required += (task_dir / "review/upload.json",)
             missing = [str(path.relative_to(task_dir)) for path in required

@@ -33,12 +33,13 @@ fbr_reviewer.py finalize --batch b1110-01 --task s11-000123 --candidate /绝对�
 
 当前 AI 用 `fbr_work.py next --inline --wait` 在 flow 运行期间持续领取最老一题。finalize 通过、快照发布和字段核查完成后生成 `review/attestation.json`；该凭证是后续提交期验证的唯一定点，不允许在提交时重新调用 AI 替代执行期评价。
 
-当前任务 AI 通过 `fbr_work.py next --inline` 一次取得 `review/review-capsule.json`，再按需求查询相关 diff hunk、最终代码及调用链，复用已有录屏和实跑证据。Capsule 与 `task-agent-brief.md` 内容同源，后者只用于兼容和人工查看；不要重复读取两者。不要整份读取 `facts.json`、`diff.patch`、原始轨迹或 `task-agent-history.json`。静态证据充分时无需重复启动；缺证据时按既有 probe 入口在任务镜像中补跑，不能直接在宿主机运行被审项目。补证后刷新 card/brief；若轨迹报告仍有效，可用 `prepare --batch … --task … --execute` 仅刷新检查点，不调用外部模型。
+当前任务 AI 通过 `fbr_work.py next --inline` 一次取得 `review/review-capsule.json`，再按 capsule 的 `code_review.review_files` 和 `focus` 定向查询相关 diff hunk、最终代码及调用链，复用已有录屏和实跑证据。评分前必须先完成 `code_review`：逐文件记录 reviewed/not_applicable，逐需求记录调用链和至少两个代码检查项；已有 finding 优先落到 `delivery_issue`。Capsule 与 `task-agent-brief.md` 内容同源，后者只用于兼容和人工查看；不要重复读取两者。不要整份读取 `facts.json`、`diff.patch`、原始轨迹或 `task-agent-history.json`。静态证据充分时无需重复启动；缺证据时按既有 probe 入口在任务镜像中补跑，不能直接在宿主机运行被审项目。补证后刷新 card/brief；若轨迹报告仍有效，可用 `prepare --batch … --task … --execute` 仅刷新检查点，不调用外部模型。
 
 默认作者输入是 compact `review/decision-input.json`，完整结构见 `review/candidate-schema.json`。当前 AI 只写需求语义、正文、claims、score_basis 和 quality_checks；`fbr_reviewer.py build` 展开为正式 candidate/verification。唯一轨迹摘录可自动补 locator，歧义位置必须失败。手工完整 candidate 仍可兼容，verification 须包含：
 
 ```json
 {
+  "feedback_policy_version": 2,
   "requirements": [{"id": "R1", "verdict": "做到", "user_text": "用户可见结果", "anchors": []}],
   "score": 4,
   "feedback": "完整正文",
@@ -55,6 +56,7 @@ fbr_reviewer.py finalize --batch b1110-01 --task s11-000123 --candidate /绝对�
   },
   "process": [{"sentence": "过程句", "evidence": [], "audit": {"checks": {}, "note": ""}}],
   "results": [], "issues": [], "test_claims": [], "score_basis": {},
+  "code_review": {"version": 1, "baseline_compared": true},
   "needs_probes": []
 }
 ```
@@ -74,17 +76,16 @@ fbr_reviewer.py finalize --batch b1110-01 --task s11-000123 --candidate /绝对�
 `lint/finalize` 失败时，`review/*-errors.json` 的 `repair_actions` 会给出应修改的
 `requirements`、`process.evidence`、`claims.sources`、`score_basis` 或正文位置。
 
-正文先对照提示词说明功能完成度，已完成什么、未完成或仍有问题什么；全部做到时直接陈述实际完成的能力，不写“未发现其他明确未完成功能”这类空泛完成度句。之后再用最多 3 句写真实过程，只保留影响结论的一到三个事件。叙述要从证据提炼行为和结果，不把取证过程写进交付评价。不要写“轨迹显示”“录屏中”“素材卡里”“原始会话表明”或“证据显示”；改写成模型实际执行了什么、产物表现如何、哪些范围尚未覆盖。过程段至少一句必须是明确的模型行为句，但全文只在第一次点明主体时写一次“模型”，后续用“它”承接或直接省略主语，不能反复写“模型随后”“模型最后”。原始过程里出现首测失败、错误断言、验证器写错或返工时，先写模型当时的做法、失败结果、修正动作和最终影响；例如“模型先用并发 curl 校验重复提交，却把多段响应拼在一起解析，报出 JSONDecodeError；改成五个独立线程分别读取后，才确认五次提交共用同一批次”。不能只列脚本通过、构建完成和未覆盖边界，也不能用“额外边界没有问题”代替过程分析。
+正文先对照提示词说明功能完成度，已完成什么、未完成或仍有问题什么；全部做到时直接陈述实际完成的能力，不写“未发现其他明确未完成功能”这类空泛完成度句。之后用一句概括模型操作，有波折再补一句写真实过程，只保留影响结论的一到三个事件。叙述要从证据提炼行为和结果，不把取证过程写进交付评价。不要写“轨迹显示”“录屏中”“素材卡里”“原始会话表明”或“证据显示”；改写成模型实际执行了什么、产物表现如何、哪些范围尚未覆盖。过程段至少一句必须是明确的模型行为句，但全文只在第一次点明主体时写一次“模型”，后续用“它”承接或直接省略主语，不能反复写“模型随后”“模型最后”。原始过程里出现首测失败、错误断言、验证器写错或返工时，先写模型当时的做法、失败结果、修正动作和最终影响；例如“模型先用并发 curl 校验重复提交，却把多段响应拼在一起解析，报出 JSONDecodeError；改成五个独立线程分别读取后，才确认五次提交共用同一批次”。不能只列脚本通过、构建完成和未覆盖边界，也不能用“额外边界没有问题”代替过程分析。
 
 正文语言先按 feedback-language-policy.md 写，再运行 build/lint。内部术语必须落到用户动作、条件或结果，例如写清“上次处理到哪条记录”“页面请求实际落到哪个接口”；不写公司黑话、抽象名词清单和“均已实现/完成”式收口。`language_review.criterion_sentence` 必须逐字出现在正文，词表命中由 `review/style-report.json` 给出，不能自动换词后跳过证据复核。
 
 每个 `process` 句先写真实 `steps` 和 `evidence`：工具 evidence 的 step 必须属于该句 steps，field 只能是 tool/target/output/error，excerpt 必须落在该步骤的真实字段中；没有工具的特殊会话使用 assistant evidence。之后还要在同序的 `process_audit` 中完成五项归因检查：`full_trace`、`baseline`、`timeline`、`source_boundary`、`scope`。验收 probe、录屏和当前 AI 的页面点击只能支撑结果或问题，不能接到模型主语链上；验收环境中的 Chromium/系统库、`sudo`、`httpx2`、安装超时和端口问题也不能写成模型过程。若轨迹中没有浏览器动作，过程句也不能写模型“点击”或“页面操作”。基线已有行为、后续修改造成的回归、绝对化范围表述和“收尾”等时序表述分别按 [process-attribution-audit.md](process-attribution-audit.md) 回查。
 
-评分与过程描述必须同向。5 分要求正文也呈现出接近一次性完美跑通；如果正文如实写了错误验证、
-错判、核心实现返工，或关键竞争没有真正复核，即使最后修好，也最高 4 分。但 4 分不能只靠
-`process_issue`：当前平台自动一致性复核要求正文再留下一个最终交付缺口，使用
-`verification_gap` 或 `delivery_issue`，并让 `score_basis.remaining` 与该句对应。确认最终交付
-完整且关键边界都已通过时应重新评估 5 分，不要为了比例编造缺口。不要为了保 5 分删除真实过程经历。
+先沿本次改动追到真实调用方，再从每条需求的入口追到交付结果；初看完整时复查高风险边界。按实际影响定档，已修好的过程波折如实保留。交付完整且五分所需边界验证通过时可给五分。
+
+policy v2 的代码审查是 4 分和 5 分的前置证据。验证缺口只有在相关代码已排除、probe 已执行且
+存在客观 `blocked_reason` 时才成立；模型没有自测、没有核对或没有做验收不能成为平台 4 分依据。
 
 
 

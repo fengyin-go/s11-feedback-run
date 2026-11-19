@@ -75,6 +75,42 @@ class DeliveryProjection(SheetCase):
         self.assertTrue((good / "workspace/.git").is_dir())
         self.assertTrue((good / "review/feedback.json").is_file())
 
+    def test_code_review_evidence_is_exported_when_present(self):
+        task = self.gated()
+        lib.save_json(task / "review/code-review.json", {
+            "version": 1,
+            "baseline_compared": True,
+            "changed_files_reviewed": [],
+            "requirement_checks": [],
+            "findings": [],
+            "verification_gap": {
+                "unresolved_observable": "",
+                "attempted_probes": [],
+                "blocked_reason": "",
+            },
+        })
+        self.complete(task)
+        manifest = self.export()
+        files = {item["path"] for item in self.listed(manifest)[task.name]["files"]}
+        self.assertIn(
+            f"results/{BATCH}/{task.name}/review/code-review.json",
+            files,
+        )
+
+    def test_v2_feedback_requires_matching_frozen_code_review(self):
+        task = self.gated()
+        doc = lib.load_json(task / "review/feedback.json")
+        doc["feedback_policy_version"] = 2
+        doc["code_review"] = {"version": 1, "baseline_compared": True}
+        lib.save_json(task / "review/feedback.json", doc)
+        valid, reason = fbr_delivery.current_feedback(task)
+        self.assertFalse(valid)
+        self.assertIn("代码审查记录缺失", reason)
+        lib.save_json(task / "review/code-review.json", doc["code_review"])
+        valid, reason = fbr_delivery.current_feedback(task)
+        self.assertFalse(valid)
+        self.assertTrue(reason)
+
     def test_rebuild_keeps_batch_directory_entry_in_place(self):
         task = self.gated()
         self.complete(task)
@@ -118,7 +154,7 @@ class DeliveryProjection(SheetCase):
         saved = lib.load_json(self.root / "results" / BATCH / "delivery-manifest.json")
         self.assertEqual(saved, manifest)
 
-    def test_gateway_key_in_raw_trace_is_deliverable_only_with_required_note(self):
+    def test_gateway_key_in_raw_trace_is_deliverable_without_new_note(self):
         task = self.gated()
         self.complete(task)
         ids_path = task / "trace/ids.json"
@@ -132,7 +168,7 @@ class DeliveryProjection(SheetCase):
         self.review_receipt(task)
         manifest = self.export()
         row = self.listed(manifest)[task.name]
-        self.assertEqual(row["api_key_files"], ["trace/" + ids["session_file"]])
+        self.assertNotIn("api_key_files", row)
         self.assertEqual(fbr_sheet.build_row(self.root, task, self.cfg)[0]["备注"],
                          "模型运行时读取了 apikey")
 
@@ -142,8 +178,22 @@ class DeliveryProjection(SheetCase):
         self.refresh_source_fixture(task)
         self.review_receipt(task)
         self.assertEqual(fbr_sheet.build_row(self.root, task, self.cfg)[0]["备注"],
-                         "模型运行时读取了 apikey")
+                         "")
         self.assertIn(task.name, self.listed(self.export()))
+
+    def test_partial_refresh_reuses_unchanged_media_and_excludes_changed_peer(self):
+        from unittest.mock import patch
+        first, peer = self.gated(), self.gated(2, TEXT_B)
+        for task in (first, peer):
+            self.complete(task)
+        self.export()
+        with patch.object(fbr_delivery, 'digest', wraps=fbr_delivery.digest) as hashed:
+            fbr_delivery.export_batch(self.root, BATCH, self.cfg, task_id=first.name)
+        self.assertFalse(any(peer.name in call.args[0].parts and call.args[0].suffix == '.mp4'
+                             for call in hashed.call_args_list))
+        (peer / 'record/recording.mp4').write_bytes(b'new bytes')
+        manifest = fbr_delivery.export_batch(self.root, BATCH, self.cfg, task_id=first.name)
+        self.assert_excluded(manifest, peer)
 
     def test_modified_export_is_rebuilt_from_original_whitelist(self):
         task = self.gated()
@@ -281,39 +331,15 @@ class DeliveryProjection(SheetCase):
         self.assertIn(task.name, self.listed(manifest))
         self.assertFalse((task / "review/upload.json").exists())
 
-    def test_missing_key_blocks_batch_and_preserves_existing_projection_bytes(self):
+    def test_export_after_rotation_and_removal_preserves_attachment_digest(self):
         task = self.gated()
         self.complete(task)
-        self.export()
-        target = self.root / "results" / BATCH
-        before = {p.relative_to(target).as_posix(): p.read_bytes() for p in target.rglob("*") if p.is_file()}
-        source_before = {p.relative_to(task).as_posix(): p.read_bytes() for p in task.rglob("*") if p.is_file()}
+        entry = self.listed(self.export())[task.name]
+        write(self.key_file, 'apikey=replacement-delivery-key-for-selftest\n')
+        self.assertEqual(self.listed(self.export())[task.name], entry)
         self.key_file.unlink()
-        with self.assertRaises(lib.FbrError):
-            self.export()
-        self.assertEqual(before, {p.relative_to(target).as_posix(): p.read_bytes() for p in target.rglob("*") if p.is_file()})
-        self.assertEqual(source_before, {p.relative_to(task).as_posix(): p.read_bytes() for p in task.rglob("*") if p.is_file()})
-
-    def test_replaced_key_blocks_whole_batch_export(self):
-        task = self.gated()
-        self.assertTrue((task / "run/key-identity.json").is_file())
-        replacement = "replacement-delivery-key-for-selftest"
-        write(self.key_file, f"apikey={replacement}\n")
-        with self.assertRaises(lib.FbrError) as caught:
-            self.export()
-        self.assertNotIn(replacement, str(caught.exception))
-        self.assertFalse((self.root / "results" / BATCH).exists())
-        self.assertTrue((task / "evidence/facts.json").is_file())
-
-    def test_missing_start_key_fingerprint_blocks_whole_batch_export(self):
-        task = self.gated()
-        identity = task / "run/key-identity.json"
-        self.assertTrue(identity.is_file())
-        identity.unlink()
-        with self.assertRaises(lib.FbrError):
-            self.export()
-        self.assertFalse((self.root / "results" / BATCH).exists())
-        self.assertTrue((task / "trace/ids.json").is_file())
+        (task / 'run/key-identity.json').unlink()
+        self.assertEqual(self.listed(self.export())[task.name], entry)
 
     def test_no_ready_task_can_export_empty_manifest_without_key(self):
         pending = self.written()
