@@ -367,7 +367,7 @@ def inputs(task: Path) -> dict:
              "review/card.md", "review/review-capsule.json", "review/task-agent-brief.md",
              "review/diff.patch",
              'record/recording.json', 'record/recording.mp4']
-    names += [fbr_evidence.MANIFEST, fbr_evidence.EVENTS, fbr_evidence.CHECK, fbr_evidence.PACK]
+    names += [fbr_evidence.MANIFEST, fbr_evidence.EVENTS, fbr_evidence.CHECK]
     names += [str(p.relative_to(task)) for p in sorted((task / 'evidence/command-logs').rglob('*.log'))]
     result = {}
     for name in names:
@@ -375,7 +375,11 @@ def inputs(task: Path) -> dict:
         if p.is_symlink():
             raise lib.FbrError("验收输入不能是符号链接：" + name)
         if p.is_file():
-            result[name] = file_sha(p)
+            result[name] = (
+                fbr_evidence.generated_digest(p)
+                if name in (fbr_evidence.MANIFEST, fbr_evidence.CHECK)
+                else file_sha(p)
+            )
     return result
 
 
@@ -393,8 +397,36 @@ def provenance_errors(task: Path) -> list[str]:
     if any(path.is_symlink() or not path.is_file() or file_sha(path) != receipt.get(key)
            for key, path in expected.items()):
         return ["验收正文或 audit 已变化，须由当前任务 AI 重新验收"]
-    if receipt.get("inputs") != inputs(task):
+    recorded_inputs = receipt.get("inputs")
+    if not isinstance(recorded_inputs, dict):
+        return ["缺少验收输入摘要"]
+    current_inputs = inputs(task)
+    generated_inputs = {
+        fbr_evidence.MANIFEST, fbr_evidence.CHECK, "trace/review-pack.json",
+    }
+    recorded_keys = set(recorded_inputs)
+    current_keys = set(current_inputs)
+    missing = recorded_keys - current_keys
+    added = current_keys - recorded_keys
+    changed = {
+        name for name in recorded_keys & current_keys
+        if recorded_inputs.get(name) != current_inputs.get(name)
+    }
+    source_changes = (missing | added | changed) - generated_inputs
+    generated_changes = (missing | added | changed) & generated_inputs
+    if source_changes:
         return ["轨迹或验收证据变化，须重新验收"]
+    if generated_changes:
+        closeout = lib.load_json(task / "review/task-closeout.json", default={})
+        stages = closeout.get("stages") if isinstance(closeout.get("stages"), dict) else {}
+        frozen = (
+            closeout.get("task_id") == task.name
+            and closeout.get("gate_state") == "passed"
+            and all(stages.get(name) == "ok"
+                    for name in ("run", "collect", "commit", "record", "facts", "feedback"))
+        )
+        if not frozen:
+            return ["轨迹或验收证据变化，须重新验收"]
     for name, digest in receipt.get('source_inputs', {}).items():
         path = task/name
         if path.is_symlink():
@@ -433,7 +465,19 @@ def analysis_errors(task: Path, expected_sha=None) -> list[str]:
     engine = SimpleNamespace(file_sha=file_sha, quality=quality)
     identity = doc.get('identity') or {}
     current = fbr_trace_review.identity(task, engine)
+
+    def stable_evidence(value):
+        evidence = (value or {}).get('evidence')
+        if not isinstance(evidence, dict):
+            return evidence
+        return {
+            key: digest
+            for key, digest in evidence.items()
+            if key not in (fbr_evidence.CHECK, fbr_evidence.PACK)
+        }
+
     if (identity.get('inputs') != current.get('inputs')
+            or stable_evidence(identity) != stable_evidence(current)
             or identity.get('policy_sha') not in ({current.get('policy_sha')} | quality.LEGACY_TRACE_POLICIES)):
         return ['轨迹分析来源或规则已变化，须重新分析']
     try:

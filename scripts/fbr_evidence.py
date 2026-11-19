@@ -25,6 +25,63 @@ def _sha_bytes(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
 
+def generated_digest(path: Path) -> str:
+    """Hash generated trace receipts without volatile build metadata.
+
+    Long-running flows may regenerate manifest/check files with a new
+    timestamp or index schema version while reading the same immutable trace.
+    The semantic source, event and pack hashes remain bound.
+    """
+    path = Path(path)
+    document = json.loads(path.read_text())
+    if not isinstance(document, dict):
+        return _sha_bytes(path.read_bytes())
+    if "full_scan_complete" in document:
+        stable = {
+            "task_id": document.get("task_id"),
+            "full_scan_complete": document.get("full_scan_complete"),
+            "all_source_files_processed": document.get("all_source_files_processed"),
+            "all_lines_accounted": document.get("all_lines_accounted"),
+            "sources": [
+                {
+                    "path": row.get("path"),
+                    "sha256": row.get("sha256"),
+                    "bytes": row.get("bytes"),
+                    "lines": row.get("lines"),
+                }
+                for row in document.get("sources") or []
+                if isinstance(row, dict)
+            ],
+            "problems": document.get("problems") or [],
+        }
+    elif "files" in document:
+        stable = {
+            "files": [
+                {
+                    "path": row.get("path"),
+                    "sha256": row.get("sha256"),
+                    "bytes": row.get("bytes"),
+                    "lines": row.get("lines"),
+                }
+                for row in document.get("files") or []
+                if isinstance(row, dict)
+            ],
+        }
+    else:
+        stable = {
+            key: value
+            for key, value in document.items()
+            if key not in {"generated_at", "version"}
+        }
+    payload = json.dumps(
+        stable,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    return _sha_bytes(payload)
+
+
 def _safe_path(task: Path, relative: str) -> Path:
     task = Path(task).resolve()
     rel = Path(relative)
@@ -434,8 +491,9 @@ def current_identity(task: Path, generated: bool = True) -> dict:
             raise lib.FbrError("原始轨迹在摄取后发生变化，须重新摄取")
     identity = {"version": VERSION, "sources": _identity_map(task)}
     if generated:
-        for name in (EVENTS, CHECK, PACK):
+        for name in (EVENTS, PACK):
             identity[name] = _sha_bytes((task / name).read_bytes())
+        identity[CHECK] = generated_digest(task / CHECK)
     return identity
 
 

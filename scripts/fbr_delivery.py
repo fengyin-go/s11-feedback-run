@@ -417,10 +417,13 @@ def _export_batch_locked(root: Path, target: Path, batch_id: str, cfg: dict, *, 
                 next_cache[source.name] = {'source': stamp}
                 if lib.load_json(source / "cleanup.json", default={}).get("state") == "cleaned":
                     entry = old_entries.get(source.name)
-                    if not entry or not _task_entry_valid(root, target, entry):
-                        raise lib.FbrError("已清理任务缺少可验证的冻结交付投影")
-                    tasks.append(entry)
-                    continue
+                    if entry and _task_entry_valid(root, target, entry):
+                        tasks.append(entry)
+                        continue
+                    valid, reason = current_feedback(source)
+                    if not valid:
+                        raise lib.FbrError(
+                            "已清理任务缺少可验证的冻结交付投影，且当前现场不能重新投影：" + reason)
                 # 先核对所有会读的控制文件，避免先读入跨题链接。
                 for name in ("state.json", "task.json", *FILES, "review/spotcheck.json", "review/snapshot.json", "run/attempts.json"):
                     safe_file(source, source / name)

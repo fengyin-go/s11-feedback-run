@@ -23,6 +23,7 @@ RULE_FILES = ("references/scoring.md", "references/feedback-writing.md", "refere
               "scripts/fbr_trace_review.py", "scripts/fbr_sources.py", "scripts/fbr_evidence.py")
 TRACE_RULE_FILES = ("scripts/fbr_trace_review.py", "scripts/fbr_sources.py", "scripts/fbr_evidence.py")
 LEGACY_TRACE_POLICIES = {
+    "f68e67c2c1dd0033612dd559b5b429b9fb19df8210046a9063bb2dc4de590e52",
     "a0eeac329d747bc52e6ee804ac30920511498b22344334cdb94a1910e328ca3c",
     "41e8cc299da551d1c8f22773ec0b0307262ddd13f5eb41cb2903b3bcc68d1e72",
 }

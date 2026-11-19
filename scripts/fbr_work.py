@@ -25,6 +25,10 @@ def stage_brief(task: Path) -> Path:
 def _task_packet(task: Path, *, include_capsule: bool = False) -> dict | None:
     if lib.platform_deprecated(task):
         return None
+    # Submitted or explicitly closed tasks are outside the current review queue.
+    # A stale checkpoint must not resurface work after delivery has begun.
+    if (task / "review/upload.json").is_file() or (task / "review/task-closeout.json").is_file():
+        return None
     work_path = task / "review/task-agent-work.json"
     if not work_path.is_file() or lib.stage_ok(task, "feedback"):
         return None

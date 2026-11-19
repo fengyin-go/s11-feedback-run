@@ -101,8 +101,13 @@ def _hashes(task: Path, names: tuple[str, ...]) -> dict[str, str]:
 
 def _review_hashes(task: Path) -> dict[str, str]:
     import fbr_delivery
+    import fbr_evidence
 
     rows = _hashes(task, REVIEW_FILES)
+    for name in (fbr_evidence.MANIFEST, fbr_evidence.CHECK):
+        target = Path(task) / name
+        if target.is_file():
+            rows[name] = fbr_evidence.generated_digest(target)
     for name in (*_trace_files(task), *_command_logs(task)):
         rows[name] = fbr_delivery.digest(_safe(task, name))
     return dict(sorted(rows.items()))

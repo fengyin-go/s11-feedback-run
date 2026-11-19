@@ -40,6 +40,15 @@ class RollingWork(Sandbox):
         self.assertNotIn("brief_text", packet)
         self.assertNotIn("review_contract", packet)
 
+    def test_next_skips_submitted_or_closed_work(self):
+        submitted, closed = self.make_task(1, repo=False), self.make_task(2, repo=False)
+        for task in (submitted, closed):
+            lib.save_json(task / "review/task-agent-work.json",
+                          {"at": "2026-11-15T10:00:00+0800", "next_steps": []})
+        lib.save_json(submitted / "review/upload.json", {"submission_id": 1})
+        lib.save_json(closed / "review/task-closeout.json", {"task_id": closed.name})
+        self.assertEqual(fbr_work.pending(self.root, submitted.parent.name), [])
+
     def test_next_inline_falls_back_to_existing_brief(self):
         task = self.make_task(repo=False)
         lib.save_json(task / "review/task-agent-work.json",

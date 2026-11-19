@@ -115,6 +115,71 @@ def source_identity(task_dir: Path) -> str:
     return lib.content_hash(values)
 
 
+def reconcile_frozen_facts(task_dir: Path) -> dict | None:
+    """Restore downstream stages for a submitted task from its frozen receipts.
+
+    A later facts invocation must never overwrite production evidence after a
+    platform record exists.  This deterministic repair only accepts files that
+    still agree with the frozen snapshot, gate, and task closeout receipts.
+    """
+    upload = lib.load_json(task_dir / "review/upload.json", default={})
+    submission_id = upload.get("submission_id")
+    platform_submission = type(submission_id) is int and submission_id > 0
+    if upload and not platform_submission and upload.get("state") != "uncertain":
+        return None
+
+    snapshot = lib.load_json(task_dir / "review/snapshot.json", default={})
+    facts = lib.load_json(task_dir / "evidence/facts.json", default={})
+    gate = lib.load_json(task_dir / "review/gate.json", default={})
+    feedback = lib.load_json(task_dir / "review/feedback.json", default={})
+    closeout = lib.load_json(task_dir / "review/task-closeout.json", default={})
+    recording = lib.load_json(task_dir / "record/recording.json", default={})
+    ids = lib.load_json(task_dir / "trace/ids.json", default={})
+    stages = lib.load_state(task_dir).get("stages", {})
+
+    commit = str(snapshot.get("commit") or "")
+    feedback_text = str(feedback.get("feedback") or "")
+    feedback_sha = hashlib.sha256(feedback_text.encode("utf-8")).hexdigest()
+    closeout_submission = closeout.get("submission") if isinstance(closeout.get("submission"), dict) else {}
+    closeout_stages = closeout.get("stages") if isinstance(closeout.get("stages"), dict) else {}
+    problems = []
+    if not commit:
+        problems.append("缺少冻结产物提交")
+    if facts.get("task_id") != task_dir.name or facts.get("commit") != commit:
+        problems.append("事实文件与冻结提交不一致")
+    if facts.get("source_identity") != source_identity(task_dir):
+        problems.append("轨迹或录屏摘要在取证后发生变化")
+    if recording.get("task_id") != task_dir.name or recording.get("commit") != commit:
+        problems.append("录屏回执与冻结提交不一致")
+    collect = stages.get("collect") if isinstance(stages.get("collect"), dict) else {}
+    if ids.get("session_id") != collect.get("session_id"):
+        problems.append("SessionID 与 collect 回执不一致")
+    if (not gate.get("passed") or gate.get("task_id") != task_dir.name
+            or gate.get("commit") != commit or gate.get("score") != feedback.get("score")
+            or gate.get("feedback_sha") != feedback_sha):
+        problems.append("Feedback gate 与冻结材料不一致")
+    if (closeout.get("gate_state") != "passed"
+            or closeout.get("task_id") != task_dir.name
+            or any(closeout_stages.get(stage) != "ok"
+                   for stage in ("run", "collect", "commit", "record", "facts", "feedback"))):
+        problems.append("任务封存回执未证明全部阶段通过")
+    if platform_submission and (
+            str(closeout_submission.get("submission_id")) != str(submission_id)
+            or closeout_submission.get("state") != "confirmed"):
+        problems.append("任务封存回执与平台提交不一致")
+    if problems:
+        raise lib.FbrError("；".join(problems))
+
+    if stages.get("facts", {}).get("state") != "ok":
+        lib.set_stage(task_dir, "facts", "ok", commit=commit, reconciled_from="platform-receipt")
+    if stages.get("feedback", {}).get("state") != "ok":
+        lib.set_stage(
+            task_dir, "feedback", "ok", score=feedback["score"],
+            feedback_sha=feedback_sha, reconciled_from="platform-receipt")
+    return {"task_id": task_dir.name, "state": "skip",
+            "detail": "存在冻结交付回执，复用取证与评价"}
+
+
 def compare_tests(before: dict, after: dict) -> dict:
     new = sorted(set(after["failed_names"]) - set(before["failed_names"]))
     fixed = sorted(set(before["failed_names"]) - set(after["failed_names"]))
@@ -189,11 +254,11 @@ def check_claims(answer: str, tree: list[str], changed: set[str]) -> dict:
 def facts_one(task_dir: Path, root: Path, cfg: dict, redo: bool = False) -> dict:
     record = lib.load_task(task_dir)
     name, workspace, initial = record["task_id"], task_dir / "workspace", record["initial_commit"]
-    identity = test_identity(initial, record, cfg)
     if lib.stage_ok(task_dir, "facts") and not redo:
         previous = lib.load_json(task_dir / "evidence/facts.json", default={})
-        if previous.get("test_identity") == identity and previous.get('source_identity') == source_identity(task_dir):
+        if previous.get('source_identity') == source_identity(task_dir):
             return {"task_id": name, "state": "skip", "detail": "已经取证过"}
+    identity = test_identity(initial, record, cfg)
     lib.require_stage(task_dir, "record")
     lib.restore_git_config(task_dir)
     snapshot = lib.load_json(task_dir / "review" / "snapshot.json")
@@ -292,6 +357,12 @@ def main() -> int:
             try:
                 return facts_one(task_dir, root, cfg, args.redo)
             except lib.FbrError as exc:
+                try:
+                    reconciled = reconcile_frozen_facts(task_dir)
+                except lib.FbrError:
+                    reconciled = None
+                if reconciled:
+                    return reconciled
                 lib.set_stage(task_dir, "facts", "failed", reason=str(exc))
                 return {"task_id": task_dir.name, "state": "failed", "detail": str(exc)}
 

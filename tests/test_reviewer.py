@@ -370,6 +370,34 @@ class Review(FlowCase):
         lib.save_json(task/'review/feedback.json', doc)
         self.assertTrue(reviewer.provenance_errors(task))
 
+    def test_passed_closeout_allows_generated_trace_index_compatibility(self):
+        task = self.agent_prepared()
+        candidate = json.loads(self.candidate()[0])
+        with mock.patch('fbr_sheet.write_sheet'):
+            self.assertEqual(
+                reviewer.finalize(task, candidate, self.verification(task, candidate))['state'],
+                'ok')
+        (task / 'review/task-closeout.json').unlink()
+        receipt = lib.load_json(task / 'review/model-review.json')
+        legacy_inputs = dict(receipt['inputs'])
+        legacy_inputs[reviewer.fbr_evidence.MANIFEST] = 'legacy-generator'
+        legacy_inputs['trace/review-pack.json'] = 'legacy-pack'
+        receipt['inputs'] = legacy_inputs
+        lib.save_json(task / 'review/model-review.json', receipt)
+        certificate = lib.load_json(task / 'review/quality.json')
+        certificate['inputs'] = legacy_inputs
+        lib.save_json(task / 'review/quality.json', certificate)
+        self.assertIn('轨迹或验收证据变化', reviewer.provenance_errors(task)[0])
+        lib.save_json(task / 'review/task-closeout.json', {
+            'task_id': task.name,
+            'gate_state': 'passed',
+            'stages': {
+                name: 'ok'
+                for name in ('run', 'collect', 'commit', 'record', 'facts', 'feedback')
+            },
+        })
+        self.assertEqual(reviewer.provenance_errors(task), [])
+
     def test_missing_receipt_wrong_model_and_changed_evidence_block_delivery(self):
         task = self.gated()
         path = task / "review/model-review.json"

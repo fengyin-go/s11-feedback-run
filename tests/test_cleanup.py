@@ -115,6 +115,23 @@ class Cleanup(SubmitCase):
         restored = lib.load_json(target / "delivery-manifest.json")
         self.assertIn(task_dir.name, [row["task_id"] for row in restored["tasks"]])
 
+    def test_hydrated_clean_task_can_rebuild_missing_projection(self):
+        task_dir, client = self.submitted()
+        backup = self.root / "_verification" / "workspace-backup"
+        shutil.copytree(task_dir / "workspace", backup, symlinks=True)
+        fbr_cleanup.prune_batch(
+            self.root, BATCH, task_dir.name, execute=True, confirm="CLEANUP", client=client)
+        target = delivery.delivery_dir(self.root, BATCH)
+        manifest = lib.load_json(target / "delivery-manifest.json")
+        manifest["tasks"] = [
+            row for row in manifest["tasks"] if row.get("task_id") != task_dir.name
+        ]
+        lib.save_json(target / "delivery-manifest.json", manifest)
+        shutil.copytree(backup, task_dir / "workspace", symlinks=True)
+        rebuilt = delivery.export_batch(self.root, BATCH, self.cfg)
+        self.assertIn(task_dir.name, [row["task_id"] for row in rebuilt["tasks"]])
+        self.assertTrue((target / task_dir.name / "trace/ids.json").is_file())
+
 
 if __name__ == "__main__":
     unittest.main()
