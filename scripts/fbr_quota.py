@@ -19,6 +19,7 @@ import fbrlib as lib
 BJ = timezone(timedelta(hours=8))
 DAY = timedelta(days=1)
 FIRST_READ = set()
+BLOCKED_RECHECK_SECONDS = 60
 
 
 def now():
@@ -90,7 +91,9 @@ def day_row(data, day):
 
 
 def used(row):
-    return max(len(row['ids']), row['overview'] - row['old_repairs'])
+    if 'unlisted' in row:
+        return row['overview'] + len(row['unlisted'])
+    return max(len(row['ids']), row['overview'] - row['old_repairs'])  # legacy, until first live sync
 
 
 def snapshot(client, account, day, created_days=None):
@@ -109,6 +112,8 @@ def snapshot(client, account, day, created_days=None):
     page = 1
     while True:
         result = client.list_submissions(page=page, page_size=100, **filters)
+        if type(result['meta']['total']) is not int or result['meta']['total'] != overview:
+            raise lib.FbrError('概览与分页总数变化，稍后重新核对')
         for row in result['items']:
             identifier = str(row['id'])
             if not identifier.isascii() or not identifier.isdecimal() or int(identifier) <= 0:
@@ -137,7 +142,9 @@ def snapshot(client, account, day, created_days=None):
 
 def notify_increase(row, account, day, capacity):
     count = len(row['ids'])
-    if count > capacity and not row.get('notice'):
+    if count <= capacity:
+        return ''
+    if not row.get('notice'):
         row['notice'] = f'{account} 在 {day} 已确认新增 {count} 条，每日 {capacity} 条标准可能变化。'
         print(row['notice'], flush=True)
     return row.get('notice', '')
@@ -148,14 +155,30 @@ def refresh(data, account, client=None, force=False):
     row = day_row(data, stamp.date())
     first = (str(path_for(account)), str(stamp.date()))
     if force or first not in FIRST_READ or stamp.timestamp() - row.get('checked', 0) >= 600:
+        created_days = data.get('created_days', {}).copy()
         try:
-            overview, ids, old = snapshot(client, account, stamp.date(), data.setdefault('created_days', {}))
+            overview, ids, old = snapshot(client, account, stamp.date(), created_days)
         except (KeyError, TypeError, ValueError, AttributeError) as exc:
             raise lib.FbrError('概览字段或分页格式变化，等待重新核对') from exc
         if now().date() != stamp.date():
             return refresh(data, account, client, True)
-        row['ids'].update(ids)
-        row.update(overview=overview, old_repairs=old, checked=stamp.timestamp())
+        # Each complete list supersedes the previous one, including legacy cumulative IDs.
+        # Bridge list propagation only for fresh confirmations never seen in a snapshot.
+        unlisted = {key: created for key, created in row.get('unlisted', {}).items()
+                    if key not in ids and stamp.timestamp() - created < BLOCKED_RECHECK_SECONDS}
+        active = {key: row['ids'][key] for key in unlisted}
+        active.update(ids)
+        for key in row['ids']:
+            created_days.setdefault(key, str(stamp.date()))
+        data['created_days'] = created_days
+        if row.get('full'):
+            rejected_at = row.get('rejected_overview', max(row['overview'], len(row['ids']) + row['old_repairs']))
+            if overview < rejected_at:
+                for field in ('full', 'rejected_overview', 'rejection_notice', 'recheck_error'):
+                    row.pop(field, None)
+            else:
+                row['rejected_overview'] = rejected_at
+        row.update(ids=active, unlisted=unlisted, overview=overview, old_repairs=old, checked=stamp.timestamp())
         FIRST_READ.add(first)
         settled = set(row['ids'].values()) - {None, ''}
         if row.get('pending_probe') in settled:
@@ -167,8 +190,17 @@ def refresh(data, account, client=None, force=False):
     return row
 
 
-def current_row(data, account, client=None, *, force=False):
+def current_row(data, account, capacity, client=None, *, force=False):
     while True:
+        stamp = now()
+        day = stamp.date()
+        prior = day_row(data, day)
+        available = capacity - used(prior) - occupied(data, day)
+        age = stamp.timestamp() - prior.get('checked', 0)
+        if prior.get('full') or available <= 0:
+            force = force or age >= BLOCKED_RECHECK_SECONDS
+        elif 0 < available <= 2 and due(stamp) == day:
+            force = force or age > 10
         row = refresh(data, account, client, force=force)
         stamp = now()
         if row is data['dates'].get(str(stamp.date())):
@@ -273,7 +305,7 @@ def inventory_project(data, root, cfg, force=False):
             if (str(date) == today and receipt.get('account') == lib.platform_account(cfg)
                     and receipt.get('platform') == fbr_platform.BASE_URL):
                 sample(data, receipt['submission_id'], created, state.get('started_at'))
-                day_row(data, date)['ids'][str(receipt['submission_id'])] = (receipt.get('remote_data') or {}).get('session_id')
+                record_confirmation(data, receipt['submission_id'], created, (receipt.get('remote_data') or {}).get('session_id'))
             data['holds'].pop(key, None)
             continue
         uncertain = receipt.get('state') in ('creating', 'uncertain', 'verifying')
@@ -356,7 +388,7 @@ def reserve(task, cfg):
     account = lib.platform_account(cfg)
     with book(account) as data:
         inventory(data, root, cfg)
-        stamp, row = current_row(data, account)
+        stamp, _ = current_row(data, account, limit(cfg))
         day = due(stamp)
         rollover(data, stamp.date())
         key = key_for(task)
@@ -365,9 +397,6 @@ def reserve(task, cfg):
             return
         target = day_row(data, day)
         remaining = limit(cfg) - used(target) - occupied(data, day, key)
-        if day == stamp.date() and 0 < remaining <= 2 and stamp.timestamp() - row['checked'] > 10:
-            refresh(data, account, force=True)
-            remaining = limit(cfg) - used(target) - occupied(data, day, key)
         if remaining <= 0 or target.get('full'):
             return retry(f'{day} 的新增名额已用完，等待额度释放或跨时段')
         samples = data['samples']
@@ -403,19 +432,17 @@ def collected(task, cfg, ids):
 
 
 class Wait(lib.FbrError):
-    def __init__(self, reason, *, state='quota_wait', tomorrow=False):
+    def __init__(self, reason, *, state='quota_wait'):
         super().__init__(reason)
         self.state = state
-        stamp = now()
-        wake = datetime.combine(stamp.date() + DAY, time(), BJ) if tomorrow else stamp + timedelta(minutes=1)
-        self.retry_at = wake.timestamp()
+        self.retry_at = now().timestamp() + BLOCKED_RECHECK_SECONDS
 
 
 def check_create(root, task, cfg, client, info, *, before_post=False):
     account = lib.platform_account(cfg)
     with book(account) as data:
         inventory(data, root, cfg)
-        stamp, row = current_row(data, account, client, force=before_post)
+        stamp, row = current_row(data, account, limit(cfg), client, force=before_post)
         day = stamp.date()
         rollover(data, day)
         if info['due'] < str(day):
@@ -429,14 +456,12 @@ def check_create(root, task, cfg, client, info, *, before_post=False):
         bind(data, key, info, limit(cfg))
         hold = data['holds'][key]
         if row.get('full'):
-            raise Wait('平台已明确拒绝当日新增，等待额度日切', tomorrow=True)
+            raise Wait('平台已明确拒绝当日新增，等待平台今日提交数下降或日切')
         free = limit(cfg) - used(row)
         unresolved = sum(h.get('attempt_day') == str(day) for k, h in data['holds'].items() if k != key)
         if free > 0 and unresolved >= free:
             raise Wait('剩余名额有结果待核对的建单请求')
         if free <= 0:
-            if len(row['ids']) < limit(cfg):
-                raise Wait('概览与已核实新增数有差额，等待对账后试投')
             if row.get('pending_probe') not in (None, info['session']):
                 raise Wait('上一条试投的建单结果待核对')
             if info['due'] <= str(day) or hold['day'] != info['due']:
@@ -449,7 +474,7 @@ def check_create(root, task, cfg, client, info, *, before_post=False):
             hold.update(uncertain=True, attempt_day=str(day))
             if free <= 0:
                 row.update(pending_probe=info['session'], probe_baseline=limit(cfg))
-        return {'day': str(day), 'probe': free <= 0}
+        return {'day': str(day), 'probe': free <= 0, 'overview': row['overview']}
 
 
 def clear_attempt(account, task):
@@ -461,15 +486,17 @@ def clear_attempt(account, task):
             day_row(data, day).pop('pending_probe', None)
 
 
-def full(account, day, *, client=None, capacity=None):
+def full(account, day, *, client=None, capacity=None, request_overview=None):
     with book(account) as data:
         row = day_row(data, day)
-        row['full'] = True
+        row.update(full=True, rejected_overview=row['overview'] if request_overview is None else request_overview)
         if client is not None:
             try:
                 refresh(data, account, client, force=True)
             except lib.FbrError as exc:
                 row['recheck_error'] = str(exc)
+        if not row.get('full'):
+            return f'{account} 在 {day} 的平台今日提交数已回落至 {row["overview"]} 条，下一次调度重新核算。'
         detail = f"{account} 在 {day} 已核实新增 {len(row['ids'])} 条，平台已拒绝当天继续新增。"
         if capacity and len(row['ids']) < capacity:
             detail += f'低于当前 {capacity} 条基准。'
@@ -478,15 +505,28 @@ def full(account, day, *, client=None, capacity=None):
         return detail
 
 
+def record_confirmation(data, identifier, created, session):
+    row = day_row(data, created.date())
+    key = str(identifier)
+    known = data.setdefault('created_days', {})
+    if 'unlisted' not in row:
+        row['ids'][key] = session
+    elif key in row['ids']:
+        row['ids'][key] = session or row['ids'][key]
+    elif key not in known and created.timestamp() >= row['checked'] - BLOCKED_RECHECK_SECONDS:
+        row['ids'][key] = session
+        row['unlisted'][key] = created.timestamp()
+    known[key] = str(created.date())
+    return row
+
+
 def confirmed(task, account, identifier, created, session, capacity):
     with book(account) as data:
         hold = data['holds'].pop(key_for(task), {})
         stamp = moment(created, platform=True)
-        row = day_row(data, stamp.date())
-        row['ids'][str(identifier)] = session
+        row = record_confirmation(data, identifier, stamp, session)
         if row.get('pending_probe') == session:
             row.pop('pending_probe', None)
-        data.setdefault('created_days', {})[str(identifier)] = str(stamp.date())
         sample(data, identifier, stamp, hold.get('started') or hold.get('end'))
         return notify_increase(row, account, stamp.date(), capacity)
 
@@ -502,16 +542,18 @@ def summary(root, *, live=False, rescan=False):
         rollover(data, day)
         row = day_row(data, day)
         holds = list(data['holds'].values())
+        unlisted = len(row.get('unlisted', {}))
+        limit_notice = row.get('notice') if len(row['ids']) > limit(cfg) else ''
         return dict(account=account, day=str(day), baseline=limit(cfg), overview=row['overview'],
-                    older_repairs=row['old_repairs'], confirmed=len(row['ids']), charged=used(row),
+                    older_repairs=row['old_repairs'], awaiting_list=unlisted, confirmed=len(row['ids']), charged=used(row),
                     checked=row.get('checked'), today_reserved=occupied(data, day),
                     today_available=0 if row.get('full') else max(0,limit(cfg)-used(row)-occupied(data, day)),
                     tomorrow_reserved=occupied(data, day+DAY), due_tonight=sum(h.get('due')==str(day) for h in holds),
                     late_ready=sum(h.get('due', '') > str(day) and bool(h.get('ready')) for h in holds),
-                    unexplained_gap=row['overview'] - row['old_repairs'] - len(row['ids']),
+                    unexplained_gap=row['overview'] - row['old_repairs'] - (len(row['ids']) - unlisted),
                     ready_tonight=sum(h.get('due')==str(day) and h.get('ready',False) for h in holds),
                     daily_limit_rejected=bool(row.get('full')),
-                    notice=' '.join(filter(None, (row.get('notice'), row.get('rejection_notice')))))
+                    notice=' '.join(filter(None, (limit_notice, row.get('rejection_notice')))))
 
 
 def live_status(root):
@@ -527,7 +569,7 @@ def status_text(row):
     if not row['checked']:
         return '今日额度尚待平台核对'
     return (f"{row['account']} {datetime.fromtimestamp(row['checked'], BJ):%Y-%m-%d %H:%M} 概览 {row['overview']}，新增 {row['confirmed']}，"
-            f"今日占位 {row['today_reserved']}，可开 {row['today_available']}，明日预留 {row['tomorrow_reserved']}，"
+            f"待列表同步 {row['awaiting_list']}，今日占位 {row['today_reserved']}，可开 {row['today_available']}，明日预留 {row['tomorrow_reserved']}，"
             f"今晚到期 {row['due_tonight']}（已就绪 {row['ready_tonight']}），可结转已就绪 {row['late_ready']}，对账差额 {row['unexplained_gap']}。{row['notice']}")
 
 

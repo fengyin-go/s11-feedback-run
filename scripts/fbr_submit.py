@@ -1171,8 +1171,9 @@ def submit_one(root: Path, plan: dict, client, schema: dict, records: list[dict]
             lib.save_json(path, receipt)
             quota.clear_attempt(ACCOUNT, task_dir)
             if daily_full:
-                detail = quota.full(ACCOUNT, quota_attempt['day'], client=client, capacity=quota.limit(cfg))
-                raise quota.Wait(detail, tomorrow=True) from None
+                detail = quota.full(ACCOUNT, quota_attempt['day'], client=client, capacity=quota.limit(cfg),
+                                    request_overview=quota_attempt['overview'])
+                raise quota.Wait(detail) from None
             raise
         rate_limited = isinstance(exc, SubmitRateLimited)
         not_sent = isinstance(exc, RequestNotSent) and not valid_id(receipt.get("submission_id"))

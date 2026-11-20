@@ -190,6 +190,67 @@ print('reserved' if q.reserve(task, cfg) is None else 'wait')
         client.detail.assert_called_once_with(2)
         self.assertEqual(client.list_submissions.call_args.kwargs['user_id'], 7)
 
+    def test_legacy_30_deleted_to_27_with_receipts_and_one_live_hold(self):
+        self.cfg['submit']['daily_limit'] = 70
+        q.lib.save_json(self.root / '_config/settings.json', self.cfg)
+        day = q.now().date()
+        original = {str(i): f's{i}' for i in range(1, 31)}
+        with q.book(self.account) as data:
+            q.day_row(data, day).update(overview=30, ids=original, checked=q.now().timestamp())
+        q.lib.save_json(self.a / 'review/upload.json', {
+            'account': self.account, 'platform': fbr_platform.BASE_URL, 'state': 'confirmed',
+            'submitted_at': q.now().isoformat(), 'submission_id': 30, 'remote_data': {'session_id': 's30'}})
+        q.snapshot.return_value = (27, dict(list(original.items())[:27]), 0)
+        self.assertEqual(q.summary(self.root, live=True)['today_available'], 43)
+        self.assertIsNone(q.reserve(self.b, self.cfg))
+        for live in (False, True, False):
+            row = q.summary(self.root, rescan=True, live=live)
+            self.assertEqual((row['charged'], row['today_reserved'], row['today_available']), (27, 1, 42))
+
+    def test_full_queue_rechecks_same_day_then_refills_one_slot(self):
+        q.snapshot.return_value = (1, {'7': 'old'}, 0)
+        self.assertIsNotNone(q.reserve(self.a, self.cfg))
+        q.full(self.account, q.now().date())
+        q.snapshot.return_value = (0, {}, 0)
+        self.clock(10, 19, 1)
+        self.assertIsNone(q.reserve(self.a, self.cfg))
+        self.assertIsNotNone(q.reserve(self.b, self.cfg))
+        decision = q.check_create(self.root, self.a, self.cfg, None, self.info(self.a), before_post=True)
+        self.assertFalse(decision['probe'])
+        q.confirmed(self.a, self.account, 8, q.now().isoformat(), self.a.name, 1)
+        q.snapshot.return_value = (1, {'8': self.a.name}, 0)
+        self.assertEqual(q.summary(self.root, live=True)['charged'], 1)
+        self.assertIsNotNone(q.reserve(self.b, self.cfg))
+
+    def test_recent_confirmation_bridges_list_delay_once_and_expires(self):
+        q.summary(self.root, live=True)
+        created = q.now().isoformat()
+        q.confirmed(self.a, self.account, 7, created, self.a.name, 1)
+        self.assertEqual(q.summary(self.root, live=True)['awaiting_list'], 1)
+        self.clock(10, 19, 1)
+        self.assertEqual(q.summary(self.root, live=True)['charged'], 0)
+        q.confirmed(self.a, self.account, 7, created, self.a.name, 1)
+        self.assertEqual(q.summary(self.root)['charged'], 0)
+
+    def test_overview_drives_capacity_when_it_includes_an_older_repair(self):
+        q.snapshot.return_value = (1, {}, 1)
+        self.assertIsNotNone(q.reserve(self.a, self.cfg))
+        self.assertEqual(q.summary(self.root)['confirmed'], 0)
+        q.snapshot.return_value = (0, {}, 0)
+        self.assertEqual(q.summary(self.root, live=True)['charged'], 0)
+
+    def test_changing_page_total_does_not_release_capacity(self):
+        q.snapshot.return_value = (1, {'7': 'old'}, 0)
+        self.assertIsNotNone(q.reserve(self.a, self.cfg))
+        client = mock.Mock()
+        client.me.return_value = {'username': self.account, 'id': 7}
+        client.list_submissions.side_effect = [{'meta': {'total': 0}},
+            {'meta': {'total_pages': 1, 'total': 1}, 'items': []}]
+        with q.book(self.account) as data, mock.patch.object(q, 'snapshot', REAL_SNAPSHOT):
+            with self.assertRaisesRegex(q.lib.FbrError, '分页总数变化'):
+                q.refresh(data, self.account, client, force=True)
+        self.assertEqual(q.summary(self.root)['charged'], 1)
+
     def test_explicit_limit_only(self):
         for message in ('今日新增提交已达上限', '今天最多提交 70 条', 'daily_submission_limit_exceeded'):
             self.assertTrue(fbr_platform.daily_limit_error(json.dumps({'detail': message}).encode()))
