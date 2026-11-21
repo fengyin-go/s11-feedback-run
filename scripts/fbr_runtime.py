@@ -205,7 +205,9 @@ class Gateway:
         try:
             data = lib.load_json(self.path / 'pressure.json', default={})
             ceiling = int(self.options['machine_parallel'])
-            if data.get('ceiling', ceiling) != ceiling:
+            stored_ceiling = data.get('ceiling', ceiling)
+            # The previous default was 5. Keep its slots and pressure history when lowering it to 4.
+            if stored_ceiling != ceiling and (stored_ceiling, ceiling) != (5, 4):
                 raise lib.FbrError('同一网关凭据的 machine_parallel 配置不一致，先统一各运行入口的额度配置')
             data.update(ceiling=ceiling, cap=min(ceiling, data.get('cap', ceiling)))
             yield data

@@ -222,6 +222,23 @@ class SharedRuntime(Sandbox):
         self.assertTrue(second.acquire(time.time() + 1, once=True))
         second.release()
 
+    def test_lowering_gateway_ceiling_preserves_live_slots(self):
+        old_cfg = copy.deepcopy(self.cfg)
+        old_cfg['gateway']['machine_parallel'] = 5
+        workers = [rt.Gateway(old_cfg) for _ in range(5)]
+        for worker in workers:
+            self.assertTrue(worker.acquire(time.time() + 1, once=True))
+        new_worker = rt.Gateway(self.cfg)
+        self.assertFalse(new_worker.acquire(time.time() + 1, once=True))
+        with new_worker.transaction() as state:
+            self.assertEqual((state['ceiling'], state['cap']), (4, 4))
+            self.assertEqual(set(state['slots']), {worker.token for worker in workers})
+        with new_worker.transaction() as state:
+            for worker in workers[:2]:
+                del state['slots'][worker.token]
+        self.assertTrue(new_worker.acquire(time.time() + 1, once=True))
+        new_worker.release()
+
     def test_pressure_dedup_floor_and_recovery(self):
         options = self.cfg['gateway']
         state = {'ceiling': 5, 'cap': 5}

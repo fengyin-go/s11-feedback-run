@@ -53,6 +53,20 @@ class Tasks(Sandbox):
         with self.assertRaisesRegex(lib.FbrError, "settings.json 缺少 image_id"):
             lib.settings(self.root)
 
+    def test_model_concurrency_defaults_and_caps_at_four(self):
+        path = self.root / '_config' / 'settings.json'
+        data = lib.load_json(path)
+        del data['concurrency']
+        for override, expected in ((None, 4), (5, 4), (2, 2)):
+            with self.subTest(override=override):
+                if override is not None:
+                    data['concurrency'] = override
+                    data['gateway']['machine_parallel'] = override
+                lib.save_json(path, data)
+                cfg = lib.settings(self.root)
+                self.assertEqual(cfg['concurrency'], expected)
+                self.assertEqual(cfg['gateway']['machine_parallel'], expected)
+
     def test_fixed_github_owner_is_not_required_or_selected_by_settings(self):
         path = self.root / "_config" / "settings.json"
         data = lib.load_json(path)

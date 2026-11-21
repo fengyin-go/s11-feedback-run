@@ -236,7 +236,8 @@ def prewarm_batch(root, batch, cfg, tasks):
         except (lib.FbrError, OSError, ValueError) as exc:
             return {'task_id': task.name, 'state': 'failed', 'detail': str(exc)}
 
-    workers = max(1, min(int(cfg.get('concurrency', 5)), len(todo)))
+    model_concurrency = min(int(cfg.get('concurrency', lib.DEFAULTS['concurrency'])), len(todo))
+    workers = max(1, model_concurrency)
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {pool.submit(prepare, task): task for task in todo}
         for future in as_completed(futures):
@@ -246,7 +247,7 @@ def prewarm_batch(root, batch, cfg, tasks):
             state['updated_at'] = lib.now_iso()
             lib.save_json(path, state)
     state.update(state='completed', completed_at=lib.now_iso(),
-                 workers=workers, model_concurrency=min(int(cfg.get('concurrency', 5)), len(todo)))
+                 workers=workers, model_concurrency=model_concurrency)
     lib.save_json(path, state)
     return state
 

@@ -42,12 +42,14 @@ FORBIDDEN_ACTIVE_GITHUB_ACCOUNTS = {"fengyin-solo"}
 DEFAULT_PLATFORM_ACCOUNT = "zouyonghong"
 PLATFORM_ACCOUNT_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 
+MODEL_CONCURRENCY_LIMIT = 4
+
 DEFAULTS = {
     "image": "adminfather/benzhi-claude-code2:20261110",
     "harness": "Claude Code",
     "harness_version": "2.1.319",
     "os": "MacOS/Linux",
-    "concurrency": 5,
+    "concurrency": MODEL_CONCURRENCY_LIMIT,
     "review_parallel": 5, "facts_parallel": 2,
     "dependencies": {"enabled": True, "paths": [], "smoke_cmd": ""},
     "record_parallel": 2,
@@ -74,7 +76,7 @@ DEFAULTS = {
         "max_continuations": 2,     # 同题累计最多两次，只发送“继续”
         "context_limit": 1000000,   # 镜像里固化的 max context token，不符不起跑
     },
-    "gateway": {"machine_parallel": 5, "soft_floor": 3, "downgrade_dedup": 120,
+    "gateway": {"machine_parallel": MODEL_CONCURRENCY_LIMIT, "soft_floor": 3, "downgrade_dedup": 120,
                 "stable_seconds": 300, "probe_interval": 300, "probe_successes": 3,
                 "spike_interval": 1200, "spike_watch": 300, "spike_backoff": 2400,
                 "retry_base": 30, "retry_max": 300},
@@ -208,6 +210,9 @@ def settings(root: Path) -> dict:
         for name in keys:
             if type(cfg[section][name]) not in (int, float) or cfg[section][name] <= 0:
                 raise FbrError(f"{section}.{name} 必须为正数")
+    cfg["concurrency"] = min(MODEL_CONCURRENCY_LIMIT, max(1, int(cfg["concurrency"])))
+    cfg["gateway"]["machine_parallel"] = min(MODEL_CONCURRENCY_LIMIT,
+                                             max(1, int(cfg["gateway"]["machine_parallel"])))
     batch_budget = cfg["run"]["batch_budget"]
     if batch_budget is not None and (type(batch_budget) not in (int, float) or batch_budget <= 0):
         raise FbrError("run.batch_budget 必须为正数或 null（null 表示不设批次派发截止）")

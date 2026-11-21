@@ -180,7 +180,7 @@ fbr_cleanup.py prune --batch b1113-01 --execute --confirm CLEANUP
 ```bash
 fbr_run.py preflight
 fbr_run.py run --batch b1110-01                      # 演练：列出哪些题没准备好
-fbr_run.py run --batch b1110-01 --execute            # 真跑，并发按 settings 里的 concurrency
+fbr_run.py run --batch b1110-01 --execute            # 真跑，模型容器默认并发 4，可通过 concurrency 调低
 fbr_run.py collect --batch b1110-01
 ```
 
