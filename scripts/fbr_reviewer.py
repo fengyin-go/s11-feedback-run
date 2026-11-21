@@ -753,6 +753,11 @@ def prepare_task_agent(task: Path, *, allow_platform_repair: bool = False) -> di
                       'process_evidence': '每个 process 句绑定真实 steps 及 tool/assistant evidence；复核引用同一原始摘录',
                       'claim_reviews': '按 public_units 完整逐句回查；trace 来源必须带 start_line、end_line、block 和原文'},
                   'detail': '当前任务 AI 检查产物、评分、撰写及复核 Feedback；本阶段不调用 reviewer.env'}
+    if allow_platform_repair:
+        import fbr_followup
+        ticket = lib.load_json(task / fbr_followup.JOURNAL, default={})
+        if ticket.get('state') == 'needs_platform_repair':
+            checkpoint['platform_repair_revision'] = ticket['revision']
     gate = lib.load_json(task/'review/gate.json', default={})
     _, history = _load_attempt_history(task)
     last = history.get('attempts', [])
@@ -1017,10 +1022,14 @@ def main() -> int:
                 with lib.file_lock(task/'.operation.lock'):
                     result = prepare_task_agent(task, allow_platform_repair=args.platform_repair)
             else:
+                import fbr_followup
+                ticket = lib.load_json(task / 'review/task-agent-work.json', default={}) if args.platform_repair else {}
                 result = finalize(task, lib.load_json(Path(args.candidate)), lib.load_json(Path(args.verification)),
                                   publish=not args.no_publish,
                                   allow_platform_repair=args.platform_repair,
                                   defer_delivery=args.defer_delivery)
+                if result.get('state') == 'ok' and not args.defer_delivery:
+                    fbr_followup.mark_ready(task, ticket.get('platform_repair_revision'))
         if args.command == 'probe':
             print(json.dumps(result, ensure_ascii=False, indent=2) if args.json
                   else f"probe\t{result['state']}\t{result.get('model','')}")

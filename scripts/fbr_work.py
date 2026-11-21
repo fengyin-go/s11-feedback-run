@@ -25,6 +25,10 @@ def stage_brief(task: Path) -> Path:
 def _task_packet(task: Path, *, include_capsule: bool = False) -> dict | None:
     if lib.platform_deprecated(task):
         return None
+    import fbr_followup
+    repair = fbr_followup.repair_packet(task)
+    if repair:
+        return repair
     # Submitted or explicitly closed tasks are outside the current review queue.
     # A stale checkpoint must not resurface work after delivery has begun.
     if (task / "review/upload.json").is_file() or (task / "review/task-closeout.json").is_file():

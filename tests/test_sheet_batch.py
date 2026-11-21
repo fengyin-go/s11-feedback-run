@@ -492,7 +492,7 @@ class Status(SheetCase):
         self.assertTrue(lines[3].endswith("）  产物快照未推送"))
         self.assertEqual(lines[4:], [
             "—— 都做完了 1 题，等运行 1 题，等取证 1 题，等Feedback 1 题",
-            f"下一步（运行）：fbr_flow.py pre-submit --batch {BATCH} --detach",
+            f"下一步（运行）：fbr_flow.py rolling --batch {BATCH} --detach",
             f"下一步（取证）：fbr_facts.py --batch {BATCH}",
             f"下一步（Feedback）：fbr_work.py next --batch {BATCH} --wait，完成当前题验收后 "
             f"fbr_work.py closeout --batch {BATCH} --task <任务>",

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""逐题滚动生产到平台提交前；pre-submit 默认真跑并包含验收后发布，平台提交始终单独授权。"""
+"""rolling 逐题运行、发布、提交并跟进质检；pre-submit 用于只执行到提交前。"""
 from __future__ import annotations
 import argparse
 import concurrent.futures as futures
@@ -15,6 +15,7 @@ import fbrlib as lib
 import fbr_runtime as runtime
 import fbr_run
 import fbr_quota as quota
+import fbr_followup as followup
 
 
 def home(root, batch):
@@ -50,6 +51,15 @@ def phase(task):
     if preflight.get('state') == 'ready':
         return 'ready_submit'
     return 'local_done'
+
+
+def followup_summary(tasks):
+    counts = {}
+    for task in tasks:
+        state = lib.load_json(task / followup.JOURNAL, default={}).get('state')
+        if state:
+            counts[state] = counts.get(state, 0) + 1
+    return counts
 
 
 def platform_summary(tasks):
@@ -195,6 +205,7 @@ def probe_task(task, root, cfg, options):
 def submit_task(task, root, cfg, options):
     import fbr_sheet
     import fbr_submit
+    followup.enroll(task, cfg)
     try:
         result = fbr_submit.submit_ready(
             root, options.batch, task.name, execute=True, confirm='SUBMIT',
@@ -237,6 +248,20 @@ def submit_task(task, root, cfg, options):
 
 def cleanup_task(task, root, cfg, options):
     import fbr_cleanup
+    if (task / followup.JOURNAL).is_file():
+        try:
+            result = followup.poll(task, root, cfg, options)
+        except (OSError, lib.FbrError) as exc:
+            from fbr_platform import PlatformError, PlatformHTTPError
+            if (isinstance(exc, PlatformError) and not isinstance(exc, PlatformHTTPError)
+                    or isinstance(exc, PlatformHTTPError) and (exc.status == 429 or exc.status >= 500)
+                    or '另一个' in str(exc)):
+                return {'task_id': task.name, 'state': 'retry', 'detail': str(exc),
+                        'retry_after': time.time() + 30}
+            raise
+        state = lib.load_json(task / followup.JOURNAL)['state']
+        if state != 'passed' or not getattr(options, 'auto_cleanup', False):
+            return result
     interval = max(10, int(getattr(options, 'cleanup_poll_seconds', 60)))
     try:
         audit = fbr_cleanup.audit_batch(root, options.batch, task.name)
@@ -399,7 +424,8 @@ def run_flow(root, args):
         def resume_step(task):
             if frozen(task):
                 cleanup = lib.load_json(task / 'cleanup.json', default={})
-                if getattr(args, 'auto_cleanup', False) and cleanup.get('state') != 'cleaned':
+                if (getattr(args, 'auto_submit', False) and (task / followup.JOURNAL).is_file()
+                        and cleanup.get('state') != 'cleaned'):
                     return 6
                 return 0
             if any(not lib.stage_ok(task, stage) for stage in ('run', 'collect', 'commit')):
@@ -416,8 +442,16 @@ def run_flow(root, args):
         cleanup_retry_queue=[]
         author_waiting={}
         runtime.write_tail_policy(root, args.batch, tasks, cfg, 'flow')
+        queue_id = getattr(args, 'queue_id', None)
+        after_projects = getattr(args, 'after_project', [])
+        if queue_id:
+            import fbr_projects
+            pressure_path = runtime.Gateway(cfg).path / 'pressure.json'
         for task in tasks:
             step=resume_step(task)
+            if queue_id and step == 0:
+                retry_queue.append((0, task))
+                continue
             pending[enqueue(step,task)]=(step,task)
         try:
             while pending or retry_queue or submit_retry_queue or cleanup_retry_queue or author_waiting:
@@ -431,19 +465,30 @@ def run_flow(root, args):
                     if lib.stage_ok(task, 'feedback'):
                         pending[enqueue(3,task)] = (3,task)
                         author_waiting.pop(name)
-                lib.save_json(directory / 'waiting.json', {'at':lib.now_iso(), 'state':'waiting_for_task_ai' if author_waiting else 'active',
+                repairs = [packet for _, task in cleanup_retry_queue
+                           if (packet := followup.repair_packet(task))]
+                lib.save_json(directory / 'waiting.json', {'at':lib.now_iso(), 'state':'waiting_for_task_ai' if author_waiting or repairs else 'active',
                     'tasks':[{'task_id':task.name,'reason':'待当前任务 AI 完成产物验收、Feedback 或具体返修',
                               'queued_at':lib.load_json(task/'review/task-agent-work.json',default={}).get('at',''),
                               'checkpoint':str(task/'review/task-agent-work.json'),
                               'brief':str(task/'review/task-agent-brief.md'),
-                              'gate':str(task/'review/gate.json')} for task in author_waiting.values()],
-                    'backlog':len(author_waiting),
+                              'gate':str(task/'review/gate.json')} for task in author_waiting.values()] + repairs,
+                    'backlog':len(author_waiting) + len(repairs),
                     'platform': platform_summary(tasks),
                     'next':'持续执行 fbr_work.py next --wait，依据检查点真实补证/修正文并 finalize；不调用 reviewer.env 生成产物评价'})
                 if args.stopped() and author_waiting:
                     rows.extend({'task_id':task.name,'state':'needs_task_agent','detail':'保留任务AI验收/返修检查点'} for task in author_waiting.values())
                     author_waiting.clear()
                 due = [(when, task) for when, task in retry_queue if when <= time.time()]
+                if queue_id:
+                    active = [task for step, task in pending.values() if step == 0]
+                    # Include cooling retries and work waiting for quota. A quiet pool alone is not a handoff.
+                    pressure = lib.load_json(pressure_path, default={})
+                    limit = min(cfg['concurrency'], cfg['gateway']['machine_parallel'],
+                                pressure.get('cap', cfg['concurrency']))
+                    fbr_projects.report_handoff(directory, queue_id, active, retry_queue, limit)
+                    available = min(limit, fbr_projects.capacity(after_projects, queue_id)) - len(active)
+                    due = due[:max(0, available)]
                 for item in due:
                     retry_queue.remove(item)
                     if not args.stopped():
@@ -470,7 +515,7 @@ def run_flow(root, args):
                                if when <= time.time()]
                 for item in due_cleanup:
                     cleanup_retry_queue.remove(item)
-                    if not args.stopped() and getattr(args, 'auto_cleanup', False):
+                    if not args.stopped() and getattr(args, 'auto_submit', False):
                         pending[enqueue(6, item[1])] = (6, item[1])
                     else:
                         rows.append({'task_id': item[1].name, 'state': 'deferred',
@@ -507,12 +552,14 @@ def run_flow(root, args):
                     elif isinstance(result,dict) and result.get('state') == 'needs_task_agent':
                         author_waiting[task.name]=task
                     elif step == 5:
-                        if (getattr(args, 'auto_cleanup', False)
-                                and result.get('state') == 'ok'):
+                        if result.get('state') == 'ok':
                             pending[enqueue(6, task)] = (6, task)
                         else:
                             rows.append(result)
                     elif step == 6:
+                        if 'quota_overview' in result:
+                            quota_status = quota.summary(root)
+                            print(quota.status_text(quota_status), flush=True)
                         rows.append(result)
                     elif isinstance(result,dict) and result.get('state') in ('repairing','needs_probes'):
                         if time.time()>=deadline or (directory/'pause').exists():
@@ -542,6 +589,9 @@ def run_flow(root, args):
         finally:
             for pool in pools:
                 pool.shutdown(wait=True, cancel_futures=True)
+        if queue_id and not args.stopped():
+            lib.save_json(directory / 'handoff.json', dict(queue_id=queue_id, started=True,
+                          remaining=0, capacity=cfg['concurrency']))
         import fbr_sheet
         with args.delivery_lock:
             fbr_sheet.write_sheet(root, args.batch, cfg)
@@ -558,7 +608,7 @@ def run_flow(root, args):
         print(quota.status_text(quota_status), flush=True)
         lib.save_json(directory / 'stop.json', {
             'quota': quota_status, 'reason': reason, 'at': lib.now_iso(), 'results': rows,
-            'platform': platform_summary(tasks), 'maintenance': maintenance})
+            'platform': platform_summary(tasks), 'followup': followup_summary(tasks), 'maintenance': maintenance})
         return {'state': reason, 'results': rows, 'maintenance': maintenance, 'quota': quota_status}
 
 
@@ -569,14 +619,18 @@ def spawn(root, args, watchdog=False):
     if runtime.alive(previous):
         return previous
     argv = [sys.executable, str(Path(__file__).resolve()), '--root', str(root),
-            'watchdog' if watchdog else 'resume', '--batch', args.batch, '--execute']
+            'watchdog' if watchdog else ('resume' if args.command == 'resume' else 'run'), '--batch', args.batch, '--execute']
     if not watchdog:
         argv += ['--confirm', 'FLOW']
-        for key in ('tasks', 'reviewer_env', 'submit_mode', 'submit_interval'):
+        for previous in getattr(args, 'after_project', []):
+            argv.extend(['--after-project', str(previous)])
+        for key in ('tasks', 'reviewer_env', 'submit_mode', 'submit_interval', 'queue_id'):
             value = getattr(args, key, None)
             if value not in (None, ""):
                 argv += ['--' + key.replace('_', '-'), str(value)]
         if getattr(args,'publish',None) is False: argv += ['--no-publish']
+        if not getattr(args, 'auto_submit', False):
+            argv.append('--no-auto-submit')
         if getattr(args, 'auto_cleanup', False):
             argv += ['--auto-cleanup', '--confirm-cleanup', 'CLEANUP',
                      '--cleanup-poll-seconds', str(getattr(args, 'cleanup_poll_seconds', 60))]
@@ -622,17 +676,21 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--root')
     subs = parser.add_subparsers(dest='command', required=True)
-    for command in ('run', 'pre-submit', 'resume', 'status', 'wait', 'recover', 'pause', 'drain', 'watchdog'):
+    for command in ('rolling', 'run', 'pre-submit', 'resume', 'status', 'wait', 'recover', 'pause', 'drain', 'watchdog'):
         p = subs.add_parser(command)
         p.add_argument('--batch', required=True)
         p.add_argument('--tasks')
+        p.add_argument('--queue-id')
+        p.add_argument('--after-project', action='append', default=[])
         p.add_argument('--execute', action='store_true')
         p.add_argument('--confirm', default='')
         p.add_argument('--detach', action='store_true')
         p.add_argument('--publish', action='store_true', default=None)
         p.add_argument('--no-publish', action='store_false', dest='publish')
         p.add_argument('--confirm-publish', default='')
-        p.add_argument('--auto-submit', action='store_true')
+        submit_mode = p.add_mutually_exclusive_group()
+        submit_mode.add_argument('--auto-submit', action='store_true', default=None)
+        submit_mode.add_argument('--no-auto-submit', action='store_false', dest='auto_submit')
         p.add_argument('--confirm-submit', default='')
         p.add_argument('--submit-mode', choices=('drain',), default='drain')
         p.add_argument('--submit-interval', type=float, default=None,
@@ -647,10 +705,17 @@ def main():
     subs.choices['wait'].add_argument('--timeout', type=int, default=300)
     args = parser.parse_args()
     try:
+        if args.command == 'rolling':
+            if args.publish is False or args.auto_submit is False:
+                raise lib.FbrError('仅本地交付请使用 pre-submit')
+            args.execute = args.auto_submit = args.publish = True
+            args.confirm = 'FLOW'
+            args.confirm_submit = 'SUBMIT'
         if args.command == 'pre-submit':
             if args.auto_submit or args.confirm_submit or args.auto_cleanup or args.confirm_cleanup:
                 raise lib.FbrError('pre-submit 只做到平台提交前，不自动提交平台，也不自动清理平台数据')
             args.execute = True
+            args.auto_submit = False
             if args.publish is None:
                 args.publish = True
         root = lib.find_root(args.root)
@@ -659,6 +724,18 @@ def main():
         if args.execute:
             lib.active_github_account()
         directory = home(root, args.batch)
+        if args.command in ('run', 'resume') and args.execute:
+            saved = lib.load_json(directory / 'plan.json', default={}) if args.command == 'resume' else {}
+            if args.publish is None:
+                args.publish = saved.get('publish', True)
+            if args.auto_submit is None:
+                args.auto_submit = args.publish and saved.get('auto_submit', True)
+                args.confirm_submit = 'SUBMIT' if args.auto_submit else ''
+            if saved and not args.queue_id:
+                args.queue_id = saved.get('queue_id')
+                args.after_project = saved.get('after_project', [])
+            if args.tasks is None:
+                args.tasks = saved.get('tasks')
         if args.command == 'wait':
             import fbr_work
             result = fbr_work.wait_for_event(
@@ -671,6 +748,7 @@ def main():
                       'tasks': {t.name: phase(t) for t in tasks},
                       'platform': platform_summary(tasks)}
             if args.command == 'status':
+                result['followup'] = followup_summary(tasks)
                 result['quota'] = quota.summary(root, rescan=True)
         elif args.command in ('pause', 'drain'):
             directory.mkdir(parents=True, exist_ok=True)
@@ -701,6 +779,8 @@ def main():
                 counts[value] = counts.get(value, 0)+1
             print(f"{args.batch}：{len(result['tasks'])} 题，状态 " +
                   " / ".join(f"{key} {value}" for key, value in sorted(counts.items())))
+            if result.get('followup'):
+                print('质检跟进 ' + ' / '.join(f'{k} {v}' for k, v in result['followup'].items()))
             if result.get('quota'):
                 print(quota.status_text(result['quota']))
         elif isinstance(result, dict) and isinstance(result.get('results'), list):

@@ -86,12 +86,15 @@ class PreDispatch(DockerCase):
         info = {'pid': 12345, 'identity': 'verified'}
         gateway = rt.Gateway(self.cfg)
         gateway.event('limit')
+        with gateway.transaction() as state:
+            reduced_cap = state['cap']
+        self.assertEqual(reduced_cap, self.cfg['gateway']['machine_parallel'] - 1)
         with mock.patch.object(rt, 'alive', return_value=True):
             self.assertTrue(gateway.track_existing(info))
             self.assertTrue(gateway.track_existing(info))
         with gateway.transaction() as state:
             self.assertEqual(len(state['slots']), 1)
-            self.assertEqual(state['cap'], 4)
+            self.assertEqual(state['cap'], reduced_cap)
         with mock.patch.object(rt, 'alive', return_value=False):
             self.assertFalse(gateway.track_existing(info))
 

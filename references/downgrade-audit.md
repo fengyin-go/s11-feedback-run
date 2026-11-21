@@ -50,4 +50,4 @@ fbr_score_audit.py validate --batch b1110-01 --task s11-000123
 
 finalize 会重新核对 `downgrade-review.json`、标准产物 probe 和基线 probe 的摘要。证据文件在验证后变化时，原降分回执失效，必须重新 validate。
 
-平台单已存在的记录不自动适用本流程；返修继续遵守平台字段可编辑范围与单独授权。
+平台单已存在的记录不自动适用本流程；滚动跟进中的原单返修遵守平台字段可编辑范围。

@@ -1370,8 +1370,14 @@ def discard_platform_task(task_dir: Path, detail: dict, blockers: list[dict], *,
     )
 
 
+def repair_revision(detail: dict) -> str:
+    return digest({key: detail.get(key) for key in (
+        'id', 'user_id', 'status', 'stage', 'current_version', 'session_id', 'editable',
+        'locked_fields', 'qc_checks', 'qc_summary', 'data')})
+
+
 def repair_one(root: Path, plan: dict, client, schema: dict, *, execute: bool, comment: str,
-               interval: float | None = None) -> dict:
+               interval: float | None = None, expected_revision: str | None = None) -> dict:
     task_dir = root / "batches" / plan["batch"] / plan["task_id"]
     discarded = lib.platform_deprecated(task_dir)
     if discarded:
@@ -1390,6 +1396,8 @@ def repair_one(root: Path, plan: dict, client, schema: dict, *, execute: bool, c
     lib.assert_platform_prompt_unchanged(task_dir)
     submission_id = receipt["submission_id"]
     detail = client.detail(submission_id)
+    if expected_revision and repair_revision(detail) != expected_revision:
+        return {"task_id": plan["task_id"], "state": "changed", "submission_id": submission_id}
     detail_session = detail.get("session_id") or remote_data(detail).get("session_id")
     if str(detail_session) != str(plan["data"]["session_id"]):
         raise lib.FbrError(f"{plan['task_id']}：平台记录 SessionID 与当前交付不一致")
@@ -1419,7 +1427,7 @@ def repair_one(root: Path, plan: dict, client, schema: dict, *, execute: bool, c
     current_trace = detail.get("trace_file")
     if current_trace:
         current["trace_file"] = current_trace
-    locked = set(detail.get("locked_fields") or [])
+    locked = {"user_prompt", "session_id", *(detail.get("locked_fields") or [])}
     desired = copy.deepcopy(current)
     for key in plan["data"]:
         if key in MEDIA_TYPES or key in locked:
@@ -1452,7 +1460,7 @@ def repair_one(root: Path, plan: dict, client, schema: dict, *, execute: bool, c
             "detail": discarded["detail"],
         }
 
-    def save_receipt(updated: dict, actual: dict) -> dict:
+    def save_receipt(updated: dict, actual: dict, *, repaired=True) -> None:
         expected = payload_with_media(plan, receipt.get("uploads", {}))
         receipt.update({
             "content_digest": plan["content_digest"],
@@ -1463,10 +1471,10 @@ def repair_one(root: Path, plan: dict, client, schema: dict, *, execute: bool, c
             "remote_response_data": actual,
             "remote_status": updated.get("status"),
             "verified_at": lib.now_iso(),
-            "last_repair_at": lib.now_iso(),
-            "last_repair_comment": comment,
             "version_no": updated.get("current_version"),
         })
+        if repaired:
+            receipt.update(last_repair_at=lib.now_iso(), last_repair_comment=comment)
         lib.save_json(path, receipt)
 
     qc_active = detail.get("qc_running") is True or detail.get("stage") in ("QC_WAITING", "QC_RUNNING")
@@ -1481,10 +1489,10 @@ def repair_one(root: Path, plan: dict, client, schema: dict, *, execute: bool, c
             return non_repairable_state()
         if not execute:
             return {"task_id": plan["task_id"], "state": "dry", "submission_id": submission_id,
-                    "status": detail.get("status"), "changed_fields": [], "already_applied": True}
-        save_receipt(detail, current)
-        return {"task_id": plan["task_id"], "state": "confirmed", "submission_id": submission_id,
-                "status": detail.get("status"), "changed_fields": [], "already_applied": True,
+                    "status": detail.get("status"), "changed_fields": [], "already_applied": False}
+        save_receipt(detail, current, repaired=False)
+        return {"task_id": plan["task_id"], "state": "needs_platform_repair", "submission_id": submission_id,
+                "status": detail.get("status"), "changed_fields": [], "already_applied": False,
                 "url": f"{BASE_URL}/app/submissions/{submission_id}"}
     if status == "QC_PASSED":
         return {"task_id": plan["task_id"], "state": "ok", "submission_id": submission_id,
@@ -1531,7 +1539,7 @@ def repair_one(root: Path, plan: dict, client, schema: dict, *, execute: bool, c
 
 def repair_batch(root: Path, batch_id: str, *, tasks: str | None = None,
                  execute: bool = False, confirm: str = "", comment: str = "", client=None,
-                 interval: float | None = None) -> dict:
+                 interval: float | None = None, expected_revision: str | None = None) -> dict:
     if execute and confirm != "REPAIR":
         raise lib.FbrError("真实平台返修需要 --execute --confirm REPAIR")
     selected = lib.task_dirs(root, batch_id, tasks)
@@ -1595,8 +1603,8 @@ def repair_batch(root: Path, batch_id: str, *, tasks: str | None = None,
         if remaining:
             plans = prepare(root, batch_id, schema, ",".join(task.name for task in remaining), None)
             rows.update({plan["task_id"]: repair_one(
-                root, plan, client, schema, execute=execute, comment=comment, interval=interval)
-                for plan in plans})
+                root, plan, client, schema, execute=execute, comment=comment, interval=interval,
+                expected_revision=expected_revision) for plan in plans})
         for task in selected:
             if not rows.get(task.name):
                 marker = discarded[task.name]

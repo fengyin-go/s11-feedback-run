@@ -245,13 +245,15 @@ class Client:
             url += "?" + urllib.parse.urlencode(params, doseq=True)
         return url
 
-    def request(self, method: str, path: str, *, json=None, params=None, headers=None, data=None) -> dict:
+    def request(self, method: str, path: str, *, json=None, params=None, headers=None, data=None, response_headers=None) -> dict:
         method = method.upper()
         if method not in ("GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"):
             raise PlatformError("不支持的平台 HTTP 方法")
         if json is not None and data is not None:
             raise PlatformError("平台请求不能同时发送 JSON 与上传流")
         url = self._url(path, params)
+        if method == "GET" and path == "/api/openapi.json":
+            url = self._base + path
         request_headers = {"Accept": "application/json", "Origin": self._base, "Referer": self._base + "/"}
         for name, value in (headers or {}).items():
             if name.lower() in ("authorization", "cookie", "host", "origin", "referer", CSRF_HEADER.lower()):
@@ -278,6 +280,10 @@ class Client:
             with self._opener.open(req, timeout=self.timeout) as response:
                 if _origin(response.geturl()) != self._origin:
                     raise PlatformError("平台响应来自其他 origin，已拒绝")
+                if response_headers is not None:
+                    response_headers["ETag"] = response.headers.get("ETag")
+                if method == "DELETE" and response.status == 204:
+                    return {}
                 raw = response.read(MAX_RESPONSE_BYTES + 1)
                 if len(raw) > MAX_RESPONSE_BYTES:
                     raise PlatformError("平台响应超过安全读取上限")
@@ -304,6 +310,13 @@ class Client:
         if not isinstance(value, dict):
             raise PlatformError("平台响应不是 JSON 对象")
         return value
+
+    def conditional_delete_supported(self) -> bool:
+        spec = self.request("GET", "/api/openapi.json")
+        operation = spec.get("paths", {}).get("/api/v1/submissions/{submission_id}", {}).get("delete", {})
+        return "412" in operation.get("responses", {}) and any(
+            param.get("in") == "header" and param.get("name", "").lower() == "if-match"
+            for param in operation.get("parameters", []))
 
     def login(self) -> dict:
         if self._logged_in:

@@ -916,7 +916,8 @@ class RepairReceipt(SubmitCase):
         ]
         result = submit.repair_one(self.root, plan, client, client.schema(), execute=True,
                                    comment="verify receipt refresh", interval=0)
-        self.assertEqual(result["state"], "confirmed")
+        self.assertEqual(result["state"], "needs_platform_repair")
+        self.assertNotIn("last_repair_at", self.receipt(task))
         receipt = self.receipt(task)
         self.assertNotEqual(receipt["remote_data"]["trace_file"],
                             receipt["remote_response_data"]["trace_file"])

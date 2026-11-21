@@ -21,10 +21,13 @@ description: solo11（26.11 领域专项，单轮 pointwise）的运行侧：把
 
 默认使用 [滚动调度与恢复](references/runtime-flow.md)、[缓存与并发](references/performance.md) 和 [分阶段保留与回收](references/retention.md)：跑完一题就进入录屏、取证和独立评价，不等待整批跑题结束。下列命令均须加 `python3 <skill>/scripts/` 前缀。
 
-当用户说“运行所有提示词”“跑完这批任务”或同义指令时，默认模式是完成平台提交前的全部操作，不把“运行”理解成只做 R1。直接使用 `fbr_flow.py pre-submit --batch … --detach`，继续处理运行、收集、快照、录屏、取证、Feedback、闸门、导出、本地表和字段核查；该命令默认发布验收通过的 GitHub 产物快照，但不提交 SOLO2 平台。平台提交仍需用户另行明确授权。
+当用户说“运行所有提示词”“跑完这批任务”时，使用 `fbr_flow.py rolling --batch … --detach`。该运行请求授权对本次选定任务逐题发布验收合格的快照、提交 SOLO2 并跟进质检。用户明确要求“只做到提交前”时使用 `pre-submit`，明确只做本地时再加 `--no-publish`。
+
+多个项目按用户给定顺序交给 `fbr_projects.py`。先将项目简称解析为包含 `_config/settings.json` 的根目录和实际批次，同名或多批次无法唯一确定时核实范围。以 1003、1004 为例，按顺序传 `--project <1003根目录> <实际批次> --project <1004根目录> <实际批次> --execute`。调度器先启动 1003，等其剩余模型任务已派发且占不满模型槽位，再用 1004 补位。跨项目合计最多四路，三个以上项目只允许相邻两项在模型阶段交接。保持调度器运行，并在同一对话用 `fbr_work.py --root <项目根目录> next --batch <批次> --inline` 依次查看已启动项目的验收和原单返修待办。各队列均为空时再等待。
 
 ```bash
-fbr_flow.py pre-submit --batch b1110-01 --detach
+fbr_flow.py rolling --batch b1110-01 --detach
+fbr_flow.py pre-submit --batch b1110-01 --detach     # 明确要求只做到提交前
 fbr_flow.py run --batch b1110-01
 fbr_flow.py run --batch b1110-01 --execute --confirm FLOW --detach
 fbr_flow.py status --batch b1110-01
@@ -42,19 +45,13 @@ fbr_batch.py closeout --batch b1110-01
 `--json` 才展开完整对象；不支持 `--json` 的命令按其帮助或错误报告定向查询。完整表格、
 平台 schema、errors 和 metrics 留在本地文件，定向查询，不整份回灌。
 
-滚动评价默认开启。`pre-submit` 启动后，当前 AI 立即进入
+滚动评价默认开启。流水线启动后，当前 AI 立即进入
 `fbr_work.py next --inline --wait -> 当前题评价 -> finalize -> closeout` 循环；inline
 直接返回当前题的去重 review capsule，不再分别读取 brief 和 contract。任务运行、录屏和取证继续并行，不能等整批跑完再领取评价待办。
 
-真跑默认在验收通过后主动推送 GitHub 产物快照并回读 SHA，再核查结果表；明确只做本地时加 `--no-publish`。`pre-submit` 不接受平台提交参数；需要滚动提交时另用 `fbr_flow.py run --auto-submit`，并须单独获得用户明确授权。下列逐阶段命令仍可用于排错和补跑：
+提交后的跟进记录在 `review/platform-followup.json`。原单为 `PENDING_FIX` 时，当前 AI 从 `fbr_work.py next --inline` 领取 `kind=platform_repair`，依据失败项修正允许字段，Feedback 通过 `finalize --execute --platform-repair` 后，调度器复核质检版本并自动 PUT 原单；仅修表单字段时由当前 AI 预览变更后运行 `repair --execute --confirm REPAIR`。同一题面、Session 和附件贯穿返修。成功返修后重新计时。首次或返修提交满 600 秒，回读仍为 `QC_WAITING`（待质检）时就结束本条跟进，重启沿用该结果。`QC_RUNNING`（质检中）继续跟进到平台给出结论。
 
-滚动提交不是默认模式，也不由 `pre-submit` 开启。只有用户明确要求一边生产、一边提交平台时，才使用：
-
-```bash
-fbr_flow.py run --batch b1110-01 \
-  --auto-submit --confirm-submit SUBMIT --submit-mode drain \
-  --submit-interval 10 --execute --confirm FLOW --detach
-```
+平台显示 `DISCARDED` 时，核实账号、原单 ID、Session 和实时状态。只有服务端支持强 ETag 与条件 DELETE 时才按读取版本删除；版本变化须重新分类。SOLO2 当前公开的通用 DELETE 也接受待返修单，缺少上述条件时保留记录并报告 `delete_guard_unavailable`。删除结果核实后以平台实时今日总数校准额度，并保留本地凭证。
 
 新增额度按 SOLO2 账号和北京时间跨项目共用，生产基准 `submit.daily_limit` 默认 70。每次对账以平台「今日提交数」校准已用量。手动删除废弃单后，平台少几条就释放几个位置；本地旧回执仅供追溯。尚在跑、待验收或待提交的题仍各占一个预留。R1 启动前原子预留，最终废弃释放；R2 按实际上传的主会话最后有效运行时间确定最迟提交日。20:00:00 及之前的轨迹当天到期，严格晚于 20:00:00 的轨迹可以次日提交。返修复用原单。账号概览和首次建单明细的核对方式、存量导入和多机共用配置见 [每日新增额度](references/daily-quota.md)。
 
@@ -92,7 +89,7 @@ fbr_flow.py run --batch b1110-01 \
   --submit-mode drain --submit-interval 10 --execute --confirm FLOW --detach
 ```
 
-单题最终清理只有同时满足以下条件才会写入 `cleaned`：平台实时详情为 `QC_PASSED`、本地回执为 `confirmed`、当前正文/附件/轨迹摘要与回执一致、结果投影全部通过 SHA256 校验、任务没有活动进程。`QC_RUNNING` 会继续轮询；`PENDING_FIX`、`uncertain`、摘要漂移或活动任务只报阻塞。轮询间隔由 `--cleanup-poll-seconds` 控制，默认 60 秒。
+单题最终清理只有同时满足以下条件才会写入 `cleaned`：平台实时详情为 `QC_PASSED`、本地回执为 `confirmed`、当前正文/附件/轨迹摘要与回执一致、结果投影全部通过 SHA256 校验、任务没有活动进程。滚动跟进依据本次提交的 10 分钟窗口回读待质检单，待返修单进入原单返修队列。轮询间隔由 `--cleanup-poll-seconds` 控制，默认 60 秒。
 
 清理前把产物快照、题面与复现字段、录屏方案、尝试摘要、diff 和文件摘要归档到 `results/<批次>/<任务>/retention.json`；平台清理时再补 `platform/` 回执。只有平台 `QC_PASSED` 后才删除 `origin/`、`workspace/`、`run-tree/`、大体积 `run/` 现场、失败录屏候选和映射到该题的 runtime scratch；原始轨迹、录屏、证据、Feedback、平台回执和小型任务骨架保留。
 
@@ -153,7 +150,7 @@ fbr_cleanup.py prune --batch b1113-01 --execute --confirm CLEANUP
 也不得通过换题、重出题或新建会话来规避原记录的锁定字段。凡失败只能靠改提示词才可能通过，
 一律在本地标记废弃且不再处理；不改平台记录，不重跑，不转回出题侧返修。
 
-底层单阶段命令和 `run` 仍默认演练；`pre-submit` 是“运行所有任务”的默认入口，明确执行到平台提交前，不需要再次逐步确认。它默认包含验收通过后的 GitHub 产物快照推送；明确只做本地时使用 `--no-publish`。单独 `push` 仍使用 `--execute --confirm PUBLISH`；平台提交仍需单独授权并使用 `--execute --confirm SUBMIT`。平台演练会登录并读取账号、字段和历史记录；不上传附件、不建单。
+底层单阶段命令和 `run` 默认演练；日常运行使用 `rolling`。单独推送用 `--execute --confirm PUBLISH`，手工提交用 `--execute --confirm SUBMIT`。
 
 ## 1. 运行与收集
 

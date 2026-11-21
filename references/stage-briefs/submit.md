@@ -13,7 +13,7 @@
 - 整批提交先运行 `fbr_batch.py closeout`；`batch-closeout.json` 不是 `ready` 时不上传任何文件。
 - schema、凭证、正文、附件、快照、账号或领域变化都会使旧预检失效。评审输入变化只让对应题重新评价，交付变化只重做交付冻结。
 - 完整 schema 和 upload plan 只从本地报告定向查询；终端摘要不是提交依据。
-- 正式提交必须单独授权并使用 `--execute --confirm SUBMIT`。返修使用 `--confirm REPAIR`。
+- 运行任务默认进入滚动提交。手工提交使用 `--execute --confirm SUBMIT`。返修使用 `--confirm REPAIR`。
 - 平台返修只允许更新原记录非锁定字段。绝对禁止修改 `task.json.prompt`、`prompt.txt`
   或平台 `user_prompt` 后重跑；只能靠改题面通过的失败写
   `review/platform-deprecated.json`，本地废弃后不再处理。
@@ -24,3 +24,5 @@
 - 只读必要字段或阻断项；不要整读 upload.json、平台详情响应或完整 schema。
 
 需要规则细节时只加载 `references/platform-api.md` 和 `references/feedback-platform-style.md`。
+
+滚动提交后查看 `fbr_work.py next --inline` 的 `platform_repair` 项，当前 AI 核对质检意见、原题面和允许字段，完成原单返修。`QC_WAITING` 满 600 秒结束跟进；`QC_RUNNING` 继续等结果。对 `delete_guard_unavailable` 报告原单编号和平台条件删除限制。
